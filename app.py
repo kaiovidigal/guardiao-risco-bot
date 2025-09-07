@@ -1,116 +1,81 @@
 import os
-import time
-import json
-from collections import deque
+import logging
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.utils.exceptions import ChatNotFound, Unauthorized
 
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-
-from risk_engine import (
-    winrate, volatilidade, streak_loss, risco_conf
+# --------------------------------------------------
+# Config & logging
+# --------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger("guardiao-risco-bot")
 
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "")
-TARGET_CHAT = os.getenv("TARGET_CHAT", "")
-CONF_LIMIAR = float(os.getenv("CONF_LIMIAR", "0.99"))
-ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "")
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+CHANNEL_ID = os.getenv("TG_CHAT_ID")  # ex.: -10028105080717
 
 if not BOT_TOKEN:
-    raise SystemExit("Faltou TG_BOT_TOKEN no ambiente.")
+    raise RuntimeError("Faltando variável de ambiente TG_BOT_TOKEN (ou BOT_TOKEN).")
+if not CHANNEL_ID:
+    raise RuntimeError("Faltando variável de ambiente TG_CHAT_ID com o ID do canal.")
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+# converte para int (Render salva como string)
+try:
+    CHANNEL_ID = int(CHANNEL_ID)
+except ValueError:
+    raise RuntimeError("TG_CHAT_ID deve ser um número inteiro (ex.: -1001234567890).")
+
+bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
-STATE_FILE = os.getenv("STATE_FILE", "data/state.json")
-os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-
-state = {"cooldown_until": 0, "limiar": CONF_LIMIAR}
-try:
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            state.update(json.load(f))
-except Exception:
-    pass
-
-def save_state():
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-hist_long  = deque(maxlen=300)
-hist_short = deque(maxlen=30)
-
-def is_admin(user_id: int) -> bool:
-    if not ADMIN_USER_ID:
-        return True
-    return str(user_id) == str(ADMIN_USER_ID)
-
-def parse_signal(text: str) -> bool:
-    up = text.upper()
-    keys = ["SINAL", "ENTRADA", "CALL", "PUT"]
-    return any(k in up for k in keys)
-
-def parse_result(text: str):
-    up = text.upper()
-    if "GREEN" in up or "WIN" in up:
-        return 1
-    if "RED" in up or "LOSS" in up:
-        return 0
-    return None
-
-async def publicar(texto: str):
-    if TARGET_CHAT:
-        await bot.send_message(TARGET_CHAT, texto)
-
-@dp.message_handler(commands=["status"])
-async def cmd_status(m: types.Message):
-    short_wr = winrate(list(hist_short))
-    long_wr  = winrate(list(hist_long))
-    vol = volatilidade(list(hist_short))
-    mxr = streak_loss(list(hist_short))
-    await m.answer(
-        f"📊 Short WR(30): {short_wr*100:.1f}% | Long WR(300): {long_wr*100:.1f}%\n"
-        f"🔀 Volatilidade: {vol:.2f} | 📉 Max Reds: {mxr}\n"
-        f"🎚️ Limiar atual: {state['limiar']*100:.2f}%"
+# --------------------------------------------------
+# Comando /start (privado)
+# --------------------------------------------------
+@dp.message_handler(commands=["start"])
+async def cmd_start(msg: types.Message):
+    await msg.answer(
+        "✅ Bot ativo!\n"
+        "Sou o Guardião de Risco.\n"
+        "• Já estou ouvindo postagens do canal configurado.\n"
+        "• Me mantenha como ADMIN do canal."
     )
 
-@dp.message_handler(content_types=types.ContentType.TEXT)
-async def watcher(m: types.Message):
-    chat_username = (m.chat.username and f"@{m.chat.username}") or ""
-    in_source = True
-    if SOURCE_CHANNEL:
-        in_source = (chat_username.lower() == SOURCE_CHANNEL.lower())
-    if not in_source:
-        return
+# --------------------------------------------------
+# Posts do canal (precisa ser ADMIN no canal)
+# --------------------------------------------------
+@dp.channel_post_handler()
+async def on_channel_post(message: types.Message):
+    """
+    Dispara sempre que sair uma nova mensagem no canal onde o bot é admin.
+    """
+    try:
+        # Log básico no console (aparece nos logs do Render)
+        logger.info(
+            "Nova mensagem no canal %s (%s): %s",
+            message.chat.title, message.chat.id, message.text or "<sem texto>"
+        )
 
-    text = (m.text or "").strip()
-    if not text:
-        return
+        # Exemplo: se quiser reencaminhar para o MESMO canal ou outro chat/grupo,
+        # defina TARGET_CHAT_ID nas variáveis de ambiente (opcional).
+        target = os.getenv("TARGET_CHAT_ID")
+        if target:
+            try:
+                target = int(target)
+                await bot.copy_message(
+                    chat_id=target,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id
+                )
+            except (ValueError, ChatNotFound, Unauthorized) as e:
+                logger.error("Falha ao encaminhar para TARGET_CHAT_ID: %s", e)
 
-    r = parse_result(text)
-    if r is not None:
-        hist_long.append(r); hist_short.append(r)
-        return
+    except Exception as e:
+        logger.exception("Erro ao processar mensagem do canal: %s", e)
 
-    if parse_signal(text):
-        if time.time() < state["cooldown_until"]:
-            await publicar("neutro")
-            return
-
-        short_wr = winrate(list(hist_short))
-        long_wr  = winrate(list(hist_long))
-        vol = volatilidade(list(hist_short))
-        mxr = streak_loss(list(hist_short))
-        conf = risco_conf(short_wr, long_wr, vol, mxr)
-
-        if conf >= state["limiar"]:
-            msg = f"🎯 Chance: {conf*100:.1f}%\n🛡️ Risco: BAIXO\n📍 Ação: ENTRAR"
-        else:
-            msg = "neutro"
-        await publicar(msg)
-
-def main():
-    executor.start_polling(dp, skip_updates=True)
-
+# --------------------------------------------------
+# Entrada
+# --------------------------------------------------
 if __name__ == "__main__":
-    main()
+    # skip_updates=True evita “TerminatedByOtherGetUpdates”
+    executor.start_polling(dp, skip_updates=True)
