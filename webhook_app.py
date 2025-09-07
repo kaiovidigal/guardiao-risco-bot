@@ -1,3 +1,4 @@
+# webhook_app.py
 import os
 import re
 import json
@@ -20,8 +21,9 @@ BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Faltando TG_BOT_TOKEN")
 
-CHANNEL_ID = -1002810508717   # seu canal fixo
-CONF_LIMIAR = 0.92            # entra a partir de 92%
+CHANNEL_ID = -1002810508717     # seu canal fixo
+CONF_LIMIAR = 0.92              # entra a partir de 92%
+COOLDOWN_S = 20                 # anti-flood entre sinais
 
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
@@ -153,12 +155,13 @@ re_apostar = re.compile(r"apostar\s+em\s+([A-Za-z]*\s*)?([1-4](?:[\s\-\|]*[1-4])
 re_red     = re.compile(r"\bRED\b", re.I)
 re_close   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
 
-def eh_sinal(txt): 
+def eh_sinal(txt):
     return bool(re_sinal.search(txt or ""))
 
 def extrai_sequencia(txt):
     m = re_seq.search(txt or "")
-    if not m: return []
+    if not m:
+        return []
     return [int(x) for x in re.findall(r"[1-4]", m.group(1))]
 
 def extrai_regra_sinal(txt):
@@ -170,8 +173,10 @@ def extrai_regra_sinal(txt):
 
 def eh_resultado(txt):
     up = (txt or "").upper()
-    if re_red.search(up) or re_close.search(up): return 0
-    if "GREEN" in up or "WIN" in up or "✅" in up: return 1
+    if re_red.search(up) or re_close.search(up):
+        return 0
+    if "GREEN" in up or "WIN" in up or "✅" in up:
+        return 1
     return None
 
 # =====================
@@ -239,24 +244,34 @@ async def on_channel_post(message: types.Message):
     if r is not None:
         hist_long.append(r)
         hist_short.append(r)
-        logger.info("Resultado %s | WR30=%.1f%% WR300=%.1f%%",
-                    "WIN" if r==1 else "RED",
-                    winrate(hist_short)*100, winrate(hist_long)*100)
+        logger.info(
+            "Resultado %s | WR30=%.1f%% WR300=%.1f%%",
+            "WIN" if r == 1 else "RED",
+            winrate(hist_short)*100, winrate(hist_long)*100
+        )
         return
 
     # 2) Sinal novo (ENTRADA CONFIRMADA)
     if eh_sinal(txt):
         now = time.time()
+
+        # cooldown: evita flood
         if now < state.get("cooldown_until", 0):
-            await bot.send_message(CHANNEL_ID, "neutro")
+            await bot.send_message(CHANNEL_ID, "🟥 <b>NEUTRO</b>", parse_mode="HTML")
             return
 
         apos_num, alvos = extrai_regra_sinal(txt)
 
-        # 🔒 Regra anti-loss por repetição — se arriscado, indica qual número
+        # 🔒 Anti-loss por repetição — se arriscado, avisa qual número
         if risco_repeticao(apos_num, alvos):
             logger.info("Bloqueado padrão repetitivo: após %s ignorando ele mesmo", apos_num)
-            await bot.send_message(CHANNEL_ID, f"neutro (número repetitivo: {apos_num})")
+            await bot.send_message(
+                CHANNEL_ID,
+                f"🟥 <b>NEUTRO — MUITA REPETIÇÃO</b> (nº {apos_num})",
+                parse_mode="HTML"
+            )
+            state["cooldown_until"] = now + COOLDOWN_S
+            save_state()
             return
 
         # Métricas
@@ -276,16 +291,17 @@ async def on_channel_post(message: types.Message):
 
         if conf >= CONF_LIMIAR:
             msg = (
-                f"🎯 Chance: {conf*100:.1f}%\n"
-                f"🛡️ Risco: BAIXO\n"
-                f"🎯 Alvos: {('-'.join(map(str, alvos)) if alvos else '—')}\n"
-                f"📍 Plano: ENTRAR (até G1)"
+                "🟢 <b>CONFIRMAR</b>\n"
+                f"🎯 Chance: <b>{conf*100:.1f}%</b>\n"
+                f"🛡️ Risco: <b>BAIXO</b>\n"
+                f"🎯 Alvos: <b>{'-'.join(map(str, alvos)) if alvos else '—'}</b>\n"
+                "📍 Plano: <b>ENTRAR (até G1)</b>"
             )
         else:
-            msg = "neutro"
+            msg = "🟥 <b>NEUTRO</b>"
 
-        await bot.send_message(CHANNEL_ID, msg)
-        state["cooldown_until"] = now + 20
+        await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML")
+        state["cooldown_until"] = now + COOLDOWN_S
         save_state()
 
 # =========================
