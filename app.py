@@ -15,13 +15,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("guardiao-risco-bot")
 
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN") or os.getenv("BOT_TOKEN")
-CHANNEL_ID = -1002810508717  # fixo no seu canal
-
-CONF_LIMIAR = float(os.getenv("CONF_LIMIAR", "0.99"))  # confiança mínima para ENTRAR
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+CHANNEL_ID = -1002810508717   # fixo no seu canal
+CONF_LIMIAR = 0.99            # fixo
 
 if not BOT_TOKEN:
-    raise RuntimeError("Faltando variável de ambiente TG_BOT_TOKEN (ou BOT_TOKEN).")
+    raise RuntimeError("Faltando variável TG_BOT_TOKEN.")
 
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
@@ -54,15 +53,14 @@ load_state()
 # =========================
 # Buffers de aprendizado
 # =========================
-hist_long  = deque(maxlen=300)  # resultados
+hist_long  = deque(maxlen=300)
 hist_short = deque(maxlen=30)
 
-ultimos_numeros = deque(maxlen=120)   # últimos números fantan
+ultimos_numeros = deque(maxlen=120)
 contagem_num = [0, 0, 0, 0, 0]
 transicoes   = [[0]*5 for _ in range(5)]
 
 def atualiza_estat_num(seq_nums):
-    global ultimos_numeros, contagem_num, transicoes
     for n in seq_nums:
         if 1 <= n <= 4:
             if ultimos_numeros:
@@ -81,7 +79,7 @@ def winrate(d):
 
 def volatilidade(d):
     d = list(d)
-    if len(d) < 10: 
+    if len(d) < 10:
         return 0.0
     trocas = sum(1 for i in range(1, len(d)) if d[i] != d[i-1])
     return trocas / (len(d) - 1)
@@ -120,8 +118,7 @@ def conf_final(short_wr, long_wr, vol, max_reds, risco_num):
     pena = 0.0
     if max_reds >= 3: pena += 0.05 * (max_reds - 2)
     if vol > 0.6:     pena += 0.05
-    conf = max(0.0, min(1.0, base - pena))
-    return conf
+    return max(0.0, min(1.0, base - pena))
 
 # =========================
 # Parsers
@@ -133,19 +130,18 @@ re_apostar = re.compile(r"apostar\s+em\s+([A-Za-z]*\s*)?([1-4](?:[\s\-\|]*[1-4])
 re_red     = re.compile(r"\bRED\b", re.I)
 re_close   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
 
-def eh_sinal(texto): return bool(re_sinal.search(texto or ""))
-def extrai_sequencia(texto):
-    m = re_seq.search(texto or "")
-    if not m: return []
-    return [int(x) for x in re.findall(r"[1-4]", m.group(1))]
-def extrai_regra_sinal(texto):
-    m1 = re_apos.search(texto or "")
-    m2 = re_apostar.search(texto or "")
+def eh_sinal(txt): return bool(re_sinal.search(txt or ""))
+def extrai_sequencia(txt):
+    m = re_seq.search(txt or ""); 
+    return [int(x) for x in re.findall(r"[1-4]", m.group(1))] if m else []
+def extrai_regra_sinal(txt):
+    m1 = re_apos.search(txt or "")
+    m2 = re_apostar.search(txt or "")
     apos = int(m1.group(1)) if m1 else None
     alvos = [int(x) for x in re.findall(r"[1-4]", m2.group(2))] if m2 else []
     return (apos, alvos)
-def eh_resultado(texto):
-    up = (texto or "").upper()
+def eh_resultado(txt):
+    up = (txt or "").upper()
     if re_red.search(up) or re_close.search(up): return 0
     if "GREEN" in up or "WIN" in up or "✅" in up: return 1
     return None
@@ -162,17 +158,16 @@ async def on_channel_post(message: types.Message):
     if not txt:
         return
 
-    # Aprender sequência
+    # Sequência
     seq = extrai_sequencia(txt)
     if seq:
         atualiza_estat_num(seq)
         logger.info("Sequência aprendida: %s", seq)
 
-    # Aprender resultado
+    # Resultado
     r = eh_resultado(txt)
     if r is not None:
-        hist_long.append(r)
-        hist_short.append(r)
+        hist_long.append(r); hist_short.append(r)
         logger.info("Resultado %s | WR30=%.1f%% WR300=%.1f%%",
                     "WIN" if r==1 else "RED",
                     winrate(hist_short)*100, winrate(hist_long)*100)
@@ -194,10 +189,10 @@ async def on_channel_post(message: types.Message):
         risco_num = risco_por_numeros(apos_num, alvos)
         conf = conf_final(short_wr, long_wr, vol, mx_reds, risco_num)
 
-        logger.info("SINAL conf=%.3f | apos=%s alvos=%s | risco_num=%.2f",
+        logger.info("SINAL conf=%.3f | apos=%s alvos=%s risco_num=%.2f",
                     conf, apos_num, alvos, risco_num)
 
-        if conf >= state.get("limiar", CONF_LIMIAR):
+        if conf >= CONF_LIMIAR:
             msg = (
                 f"🎯 Chance: {conf*100:.1f}%\n"
                 f"🛡️ Risco: BAIXO\n"
@@ -216,7 +211,3 @@ async def on_channel_post(message: types.Message):
 # =========================
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
-        
-
-
-    
