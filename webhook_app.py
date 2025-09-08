@@ -1,9 +1,6 @@
-# webhook_app.py
-import os
-import re
-import json
-import time
-import logging
+# webhook_app.py — Guardião de Risco (sem limiar; sempre mostra confiança + aviso "priorize nº 1")
+
+import os, re, json, time, logging
 from collections import deque
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
@@ -21,8 +18,7 @@ BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Faltando TG_BOT_TOKEN")
 
-CHANNEL_ID = -1002810508717     # seu canal fixo
-CONF_LIMIAR = 0.92              # entra a partir de 92%
+CHANNEL_ID = -1002810508717     # seu canal de sinais
 COOLDOWN_S = 20                 # anti-flood entre sinais
 
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
@@ -34,20 +30,17 @@ dp = Dispatcher(bot)
 STATE_FILE = "data/state.json"
 os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
 
-state = {"cooldown_until": 0.0, "limiar": CONF_LIMIAR}
-
+state = {"cooldown_until": 0.0}
 def load_state():
     try:
         if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                state.update(json.load(f))
+            state.update(json.load(open(STATE_FILE, "r", encoding="utf-8")))
     except Exception as e:
         logger.warning("Falha ao carregar state: %s", e)
 
 def save_state():
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning("Falha ao salvar state: %s", e)
 
@@ -100,8 +93,7 @@ def streak_loss(d):
 
 def probs_depois(depois_de):
     """
-    Retorna vetor [0, p(1), p(2), p(3), p(4)]
-    com suavização de Laplace (alpha=1) para evitar extremos 0/1.
+    Retorna vetor [0, p(1), p(2), p(3), p(4)] com suavização de Laplace (alpha=1).
     Se não houver dados suficientes para 'depois_de', usa a distribuição global.
     """
     alpha = 1.0
@@ -114,7 +106,7 @@ def probs_depois(depois_de):
         return dist_global()
 
     total = sum(transicoes[depois_de][1:5])
-    if total < 8:  # exige no mínimo 8 observações da transição específica
+    if total < 8:
         return dist_global()
 
     tot = total + 4*alpha
@@ -122,8 +114,7 @@ def probs_depois(depois_de):
 
 def risco_por_numeros(apos_num, alvos):
     """
-    Retorna risco = 1 - p_hit para os alvos, dado o último número (apos_num)
-    ou o último observado em ultimos_numeros se apos_num for None.
+    risco = 1 - p_hit dos alvos, dado o 'apos_num' (ou último observado).
     """
     if not alvos:
         return 0.5
@@ -134,8 +125,8 @@ def risco_por_numeros(apos_num, alvos):
 
 def conf_final(short_wr, long_wr, vol, max_reds, risco_num):
     """
-    Combina WR curto/longo, estabilidade e risco numérico em uma confiança [0..1].
-    Penaliza streaks de RED >=3 e volatilidade muito alta (>0.6).
+    Confiança [0..1] combinando WR curto/longo, estabilidade e risco numérico.
+    (Sem limiar de decisão — apenas informativa.)
     """
     base = 0.55*short_wr + 0.30*long_wr + 0.10*(1.0 - vol) + 0.05*(1.0 - risco_num)
     pena = 0.0
@@ -152,8 +143,11 @@ re_sinal   = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 re_seq     = re.compile(r"Sequ[eê]ncia[:\s]*([^\n]+)", re.I)
 re_apos    = re.compile(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", re.I)
 re_apostar = re.compile(r"apostar\s+em\s+([A-Za-z]*\s*)?([1-4](?:[\s\-\|]*[1-4])*)", re.I)
-re_red     = re.compile(r"\bRED\b", re.I)
-re_close   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
+
+# RESULTADO: só conta GREEN/RED explícitos
+re_close   = re.compile(r"\bAPOSTA\s+ENCERRADA\b", re.I)
+re_green   = re.compile(r"\bGREEN\b|✅", re.I)
+re_red     = re.compile(r"\bRED\b|❌", re.I)
 
 def eh_sinal(txt):
     return bool(re_sinal.search(txt or ""))
@@ -168,33 +162,52 @@ def extrai_regra_sinal(txt):
     m1 = re_apos.search(txt or "")
     m2 = re_apostar.search(txt or "")
     apos = int(m1.group(1)) if m1 else None
-    alvos = [int(x) for x in re.findall(r"[1-4]", m2.group(2))] if m2 else []
+    alvos = [int(x) for x in re.findall(r"[1-4]", (m2.group(2) if m2 else ""))]
     return (apos, alvos)
 
 def eh_resultado(txt):
+    """
+    1 = GREEN, 0 = RED, None = não identificado.
+    Requer 'APOSTA ENCERRADA' + palavra/emoji de GREEN ou RED.
+    """
     up = (txt or "").upper()
-    if re_red.search(up) or re_close.search(up):
-        return 0
-    if "GREEN" in up or "WIN" in up or "✅" in up:
-        return 1
-    return None
+    if not re_close.search(up):
+        return None
+    if re_green.search(up): return 1
+    if re_red.search(up):   return 0
+    return None  # NÃO força RED quando não é explícito
 
 # =====================
-# Anti-loss por repetição
+# Avisos (sem bloqueio)
 # =====================
-def risco_repeticao(apos_num, alvos):
+def aviso_priorize_1(apos_num, alvos):
     """
-    Bloqueia entradas arriscadas quando o número tende a se repetir
-    e o sinal exclui justamente esse número. Ex.: após 1 → apostar em 2-3-4, mas p(1|1) alta.
+    Sem threshold fixo:
+    - calcula p(1) condicional (ou global)
+    - se p(1) for a MAIOR probabilidade e o sinal estiver excluindo 1, sugere priorizar 1.
+    Retorna texto do aviso (ou '').
     """
-    if apos_num not in [1, 2, 3, 4]:
-        return False
-    probs = probs_depois(apos_num)   # [0, p1, p2, p3, p4]
+    ultimo_ref = apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None)
+    probs = probs_depois(ultimo_ref)  # [0,p1,p2,p3,p4]
+    p1 = probs[1]
+    # maior prob?
+    maior_idx = max(range(1,5), key=lambda i: probs[i])
+    if maior_idx == 1 and (alvos and 1 not in alvos):
+        return f"🔎 <b>Possível 1 — priorize o nº 1</b> (p≈{p1*100:.1f}%)"
+    return ""
+
+def aviso_muita_sequencia(apos_num, alvos):
+    """
+    Mantém apenas como informação (sem travar a entrada):
+    se p(repetir o próprio 'apos') for bem maior que a média e 'apos' não está nos alvos.
+    """
+    if apos_num not in [1,2,3,4]:
+        return ""
+    probs = probs_depois(apos_num)
     p_repeat = probs[apos_num]
-    # Limiar de repetição (40%); se o próprio número não está nos alvos, evite
     if p_repeat >= 0.40 and apos_num not in alvos:
-        return True
-    return False
+        return f"⚠️ Muita sequência do nº {apos_num} (p≈{p_repeat*100:.1f}%)"
+    return ""
 
 # =========================
 # Handlers
@@ -202,10 +215,9 @@ def risco_repeticao(apos_num, alvos):
 @dp.message_handler(commands=["start"])
 async def cmd_start(msg: types.Message):
     await msg.answer(
-        "🤖 Guardião de Risco (webhook) ativo!\n"
+        "🤖 Guardião de Risco (webhook)\n"
         f"• Canal monitorado: {CHANNEL_ID}\n"
-        f"• Limiar: {CONF_LIMIAR:.2f}\n"
-        "• Use /status para ver métricas."
+        "• Sem limiar fixo: sempre publico a taxa estimada e avisos."
     )
 
 @dp.message_handler(commands=["status"])
@@ -219,8 +231,7 @@ async def cmd_status(msg: types.Message):
         "📊 Status:\n"
         f"WR30: {short_wr*100:.1f}% | WR300: {long_wr*100:.1f}%\n"
         f"Volatilidade: {vol:.2f} | Max REDs: {reds}\n"
-        f"Último número Fantan: {ultimo}\n"
-        f"Limiar: {CONF_LIMIAR:.2f}"
+        f"Último número Fantan: {ultimo}"
     )
 
 # ====== Handler do CANAL (principal) ======
@@ -239,7 +250,7 @@ async def on_channel_post(message: types.Message):
         atualiza_estat_num(seq)
         logger.info("Sequência aprendida: %s (últ=%s)", seq, (ultimos_numeros[-1] if ultimos_numeros else None))
 
-    # 1) Aprender resultado (RED/WIN)
+    # 1) Aprender resultado (GREEN/RED)
     r = eh_resultado(txt)
     if r is not None:
         hist_long.append(r)
@@ -254,51 +265,39 @@ async def on_channel_post(message: types.Message):
     # 2) Sinal novo (ENTRADA CONFIRMADA)
     if eh_sinal(txt):
         now = time.time()
-
-        # cooldown: evita flood
         if now < state.get("cooldown_until", 0):
-            await bot.send_message(CHANNEL_ID, "🟥 <b>NEUTRO</b>", parse_mode="HTML")
-            return
+            return  # só anti-flood, sem 'neutro'
 
         apos_num, alvos = extrai_regra_sinal(txt)
-
-        # 🔒 Anti-loss por repetição — se arriscado, avisa qual número
-        if risco_repeticao(apos_num, alvos):
-            logger.info("Bloqueado padrão repetitivo: após %s ignorando ele mesmo", apos_num)
-            await bot.send_message(
-                CHANNEL_ID,
-                f"🟥 <b>NEUTRO — MUITA REPETIÇÃO</b> (nº {apos_num})",
-                parse_mode="HTML"
-            )
-            state["cooldown_until"] = now + COOLDOWN_S
-            save_state()
-            return
 
         # Métricas
         short_wr = winrate(hist_short)
         long_wr  = winrate(hist_long)
         vol      = volatilidade(hist_short)
         mx_reds  = streak_loss(hist_short)
-
-        # Probabilidade de acerto pelos alvos (p_hit) → risco = 1 - p_hit
         risco_num = risco_por_numeros(apos_num, alvos)
         conf = conf_final(short_wr, long_wr, vol, mx_reds, risco_num)
 
-        logger.info(
-            "SINAL conf=%.3f | WR30=%.2f WR300=%.2f vol=%.2f reds=%d | apos=%s alvos=%s risco_num=%.2f",
-            conf, short_wr, long_wr, vol, mx_reds, apos_num, alvos, risco_num
-        )
+        # Probabilidades por número para exibir
+        ref = apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None)
+        probs = probs_depois(ref)  # [0,p1..p4]
+        probs_txt = " | ".join(f"{i}:{probs[i]*100:.1f}%" for i in range(1,5))
 
-        if conf >= CONF_LIMIAR:
-            msg = (
-                "🟢 <b>CONFIRMAR</b>\n"
-                f"🎯 Chance: <b>{conf*100:.1f}%</b>\n"
-                f"🛡️ Risco: <b>BAIXO</b>\n"
-                f"🎯 Alvos: <b>{'-'.join(map(str, alvos)) if alvos else '—'}</b>\n"
-                "📍 Plano: <b>ENTRAR (até G1)</b>"
-            )
-        else:
-            msg = "🟥 <b>NEUTRO</b>"
+        # Avisos informativos (sem bloquear)
+        av1 = aviso_priorize_1(apos_num, alvos)
+        av2 = aviso_muita_sequencia(apos_num, alvos)
+        avisos = "\n".join([x for x in [av1, av2] if x])
+
+        msg = (
+            "🟢 <b>SINAL</b>\n"
+            f"🎯 Alvos: <b>{'-'.join(map(str, alvos)) if alvos else '—'}</b>\n"
+            f"📍 Após: <b>{apos_num if apos_num else '—'}</b>\n"
+            f"📊 Taxa estimada: <b>{conf*100:.1f}%</b>\n"
+            f"🧠 Prob. por nº → {probs_txt}\n"
+        )
+        if avisos:
+            msg += avisos + "\n"
+        msg += "📍 Plano sugerido: <b>ENTRAR (até G1)</b>"
 
         await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML")
         state["cooldown_until"] = now + COOLDOWN_S
@@ -315,8 +314,7 @@ def healthz():
 
 @app.on_event("startup")
 async def on_startup():
-    # Remove webhook antigo e configura o novo endpoint
-    base_url = (os.getenv("PUBLIC_URL") or "").rstrip("/")  # evita //webhook
+    base_url = (os.getenv("PUBLIC_URL") or "").rstrip("/")
     if not base_url:
         logger.warning("PUBLIC_URL não definido; defina no Render (ex.: https://seuservico.onrender.com)")
         return
