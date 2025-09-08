@@ -1,31 +1,43 @@
-# webhook_app.py — Guardião Fantan com “número seco” (1–4) ou multi-alvos
+# -*- coding: utf-8 -*-
+# webhook_app.py — Fantan: Número Seco com Padrões (n-grama) e Confiança >= 90% (Wilson 95%)
 
-import os, re, json, time, logging
-from collections import deque
+import os, re, json, time, logging, math
+from collections import defaultdict, deque
+from typing import Dict, Tuple, List, Optional
+
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
 
 # =========================
 # Config & Logging
 # =========================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("guardiao-fantan")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("fantan-numero-seco")
 
 BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Faltando TG_BOT_TOKEN")
 
-CHANNEL_ID      = int(os.getenv("CHANNEL_ID", "-1002810508717"))  # canal de sinais
-COOLDOWN_S      = int(os.getenv("COOLDOWN_S", "20"))              # anti-flood
-MODO_RECOM      = (os.getenv("MODO_RECOMENDACAO", "AUTO") or "AUTO").upper()  # AUTO|SECO|MULTI
-MIN_PROB_SECO   = float(os.getenv("MIN_PROB_SECO", "0.33"))       # prob mínima p/ enviar nº seco
-TOPK_MULTI      = int(os.getenv("TOPK_MULTI", "3"))               # qtos números no multi (quando necessário)
-ALPHA_SUAV      = float(os.getenv("ALPHA_SUAV", "1.0"))           # suavização Laplace
-MIN_TRANSICOES  = int(os.getenv("MIN_TRANSICOES", "8"))           # transições mínimas p/ confiar no "depois de X"
-CONF_MIN_ENVIO  = float(os.getenv("CONF_MIN_ENVIO", "0.0"))       # confiança mínima (0..1) para enviar
+# Canal de destino (onde o bot posta) — coloque o ID numérico do seu canal
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1002810508717"))
+
+# URL pública do Render (ou outro provedor) — ex.: https://seu-app.onrender.com
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").rstrip("/")
+
+# Anti-flood entre sinais
+COOLDOWN_S = int(os.getenv("COOLDOWN_S", "10"))
+
+# Parâmetros da mineração / decisão
+N_MAX       = int(os.getenv("N_MAX", "4"))         # comprimento máximo do padrão (1..4)
+MIN_SUP     = int(os.getenv("MIN_SUP", "20"))      # suporte mínimo do padrão
+CONF_MIN    = float(os.getenv("CONF_MIN", "0.90")) # limiar de envio (Wilson lower 95%)
+Z_WILSON    = float(os.getenv("Z_WILSON", "1.96")) # z=1.96 ≈ 95%
+
+# Relatórios
+SEND_SIGNALS  = int(os.getenv("SEND_SIGNALS", "1"))   # 1 envia sinal; 0 só imprime “Prévia/Neutro”
+REPORT_EVERY  = int(os.getenv("REPORT_EVERY", "5"))   # a cada N sinais enviados
+RESULTS_WIN   = int(os.getenv("RESULTS_WINDOW", "30"))
 
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp  = Dispatcher(bot)
@@ -35,268 +47,312 @@ dp  = Dispatcher(bot)
 # =========================
 STATE_FILE = "data/state.json"
 os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
-state = {"cooldown_until": 0.0}
+state = {
+    "cooldown_until": 0.0,
+    "sinais_enviados": 0,
+    "greens_total": 0,
+    "reds_total": 0
+}
 
 def load_state():
     try:
         if os.path.exists(STATE_FILE):
             state.update(json.load(open(STATE_FILE, "r", encoding="utf-8")))
     except Exception as e:
-        logger.warning("Falha ao carregar state: %s", e)
+        log.warning("Falha ao carregar state: %s", e)
 
 def save_state():
     try:
         json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.warning("Falha ao salvar state: %s", e)
+        log.warning("Falha ao salvar state: %s", e)
 
 load_state()
 
 # =========================
-# Buffers de aprendizado
+# Modelo e estatísticas
 # =========================
-hist_long  = deque(maxlen=300)   # histórico de greens/reds
-hist_short = deque(maxlen=30)
+# Mapa: pattern(tuple de ints de 1..4 com tamanho 1..N_MAX) -> contagens dos próximos números (1..4)
+# Ex.: pad=(2,4,1) => counts = [0, c1, c2, c3, c4], total = sum(c1..c4)
+pattern_counts: Dict[Tuple[int, ...], List[int]] = defaultdict(lambda: [0,0,0,0,0])
+pattern_totals: Dict[Tuple[int, ...], int] = defaultdict(int)
 
-ultimos_numeros = deque(maxlen=120)         # sequência bruta 1..4
-contagem_num    = [0, 0, 0, 0, 0]           # frequência global por nº
-transicoes      = [[0]*5 for _ in range(5)] # transicoes[a][b] = qtde de b após a
+# Para contexto online (últimos números observados)
+recent_nums = deque(maxlen=N_MAX)
 
-def atualiza_estat_num(seq_nums):
-    for n in seq_nums:
-        if 1 <= n <= 4:
-            if ultimos_numeros:
-                prev = ultimos_numeros[-1]
-                if 1 <= prev <= 4:
-                    transicoes[prev][n] += 1
-            ultimos_numeros.append(n)
-            contagem_num[n] += 1
+# Para relatórios GREEN/RED (se o canal publicar resultado)
+hist_long  = deque(maxlen=300)
+hist_short = deque(maxlen=60)
 
 # =========================
-# Métricas auxiliares
+# Regex dos parsers
 # =========================
-def winrate(d):
-    d = list(d)
-    return (sum(d) / len(d)) if d else 0.0
+re_sinal   = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
+re_seq     = re.compile(r"Sequ[eê]ncia[:\s]*([^\n]+)", re.I)
+re_apos    = re.compile(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", re.I)
+re_close   = re.compile(r"APOSTA\s+ENCERRADA", re.I)
+re_green   = re.compile(r"\bGREEN\b|✅", re.I)
+re_red     = re.compile(r"\bRED\b|❌", re.I)
 
-def volatilidade(d):
-    d = list(d)
-    if len(d) < 10:
-        return 0.0
-    trocas = sum(1 for i in range(1, len(d)) if d[i] != d[i-1])
-    return trocas / (len(d) - 1)
-
-def streak_loss(d):
-    s = 0; mx = 0
-    for x in d:
-        if x == 0:
-            s += 1; mx = max(mx, s)
-        else:
-            s = 0
-    return mx
-
-# =========================
-# Distribuições condicionais
-# =========================
-def _dist_global():
-    tot = sum(contagem_num[1:5]) + 4*ALPHA_SUAV
-    return [0] + [(contagem_num[i] + ALPHA_SUAV) / tot for i in range(1, 5)]
-
-def _dist_condicional(depois_de):
-    if not (isinstance(depois_de, int) and 1 <= depois_de <= 4):
-        return _dist_global()
-    total = sum(transicoes[depois_de][1:5])
-    if total < MIN_TRANSICOES:
-        return _dist_global()
-    tot = total + 4*ALPHA_SUAV
-    return [0] + [(transicoes[depois_de][i] + ALPHA_SUAV) / tot for i in range(1, 5)]
-
-def probs_depois(depois_de):
-    """Distribuição P(número | depois_de). Cai em global se dados insuficientes."""
-    return _dist_condicional(depois_de)
-
-# =========================
-# Score de risco/confiança
-# =========================
-def risco_por_alvos(apos_num, alvos):
-    if not alvos:
-        return 0.5
-    ultimo_ref = apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None)
-    probs = probs_depois(ultimo_ref)
-    p_hit = sum(probs[a] for a in alvos if 1 <= a <= 4)
-    return 1.0 - p_hit
-
-def conf_final(short_wr, long_wr, vol, max_reds, risco_alvos):
-    base = 0.55*short_wr + 0.30*long_wr + 0.10*(1.0 - vol) + 0.05*(1.0 - risco_alvos)
-    pena = 0.0
-    if max_reds >= 3: pena += 0.05 * (max_reds - 2)
-    if vol > 0.6:     pena += 0.05
-    return max(0.0, min(1.0, base - pena))
-
-# =========================
-# Parsers
-# =========================
-re_sinal     = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-re_seq       = re.compile(r"Sequ[eê]ncia[:\s]*([^\n]+)", re.I)
-re_apos      = re.compile(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", re.I)
-re_apostar   = re.compile(r"apostar\s+em\s+([A-Za-z]*\s*)?([1-4](?:[\s\-\|]*[1-4])*)", re.I)
-re_close     = re.compile(r"APOSTA\s+ENCERRADA", re.I)
-re_green     = re.compile(r"\bGREEN\b|✅", re.I)
-re_red       = re.compile(r"\bRED\b|❌", re.I)
-re_modo_seco = re.compile(r"\b(seco|1\s*n[uú]mero)\b", re.I)
-
-def eh_sinal(txt): 
+def eh_sinal(txt: str) -> bool:
     return bool(re_sinal.search(txt or ""))
 
-def extrai_sequencia(txt):
+def extrai_apos(txt: str) -> Optional[int]:
+    m = re_apos.search(txt or ""); 
+    return int(m.group(1)) if m else None
+
+def extrai_sequencia(txt: str) -> List[int]:
     m = re_seq.search(txt or "")
-    return [int(x) for x in re.findall(r"[1-4]", m.group(1))] if m else []
+    if not m: return []
+    return [int(x) for x in re.findall(r"[1-4]", m.group(1))]
 
-def extrai_regra_sinal(txt):
-    m1 = re_apos.search(txt or "")
-    m2 = re_apostar.search(txt or "")
-    apos = int(m1.group(1)) if m1 else None
-    alvos = [int(x) for x in re.findall(r"[1-4]", (m2.group(2) if m2 else ""))]
-    return (apos, alvos)
-
-def eh_resultado(txt):
-    up = (txt or "").upper()
-    if not re_close.search(up): return None
-    if re_green.search(up): return 1
-    if re_red.search(up):   return 0
+def eh_resultado(txt: str) -> Optional[int]:
+    u = (txt or "").upper()
+    if not re_close.search(u): return None
+    if re_green.search(u): return 1
+    if re_red.search(u):   return 0
     return None
 
-def pedido_modo_seco(txt):
-    return bool(re_modo_seco.search(txt or ""))
+# =========================
+# Atualização do modelo
+# =========================
+def alimentar_sequencia(nums: List[int]):
+    """Alimenta a mineração de padrões com uma sequência crua (… a, b, c, …)."""
+    if not nums: 
+        return
+    # Atualiza padrões n-grama
+    # Para cada posição i, olhe para trás até N_MAX e conte (padrão -> próximo)
+    for i in range(1, len(nums)):
+        nxt = nums[i]
+        if nxt < 1 or nxt > 4: 
+            continue
+        # constrói janelas de tamanho 1..N_MAX que terminam em i-1
+        for n in range(1, N_MAX + 1):
+            if i - n < 0: break
+            pad = tuple(nums[i - n:i])   # últimos n números antes de nxt
+            if not pad: 
+                continue
+            if any((x < 1 or x > 4) for x in pad):
+                continue
+            # conta
+            pattern_counts[pad][nxt] += 1
+            pattern_totals[pad]      += 1
+
+    # Atualiza contexto online
+    for x in nums:
+        if 1 <= x <= 4:
+            if len(recent_nums) == N_MAX:
+                recent_nums.popleft()
+            recent_nums.append(x)
 
 # =========================
-# Regras de recomendação
+# Estatística: Limite inferior de Wilson (95% por padrão)
 # =========================
-def escolhe_numero_seco(apos_num):
-    """Retorna (numero, probabilidade) do melhor nº 1..4 após 'apos_num' (ou global)."""
-    ref = apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None)
-    p = probs_depois(ref)
-    # argmax entre 1..4
-    melhor = max(range(1,5), key=lambda i: p[i])
-    return melhor, p[melhor]
-
-def escolhe_multi_alvos(apos_num, k=TOPK_MULTI):
-    """Retorna top-k números por probabilidade após 'apos_num' (ou global)."""
-    ref = apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None)
-    p = probs_depois(ref)
-    ordem = sorted(range(1,5), key=lambda i: p[i], reverse=True)
-    return ordem[:max(1, min(4, k))], [p[i] for i in ordem[:max(1, min(4, k))]]
-
-def define_modo_recomendacao(txt):
-    if MODO_RECOM in ("SECO", "MULTI"):
-        return MODO_RECOM
-    # AUTO: decide pelo conteúdo do texto
-    return "SECO" if pedido_modo_seco(txt) else "MULTI"
+def wilson_lower(successes: int, n: int, z: float = Z_WILSON) -> float:
+    if n == 0:
+        return 0.0
+    phat = successes / n
+    denom = 1 + z*z/n
+    centre = phat + z*z/(2*n)
+    margin = z*math.sqrt((phat*(1 - phat) + z*z/(4*n)) / n)
+    return max(0.0, (centre - margin) / denom)
 
 # =========================
-# Handlers
+# Decisão em tempo real
+# =========================
+def contexto_candidato(apos: Optional[int]) -> List[Tuple[int, ...]]:
+    """
+    Retorna lista de padrões candidatos (do maior N para o menor),
+    respeitando 'Entrar após o k' se fornecido.
+    """
+    candidates = []
+    # usamos os últimos números observados e/ou o 'apos'
+    base = list(recent_nums)
+    # se veio "após k", garantimos que o último do padrão é k:
+    if apos is not None:
+        base = (base + [apos]) if (not base or base[-1] != apos) else base
+
+    # gerar padrões do maior para o menor
+    for n in range(min(N_MAX, len(base)), 0, -1):
+        pad = tuple(base[-n:])
+        candidates.append(pad)
+    return candidates
+
+def decidir_numero(apos: Optional[int]):
+    """
+    Procura o melhor (padrão -> X) com:
+      - suporte >= MIN_SUP
+      - wilson_lower >= CONF_MIN
+    Prioriza N maior; em empate, maior Wilson; depois maior suporte; depois menor X.
+    Retorna: (numero_escolhido, padrao, N, wilson_low, p_hat, suporte, distribuicao_dict) ou None
+    """
+    cands = contexto_candidato(apos)
+    for pad in cands:  # já vem N grande -> pequeno
+        total = pattern_totals.get(pad, 0)
+        if total < MIN_SUP:
+            continue
+        cnts = pattern_counts.get(pad, [0,0,0,0,0])
+        # Distribuição e melhores
+        best = None
+        for x in (1,2,3,4):
+            s = cnts[x]
+            wl = wilson_lower(s, total)
+            if wl >= CONF_MIN:
+                p_hat = s / total
+                item = (wl, p_hat, total, x)
+                if (best is None) or (item > best):
+                    best = item
+        if best:
+            wl, p_hat, total, x = best
+            dist = {i: (cnts[i]/total) for i in (1,2,3,4)}
+            return x, pad, len(pad), wl, p_hat, total, dist
+    return None
+
+# =========================
+# Mensagens
+# =========================
+def fmt_dist(dist: Dict[int,float]) -> str:
+    return " | ".join(f"{i}:{dist[i]*100:.1f}%" for i in (1,2,3,4))
+
+async def enviar_sinal(x: int, pad: Tuple[int,...], n: int, wl: float, p_hat: float, total: int, dist: Dict[int,float], apos: Optional[int]):
+    msg = (
+        "🟢 <b>SINAL (NÚMERO SECO)</b>\n"
+        f"🎯 Número: <b>{x}</b>\n"
+        f"📍 Padrão: <b>{pad}</b> | N={n}"
+        + (f" | Após: <b>{apos}</b>" if apos else "") + "\n"
+        f"🧠 Conf. (Wilson 95%): <b>{wl*100:.1f}%</b>  (p̂={p_hat*100:.1f}% | amostra={total})\n"
+        f"📈 Distribuição após {pad}: {fmt_dist(dist)}"
+    )
+    await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML")
+
+async def enviar_neutro(apos: Optional[int]):
+    base_ctx = list(recent_nums)
+    if apos is not None:
+        base_ctx = (base_ctx + [apos]) if (not base_ctx or base_ctx[-1] != apos) else base_ctx
+    ctx = tuple(base_ctx[-min(len(base_ctx), N_MAX):]) if base_ctx else ()
+    msg = (
+        "😐 <b>Neutro — avaliando combinações</b>\n"
+        f"📍 Contexto atual: <b>{ctx if ctx else '—'}</b>\n"
+        f"🔎 Nenhum padrão com Wilson ≥ {CONF_MIN*100:.0f}% e suporte ≥ {MIN_SUP} (N=1..{N_MAX})."
+    )
+    await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML")
+
+# =========================
+# Relatórios
+# =========================
+def taxa(d): 
+    d = list(d); 
+    return (sum(d)/len(d)) if d else 0.0
+
+def taxa_ultimos(d, n):
+    d = list(d)[-n:]
+    return (sum(d)/len(d)) if d else 0.0
+
+async def envia_resumo():
+    short_wr = taxa(hist_short)
+    long_wr  = taxa(hist_long)
+    lastN_wr = taxa_ultimos(hist_long, RESULTS_WIN)
+    total    = state.get("greens_total",0)+state.get("reds_total",0)
+    overall  = (state.get("greens_total",0)/total) if total else 0.0
+    msg = (
+        "📊 <b>Resumo</b>\n"
+        f"🧪 Últimos {RESULTS_WIN}: <b>{lastN_wr*100:.1f}%</b>\n"
+        f"⏱️ Curto (≈{len(hist_short)}): <b>{short_wr*100:.1f}%</b>\n"
+        f"📚 Longo (≈{len(hist_long)}): <b>{long_wr*100:.1f}%</b>\n"
+        f"🌐 Geral: <b>{overall*100:.1f}%</b> "
+        f"({state.get('greens_total',0)}✅ / {state.get('reds_total',0)}❌)"
+    )
+    await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML")
+
+# =========================
+# Handlers Telegram
 # =========================
 @dp.message_handler(commands=["start"])
 async def cmd_start(msg: types.Message):
     info = (
-        "🤖 Guardião Fantan ativo!\n\n"
-        "• Modos: <b>SECO</b> (1 número) ou <b>MULTI</b> (2–3 números).\n"
-        "• Ambiente: MODO_RECOMENDACAO=AUTO|SECO|MULTI, "
-        f"MIN_PROB_SECO={MIN_PROB_SECO}, TOPK_MULTI={TOPK_MULTI}.\n"
-        "• Para forçar número seco no texto, inclua: “seco” ou “1 número”."
+        "🤖 Fantan — Modo <b>NÚMERO SECO</b> com padrões (n-grama)\n"
+        f"• N_MAX={N_MAX} | MIN_SUP={MIN_SUP} | CONF_MIN={CONF_MIN:.2f} (Wilson 95%)\n"
+        f"• SEND_SIGNALS={SEND_SIGNALS} (1 envia | 0 só prévia/neutro)\n"
+        f"• REPORT_EVERY={REPORT_EVERY} | RESULTS_WINDOW={RESULTS_WIN}\n"
+        "Comandos: /status"
     )
-    await msg.answer(info)
+    await msg.answer(info, parse_mode="HTML")
+
+@dp.message_handler(commands=["status"])
+async def cmd_status(msg: types.Message):
+    await envia_resumo()
 
 @dp.channel_post_handler(content_types=["text"])
 async def on_channel_post(message: types.Message):
-    if message.chat.id != CHANNEL_ID: 
+    if message.chat.id != CHANNEL_ID:
         return
     txt = (message.text or "").strip()
-    if not txt: 
+    if not txt:
         return
 
-    # 1) Alimenta estatística com sequência bruta (se houver)
+    # 1) Alimenta modelo com SEQUÊNCIA (histórico completo)
     seq = extrai_sequencia(txt)
-    if seq: 
-        atualiza_estat_num(seq)
+    if seq:
+        alimentar_sequencia(seq)
 
-    # 2) Resultado de aposta (GREEN/RED)
+    # 2) Resultado GREEN/RED (para resumo; não altera decisão do padrão)
     r = eh_resultado(txt)
     if r is not None:
         hist_long.append(r)
         hist_short.append(r)
+        if r == 1: state["greens_total"] += 1
+        else: state["reds_total"] += 1
+        save_state()
         return
 
-    # 3) Novo SINAL
+    # 3) SINAL → decidir número seco com base nas combinações
     if eh_sinal(txt):
         now = time.time()
-        if now < state.get("cooldown_until", 0): 
+        if now < state.get("cooldown_until", 0):
             return
 
-        apos_num, alvos_txt = extrai_regra_sinal(txt)
-        modo = define_modo_recomendacao(txt)
+        apos = extrai_apos(txt)  # pode ser None
+        decisao = decidir_numero(apos)
 
-        # Gera recomendação de acordo com o modo + o que veio no sinal
-        if modo == "SECO":
-            num, pnum = escolhe_numero_seco(apos_num)
-            alvos = [num]
-            tipo = "NÚMERO SECO"
-            prob_info = f"{num}:{pnum*100:.1f}%"
-            # opcional: exigir prob mínima
-            if pnum < MIN_PROB_SECO:
-                logger.info("Probabilidade (%.3f) abaixo do mínimo (%.3f). Sinal não enviado.", pnum, MIN_PROB_SECO)
-                return
-        else:  # MULTI
-            if alvos_txt:  # se o sinal já veio com alvos, usa-os
-                alvos = [a for a in alvos_txt if 1 <= a <= 4]
-                # ainda mostramos probabilidades por nº
-                p = probs_depois(apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None))
-                prob_info = " | ".join(f"{i}:{p[i]*100:.1f}%" for i in range(1,5))
-            else:
-                # gerar automaticamente top-k
-                alvos, pks = escolhe_multi_alvos(apos_num, k=TOPK_MULTI)
-                prob_info = " | ".join(f"{a}:{pk*100:.1f}%" for a, pk in zip(alvos, pks))
-            tipo = "MULTI-ALVOS"
-
-        # 4) Métricas e confiança
-        short_wr = winrate(hist_short); long_wr = winrate(hist_long)
-        vol      = volatilidade(hist_short); mx_reds = streak_loss(hist_short)
-        risco    = risco_por_alvos(apos_num, alvos)
-        conf     = conf_final(short_wr, long_wr, vol, mx_reds, risco)
-
-        if conf < CONF_MIN_ENVIO:
-            logger.info("Confiança (%.3f) abaixo de CONF_MIN_ENVIO (%.3f). Sinal não enviado.", conf, CONF_MIN_ENVIO)
+        if decisao is None:
+            # Sem padrão válido ≥90% → neutro
+            await enviar_neutro(apos)
+            state["cooldown_until"] = now + COOLDOWN_S
+            save_state()
             return
 
-        # 5) Mensagem
-        p_all = probs_depois(apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None))
-        probs_txt = " | ".join(f"{i}:{p_all[i]*100:.1f}%" for i in range(1,5))
+        x, pad, n, wl, p_hat, total, dist = decisao
 
-        msg_out = (
-            f"🟢 <b>SINAL ({tipo})</b>\n"
-            f"🎯 Recomendação: <b>{'-'.join(map(str, alvos)) if alvos else '—'}</b>\n"
-            f"📍 Após: <b>{apos_num if apos_num else '—'}</b>\n"
-            f"📊 Confiança: <b>{conf*100:.1f}%</b>\n"
-            f"🧠 Prob. alvo(s): {prob_info}\n"
-            f"📈 Prob. por nº: {probs_txt}"
-        )
-
-        await bot.send_message(CHANNEL_ID, msg_out, parse_mode="HTML")
-        state["cooldown_until"] = now + COOLDOWN_S
-        save_state()
+        if SEND_SIGNALS == 1:
+            await enviar_sinal(x, pad, n, wl, p_hat, total, dist, apos)
+            state["sinais_enviados"] += 1
+            state["cooldown_until"] = now + COOLDOWN_S
+            save_state()
+            # resumo periódico
+            if REPORT_EVERY > 0 and state["sinais_enviados"] % REPORT_EVERY == 0:
+                await envia_resumo()
+        else:
+            # Modo teste: só imprime uma prévia discreta
+            prev = (
+                f"👀 Prévia (não enviado) — SECO {x} | pad={pad} N={n} | "
+                f"wilson={wl*100:.1f}% | p̂={p_hat*100:.1f}% | N={total} | dist: {fmt_dist(dist)}"
+            )
+            await bot.send_message(CHANNEL_ID, prev, parse_mode="HTML")
+            state["cooldown_until"] = now + COOLDOWN_S
+            save_state()
 
 # =========================
-# FastAPI
+# FastAPI (webhook)
 # =========================
 app = FastAPI()
 
 @app.on_event("startup")
 async def on_startup():
-    base_url = (os.getenv("PUBLIC_URL") or "").rstrip("/")
-    if not base_url: 
+    if not PUBLIC_URL:
+        log.warning("PUBLIC_URL não definido — webhook não será configurado.")
         return
     await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(f"{base_url}/webhook/{BOT_TOKEN}")
+    await bot.set_webhook(f"{PUBLIC_URL}/webhook/{BOT_TOKEN}")
 
 @app.post(f"/webhook/{BOT_TOKEN}")
 async def telegram_webhook(request: Request):
