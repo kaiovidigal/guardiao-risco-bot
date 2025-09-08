@@ -1,4 +1,4 @@
-# webhook_app.py — Guardião de Risco (sem limiar; sempre mostra confiança + aviso "priorize nº 1")
+# webhook_app.py — Guardião de Risco (sem limiar; confiança + avisos, sem "Plano sugerido")
 
 import os, re, json, time, logging
 from collections import deque
@@ -92,12 +92,7 @@ def streak_loss(d):
     return mx
 
 def probs_depois(depois_de):
-    """
-    Retorna vetor [0, p(1), p(2), p(3), p(4)] com suavização de Laplace (alpha=1).
-    Se não houver dados suficientes para 'depois_de', usa a distribuição global.
-    """
     alpha = 1.0
-
     def dist_global():
         tot = sum(contagem_num[1:5]) + 4*alpha
         return [0] + [(contagem_num[i] + alpha) / tot for i in range(1, 5)]
@@ -113,9 +108,6 @@ def probs_depois(depois_de):
     return [0] + [(transicoes[depois_de][i] + alpha) / tot for i in range(1, 5)]
 
 def risco_por_numeros(apos_num, alvos):
-    """
-    risco = 1 - p_hit dos alvos, dado o 'apos_num' (ou último observado).
-    """
     if not alvos:
         return 0.5
     ultimo_ref = apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None)
@@ -124,10 +116,6 @@ def risco_por_numeros(apos_num, alvos):
     return max(0.0, min(1.0, 1.0 - p_hit))
 
 def conf_final(short_wr, long_wr, vol, max_reds, risco_num):
-    """
-    Confiança [0..1] combinando WR curto/longo, estabilidade e risco numérico.
-    (Sem limiar de decisão — apenas informativa.)
-    """
     base = 0.55*short_wr + 0.30*long_wr + 0.10*(1.0 - vol) + 0.05*(1.0 - risco_num)
     pena = 0.0
     if max_reds >= 3:
@@ -144,7 +132,6 @@ re_seq     = re.compile(r"Sequ[eê]ncia[:\s]*([^\n]+)", re.I)
 re_apos    = re.compile(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", re.I)
 re_apostar = re.compile(r"apostar\s+em\s+([A-Za-z]*\s*)?([1-4](?:[\s\-\|]*[1-4])*)", re.I)
 
-# RESULTADO: só conta GREEN/RED explícitos
 re_close   = re.compile(r"\bAPOSTA\s+ENCERRADA\b", re.I)
 re_green   = re.compile(r"\bGREEN\b|✅", re.I)
 re_red     = re.compile(r"\bRED\b|❌", re.I)
@@ -166,41 +153,26 @@ def extrai_regra_sinal(txt):
     return (apos, alvos)
 
 def eh_resultado(txt):
-    """
-    1 = GREEN, 0 = RED, None = não identificado.
-    Requer 'APOSTA ENCERRADA' + palavra/emoji de GREEN ou RED.
-    """
     up = (txt or "").upper()
     if not re_close.search(up):
         return None
     if re_green.search(up): return 1
     if re_red.search(up):   return 0
-    return None  # NÃO força RED quando não é explícito
+    return None
 
 # =====================
-# Avisos (sem bloqueio)
+# Avisos (sem bloquear)
 # =====================
 def aviso_priorize_1(apos_num, alvos):
-    """
-    Sem threshold fixo:
-    - calcula p(1) condicional (ou global)
-    - se p(1) for a MAIOR probabilidade e o sinal estiver excluindo 1, sugere priorizar 1.
-    Retorna texto do aviso (ou '').
-    """
     ultimo_ref = apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None)
-    probs = probs_depois(ultimo_ref)  # [0,p1,p2,p3,p4]
+    probs = probs_depois(ultimo_ref)
     p1 = probs[1]
-    # maior prob?
     maior_idx = max(range(1,5), key=lambda i: probs[i])
     if maior_idx == 1 and (alvos and 1 not in alvos):
         return f"🔎 <b>Possível 1 — priorize o nº 1</b> (p≈{p1*100:.1f}%)"
     return ""
 
 def aviso_muita_sequencia(apos_num, alvos):
-    """
-    Mantém apenas como informação (sem travar a entrada):
-    se p(repetir o próprio 'apos') for bem maior que a média e 'apos' não está nos alvos.
-    """
     if apos_num not in [1,2,3,4]:
         return ""
     probs = probs_depois(apos_num)
@@ -217,7 +189,7 @@ async def cmd_start(msg: types.Message):
     await msg.answer(
         "🤖 Guardião de Risco (webhook)\n"
         f"• Canal monitorado: {CHANNEL_ID}\n"
-        "• Sem limiar fixo: sempre publico a taxa estimada e avisos."
+        "• Sempre publico a taxa estimada e avisos (sem plano sugerido)."
     )
 
 @dp.message_handler(commands=["status"])
@@ -234,43 +206,34 @@ async def cmd_status(msg: types.Message):
         f"Último número Fantan: {ultimo}"
     )
 
-# ====== Handler do CANAL (principal) ======
+# ====== Handler do CANAL ======
 @dp.channel_post_handler(content_types=["text"])
 async def on_channel_post(message: types.Message):
     if message.chat.id != CHANNEL_ID:
         return
-
     txt = (message.text or "").strip()
     if not txt:
         return
 
-    # 0) Aprender sequência Fantan (atualiza contagens e transições)
     seq = extrai_sequencia(txt)
     if seq:
         atualiza_estat_num(seq)
-        logger.info("Sequência aprendida: %s (últ=%s)", seq, (ultimos_numeros[-1] if ultimos_numeros else None))
+        logger.info("Sequência aprendida: %s", seq)
 
-    # 1) Aprender resultado (GREEN/RED)
     r = eh_resultado(txt)
     if r is not None:
         hist_long.append(r)
         hist_short.append(r)
-        logger.info(
-            "Resultado %s | WR30=%.1f%% WR300=%.1f%%",
-            "WIN" if r == 1 else "RED",
-            winrate(hist_short)*100, winrate(hist_long)*100
-        )
+        logger.info("Resultado %s", "WIN" if r == 1 else "RED")
         return
 
-    # 2) Sinal novo (ENTRADA CONFIRMADA)
     if eh_sinal(txt):
         now = time.time()
         if now < state.get("cooldown_until", 0):
-            return  # só anti-flood, sem 'neutro'
+            return
 
         apos_num, alvos = extrai_regra_sinal(txt)
 
-        # Métricas
         short_wr = winrate(hist_short)
         long_wr  = winrate(hist_long)
         vol      = volatilidade(hist_short)
@@ -278,12 +241,10 @@ async def on_channel_post(message: types.Message):
         risco_num = risco_por_numeros(apos_num, alvos)
         conf = conf_final(short_wr, long_wr, vol, mx_reds, risco_num)
 
-        # Probabilidades por número para exibir
         ref = apos_num if apos_num else (ultimos_numeros[-1] if ultimos_numeros else None)
-        probs = probs_depois(ref)  # [0,p1..p4]
+        probs = probs_depois(ref)
         probs_txt = " | ".join(f"{i}:{probs[i]*100:.1f}%" for i in range(1,5))
 
-        # Avisos informativos (sem bloquear)
         av1 = aviso_priorize_1(apos_num, alvos)
         av2 = aviso_muita_sequencia(apos_num, alvos)
         avisos = "\n".join([x for x in [av1, av2] if x])
@@ -297,7 +258,6 @@ async def on_channel_post(message: types.Message):
         )
         if avisos:
             msg += avisos + "\n"
-        msg += "📍 Plano sugerido: <b>ENTRAR (até G1)</b>"
 
         await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML")
         state["cooldown_until"] = now + COOLDOWN_S
@@ -316,7 +276,7 @@ def healthz():
 async def on_startup():
     base_url = (os.getenv("PUBLIC_URL") or "").rstrip("/")
     if not base_url:
-        logger.warning("PUBLIC_URL não definido; defina no Render (ex.: https://seuservico.onrender.com)")
+        logger.warning("PUBLIC_URL não definido")
         return
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_webhook(f"{base_url}/webhook/{BOT_TOKEN}")
