@@ -1,143 +1,204 @@
-# webhook_app.py
-import os
-import json
-import logging
-from typing import Any, Dict, Optional
-
-from fastapi import FastAPI, Request
+import os, re, json, hmac, hashlib, time
+from typing import Any, Dict
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import uvicorn
+import nest_asyncio
+nest_asyncio.apply()
 
-# --- logging bonitinho ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("fantan-auto")
+# ===== Config =====
+CONF_MIN = float(os.getenv("CONF_MIN", "0.90"))
+REQUIRE_G1 = os.getenv("REQUIRE_G1", "1") == "1"
 
-app = FastAPI(title="guardiao-risco-bot webhook")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+DEST_CHAT_ID = int(os.getenv("DEST_CHAT_ID", "0"))
 
-# ========================
-# Config por variáveis de ambiente
-# ========================
-CONF_MIN      = float(os.getenv("CONF_MIN", "0.82"))
-MIN_SUP_G0    = int(os.getenv("MIN_SUP_G0", "10"))
-MIN_SUP_G1    = int(os.getenv("MIN_SUP_G1", "8"))
-N_MAX         = int(os.getenv("N_MAX", "4"))
-Z_WILSON      = float(os.getenv("Z_WILSON", "1.96"))
-COOLDOWN_S    = int(os.getenv("COOLDOWN_S", "6"))
-SEND_SIGNALS  = int(os.getenv("SEND_SIGNALS", "1"))
-REPORT_EVERY  = int(os.getenv("REPORT_EVERY", "5"))
-RESULTS_WINDOW= int(os.getenv("RESULTS_WINDOW", "30"))
-
-PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()    # ex: @fantanovidigal
-AUTO_SCRAPE    = int(os.getenv("AUTO_SCRAPE", "1"))
+PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "@fantanvidigal")
+AUTO_SCRAPE = os.getenv("AUTO_SCRAPE", "1") == "1"
 SCRAPE_EVERY_S = int(os.getenv("SCRAPE_EVERY_S", "120"))
-SCRAPE_LIMIT   = int(os.getenv("SCRAPE_LIMIT", "1000"))
+SCRAPE_LIMIT = int(os.getenv("SCRAPE_LIMIT", "1000"))
 
-# Para mostrar no /status
-def current_conf() -> Dict[str, Any]:
+# ===== Bot (aiogram 2.x) =====
+from aiogram import Bot, types
+from aiogram.utils.exceptions import MessageNotModified
+
+bot: Bot | None = None
+if TG_BOT_TOKEN and DEST_CHAT_ID:
+    bot = Bot(token=TG_BOT_TOKEN, parse_mode="HTML")
+
+# ===== App =====
+app = FastAPI(title="fantan-auto webhook")
+
+# Cache simples pra evitar duplicados (hash->expiração)
+CACHE: Dict[str, float] = {}
+CACHE_TTL = 30 * 60  # 30 min
+
+def _now() -> float:
+    return time.time()
+
+def cache_seen(key: str) -> bool:
+    # purge
+    now = _now()
+    expired = [k for k,v in CACHE.items() if v < now]
+    for k in expired:
+        CACHE.pop(k, None)
+    if key in CACHE:
+        return True
+    CACHE[key] = now + CACHE_TTL
+    return False
+
+# ===== Parsers =====
+RE_PCT = re.compile(r"Acertamos\s+(\d{1,3}(?:[.,]\d+)?)%\s+das", re.I)
+RE_SEQ = re.compile(r"Sequ[eê]ncia\s*:\s*([0-9]+)", re.I)
+RE_MESA = re.compile(r"Mesa\s*:\s*([^\n\r]+)", re.I)
+RE_ESTR = re.compile(r"Estrat[eé]gia\s*:\s*([0-9]+)", re.I)
+RE_GALES = re.compile(r"Fazer até\s*([0-9]+)\s*gales", re.I)
+
+def parse_signal(text: str) -> Dict[str, Any] | None:
+    """Retorna um dict com os campos do sinal se for 'ENTRADA CONFIRMADA'."""
+    if "ENTRADA CONFIRMADA" not in text.upper():
+        return None
+
+    pct = None
+    m = RE_PCT.search(text)
+    if m:
+        pct = float(m.group(1).replace(",", "."))
+        pct /= 100.0
+
+    seq = None
+    m = RE_SEQ.search(text)
+    if m:
+        seq = int(m.group(1))
+
+    mesa = None
+    m = RE_MESA.search(text)
+    if m:
+        mesa = m.group(1).strip()
+
+    estrategia = None
+    m = RE_ESTR.search(text)
+    if m:
+        estrategia = m.group(1)
+
+    gales = None
+    m = RE_GALES.search(text)
+    if m:
+        gales = int(m.group(1))
+
     return {
-        "CONF_MIN": CONF_MIN,
-        "MIN_SUP_G0": MIN_SUP_G0,
-        "MIN_SUP_G1": MIN_SUP_G1,
-        "N_MAX": N_MAX,
-        "Z_WILSON": Z_WILSON,
-        "COOLDOWN_S": COOLDOWN_S,
-        "SEND_SIGNALS": SEND_SIGNALS,
-        "REPORT_EVERY": REPORT_EVERY,
-        "RESULTS_WINDOW": RESULTS_WINDOW,
+        "pct": pct,
+        "seq": seq,
+        "mesa": mesa,
+        "estrategia": estrategia,
+        "gales": gales,
+        "raw": text.strip()
     }
 
-def current_scrape() -> Dict[str, Any]:
-    return {
-        "PUBLIC_CHANNEL": PUBLIC_CHANNEL,
-        "SCRAPE_EVERY_S": SCRAPE_EVERY_S,
-        "SCRAPE_LIMIT": SCRAPE_LIMIT,
-        "AUTO_SCRAPE": AUTO_SCRAPE,
-    }
+def approved(sig: Dict[str, Any]) -> bool:
+    # % mínima
+    if sig["pct"] is not None and sig["pct"] < CONF_MIN:
+        return False
+    # G1 exigido
+    if REQUIRE_G1 and (sig["seq"] is None or sig["seq"] != 1):
+        return False
+    return True
 
-# ========================
-# Model para testes do /ingest
-# ========================
-class IngestPayload(BaseModel):
-    chat_id: Optional[int] = None
-    message_id: Optional[int] = None
-    text: str
+def fmt_signal(sig: Dict[str, Any]) -> str:
+    pct_txt = f"{int(sig['pct']*100)}%" if sig["pct"] is not None else "N/D"
+    seq_txt = f"G{sig['seq']}" if sig["seq"] is not None else "G?"
+    mesa = sig["mesa"] or "-"
+    estr = sig["estrategia"] or "-"
+    gales = sig["gales"]
+    gales_txt = f"{gales}" if gales is not None else "?"
+    return (
+        "<b>✅ SINAL CONFIRMADO</b>\n"
+        f"• Mesa: <b>{mesa}</b>\n"
+        f"• Estratégia: <code>{estr}</code>\n"
+        f"• Sequência: <b>{seq_txt}</b>\n"
+        f"• Confiança: <b>{pct_txt}</b>\n"
+        f"• Gales até: <b>{gales_txt}</b>\n"
+        "—\n"
+        "<i>Origem:</i> canal público\n"
+    )
 
-# ========================
-# Endpoints
-# ========================
+# ===== Modelos =====
+class TelegramUpdate(BaseModel):
+    update_id: int | None = None
+    message: Dict[str, Any] | None = None
+    edited_message: Dict[str, Any] | None = None
+    channel_post: Dict[str, Any] | None = None
+    edited_channel_post: Dict[str, Any] | None = None
 
-@app.get("/")
-async def root():
-    return {"ok": True, "hint": "use /status, /ingest (POST) ou /webhook/{token}"}
+def extract_text(update: TelegramUpdate) -> tuple[str | None, int | None]:
+    """Retorna (texto, message_id). Lê message / channel_post."""
+    src = update.channel_post or update.message or update.edited_channel_post or update.edited_message
+    if not src:
+        return None, None
+    txt = src.get("text") or src.get("caption")
+    mid = src.get("message_id")
+    return txt, mid
 
+# ===== Endpoints =====
 @app.get("/status")
 async def status():
     return {
         "ok": True,
-        "conf": current_conf(),
-        "scrape": current_scrape(),
-        "bot": {"enabled": bool(os.getenv("TG_BOT_TOKEN", "").strip())},
-        "webhook": "/webhook/{token}",
+        "conf": {
+            "CONF_MIN": CONF_MIN,
+            "REQUIRE_G1": REQUIRE_G1,
+        },
+        "scrape": {
+            "PUBLIC_CHANNEL": PUBLIC_CHANNEL,
+            "SCRAPE_EVERY_S": SCRAPE_EVERY_S,
+            "SCRAPE_LIMIT": SCRAPE_LIMIT,
+            "AUTO_SCRAPE": 1 if AUTO_SCRAPE else 0,
+        },
+        "bot": {
+            "enabled": 1 if bot else 0,
+            "DEST_CHAT_ID": DEST_CHAT_ID,
+        },
+        "webhook": "/webhook/{TG_BOT_TOKEN}"
     }
 
-@app.post("/ingest")
-async def ingest(payload: IngestPayload):
-    """
-    Endpoint de teste manual: você pode postar textos aqui
-    para simular um 'sinal' e ver o processamento.
-    """
-    log.info("🧪 /ingest recebido: %s", payload.model_dump())
-    # aqui você poderia chamar o mesmo pipeline de parse/score que o scraper usa
-    return {"ok": True, "echo": payload.model_dump()}
-
-# ------------ IMPORTANTE -------------
-# Webhook dinâmico: aceita /webhook/<token> (o formato que o Telegram usa)
 @app.post("/webhook/{token}")
 async def webhook_dyn(token: str, request: Request):
-    try:
-        data = await request.json()
-    except Exception:
-        # fallback: pode vir como form/urlencoded em alguns casos
-        body = await request.body()
+    # Opcional: recusar se token não confere com o do bot
+    if TG_BOT_TOKEN and token != TG_BOT_TOKEN:
+        return JSONResponse({"ok": False, "error": "bad token"}, status_code=403)
+
+    data = await request.json()
+    upd = TelegramUpdate(**data)
+    text, mid = extract_text(upd)
+
+    if not text:
+        return {"ok": True, "skipped": "no_text"}
+
+    # Evitar duplicados por hash de conteúdo
+    key = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    if cache_seen(key):
+        return {"ok": True, "skipped": "duplicate"}
+
+    # Tenta parsear sinal
+    sig = parse_signal(text)
+    if not sig:
+        return {"ok": True, "skipped": "no_signal"}
+
+    if not approved(sig):
+        return {"ok": True, "skipped": "filtered_out", "sig": sig}
+
+    # Envia pro destino
+    sent = False
+    if bot and DEST_CHAT_ID:
         try:
-            data = json.loads(body.decode("utf-8"))
-        except Exception:
-            data = {"raw": body.decode("utf-8", errors="ignore")}
-    log.info("📩 Webhook recebido para token=%s: %s", token, json.dumps(data)[:2000])
-    # Se quiser validar o token, compare com TG_BOT_TOKEN do ambiente
-    tg_token = os.getenv("TG_BOT_TOKEN", "").strip()
-    if tg_token and token != tg_token:
-        log.warning("⚠️ Token no path não confere com TG_BOT_TOKEN do ambiente.")
-    # TODO: aqui você processa updates do Telegram (mensagens, callbacks etc.)
-    return {"ok": True}
+            await bot.send_message(DEST_CHAT_ID, fmt_signal(sig))
+            sent = True
+        except Exception as e:
+            print("Erro ao enviar ao bot:", e)
 
-# Webhook fixo (compat): aceita /webhook sem token e encaminha para o dinâmico
-@app.post("/webhook")
-async def webhook_fixed(request: Request):
-    token = os.getenv("TG_BOT_TOKEN", "no-token")
-    return await webhook_dyn(token, request)
+    return {"ok": True, "forwarded": sent, "sig": sig}
 
-# ========================
-# Eventos de inicialização
-# ========================
-@app.on_event("startup")
-async def on_startup():
-    # só logs úteis; todo o scraper/Telethon roda no outro módulo/worker
-    log.info("ℹ️  Inicialização do aplicativo concluída.")
-    # Dica de webhook registrado (se aplicável)
-    base = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-    tg_token = os.getenv("TG_BOT_TOKEN", "").strip()
-    if base and tg_token:
-        log.info("🔗 Webhook esperado em %s/webhook/%s", base, tg_token)
-    else:
-        log.info("🔗 Você pode chamar /webhook/{token} diretamente sem registrar no Telegram.")
-
-# ========================
-# Uvicorn local (Render ignora se usa 'Start Command')
-# ========================
+# ===== Início do serviço HTTP =====
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
+    import uvicorn, os
+    port = int(os.getenv("PORT", "10000"))
     uvicorn.run("webhook_app:app", host="0.0.0.0", port=port, reload=False)
