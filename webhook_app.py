@@ -10,8 +10,8 @@ from pydantic import BaseModel
 # =========================
 # CONFIG
 # =========================
-# Banco fixo e persistente
-DB_PATH        = "/data/data.db"
+# Banco fixo e gravável no Render (persistente dentro da pasta do app)
+DB_PATH        = "/opt/render/project/src/data/data.db"
 
 # Vars mínimas exigidas pelo Telegram (mantenha no Render)
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
@@ -34,7 +34,7 @@ W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
 ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
 GAP_MIN = 0.08
 
-app = FastAPI(title="Fantan Guardião — Número Seco", version="2.6.0")
+app = FastAPI(title="Fantan Guardião — Número Seco", version="2.6.1")
 
 # =========================
 # SQLite helpers (WAL + retry)
