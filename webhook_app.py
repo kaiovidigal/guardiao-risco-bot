@@ -1,333 +1,259 @@
-import os
-import re
-import asyncio
-import json
-import logging
-import time
-from typing import List, Dict, Any, Optional
-from collections import deque, Counter
+import os, json, re, time, threading
+from typing import Dict, Any, Optional, List
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
 
 import nest_asyncio
 nest_asyncio.apply()
 
+import uvicorn
 from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
-from telethon import TelegramClient
-from telethon.sessions import StringSession
-from telethon.tl.types import PeerChannel
-from aiogram import Bot
+from fastapi.responses import JSONResponse
+import httpx
 
-# =========================
-# Config & Globals
-# =========================
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH", "")
-SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
-PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()  # ex: @fantanvidigal
-DESTINO_CHAT_ID = int(os.getenv("DESTINO_CHAT_ID", "0"))  # id numérico do chat destino
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+# ========================
+# Config (via variáveis)
+# ========================
+TG_BOT_TOKEN      = os.getenv("TG_BOT_TOKEN", "").strip()
+PUBLIC_CHANNEL    = os.getenv("PUBLIC_CHANNEL", "").strip()     # ex: @fantanvidigal
+BOT_ENABLED       = os.getenv("BOT_ENABLED", "1").strip()       # "1" = manda msg pelo bot
+Z_WILSON          = float(os.getenv("Z_WILSON", "1.96"))        # 95% conf
+HIST_MAX          = int(os.getenv("HIST_MAX", "5000"))          # quantos eventos guardar
+DECAY_DAYS        = float(os.getenv("DECAY_DAYS", "3"))         # meia-vida aproximada
+MIN_OBS_FOR_CONF  = int(os.getenv("MIN_OBS_FOR_CONF", "30"))    # min. observações p/ conf estimada
 
-# Thresholds e ritmo
-CONF_MIN = float(os.getenv("CONF_MIN", "0.82"))
-COOLDOWN_S = int(os.getenv("COOLDOWN_S", "6"))
-RESULTS_WINDOW = int(os.getenv("RESULTS_WINDOW", "30"))
+BASE_URL = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# Retroativo (scraper)
-AUTO_SCRAPE = int(os.getenv("AUTO_SCRAPE", "1"))
-SCRAPE_EVERY_S = int(os.getenv("SCRAPE_EVERY_S", "120"))
-SCRAPE_LIMIT = int(os.getenv("SCRAPE_LIMIT", "800"))
-
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-
-# Estado
 app = FastAPI()
-log = logging.getLogger("fantan-auto")
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
 
-client: Optional[TelegramClient] = None
-bot: Optional[Bot] = None
+# ========================
+# Estado em memória
+# (Render tem FS efêmero; isto se perde em restart — simples e suficiente)
+# ========================
 
-# memória recente de resultados e escolhas
-_hist = deque(maxlen=RESULTS_WINDOW)     # números sorteados observados (1..4)
-_stats = {"hits": 0, "miss": 0, "total": 0}
-_last_signal: Dict[str, Any] = {}       # guarda último sinal para conferência
-_last_sent_ts = 0.0
+# Estatística por número (1..4)
+# stats[n] = deque([(timestamp, 1 ou 0), ...])  -> 1=acerto, 0=erro daquele número seco
+stats: Dict[int, deque] = {i: deque(maxlen=HIST_MAX) for i in range(1, 5)}
 
-# ======= util =======
-def now_ts() -> float:
+# Guardar previsão por message_id do canal para casarmos com o fechamento
+# predicted[message_id] = {"num": 2, "at": ts}
+predicted: Dict[int, Dict[str, Any]] = {}
+
+# Regex p/ extrair lista de números de 1..4 (2 | 3) / (2 3) / (2,3) etc
+RE_NUMS = re.compile(r"\b([1-4])\b")
+
+# Booleans para classificar fechamento
+RE_GREEN = re.compile(r"\b(GREEN|VERDE)\b", re.I)
+RE_RED   = re.compile(r"\b(RED|LOSS)\b", re.I)
+
+# ========================
+# Helpers
+# ========================
+
+def _now() -> float:
     return time.time()
 
-def pretty_conf(p: float) -> str:
-    try:
-        return f"{p*100:.2f}%"
-    except Exception:
-        return "n/a"
+def _decay_weight(ts: float, now: float) -> float:
+    """peso exponencial ~ meia-vida DECAY_DAYS"""
+    half_life = DECAY_DAYS * 24 * 3600
+    return 0.5 ** ((now - ts) / max(1.0, half_life))
 
-# =========================
-# Escolha de número seco
-# =========================
-def choose_single_number(candidatos: List[int], modo: str = "G2") -> Dict[str, Any]:
-    """
-    Heurística leve:
-      1) frequência recente na janela (Counter de _hist)
-      2) desempate favorece centro (2,3) > pontas (1,4)
-      3) pequeno ajuste por modo (G1/G2)
-    Retorna: {"numero": n, "conf": 0~1, "modo": modo}
-    """
-    if not candidatos:
-        return {"numero": None, "conf": 0.0, "modo": modo}
+def score_number(n: int) -> Dict[str, float]:
+    """Retorna métricas do número (p, n_eff, wilson_low) com decaimento."""
+    now = _now()
+    s = stats[n]
+    if not s:
+        return {"p": 0.5, "n_eff": 0.0, "wilson": 0.0}
 
-    cnt = Counter(_hist)
-    # rank base pela frequência
-    ranked = sorted(candidatos, key=lambda n: (cnt.get(n, 0), n in (2,3), -abs(2.5-n)), reverse=True)
-    escolhido = ranked[0]
-
-    # confiança simples: fração da freq do escolhido + bônus de densidade
-    total_seen = max(1, sum(cnt.values()))
-    freq = cnt.get(escolhido, 0) / total_seen
-    dens = sum(cnt.get(n, 0) for n in candidatos) / total_seen
-
-    conf = 0.55*freq + 0.35*dens + 0.10*(1 if escolhido in (2,3) else 0)
-    # ajuste pelo modo (G1 costuma ser mais conservador)
-    if modo.upper() == "G1":
-        conf += 0.03
-    conf = max(0.0, min(conf, 0.99))
-
-    return {"numero": escolhido, "conf": conf, "modo": modo.upper()}
-
-# =========================
-# Parser de mensagens do canal
-# =========================
-_re_confirm = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-_re_cands   = re.compile(r"(?:Ssh|KWOK)[^\d]*([1-4](?:[-–][1-4]){1,3})")
-_re_gales   = re.compile(r"até\s+(?P<g>\d)\s+gale", re.I)
-_re_green   = re.compile(r"\bGREEN\b", re.I)
-_re_res_num = re.compile(r"\b(?:saiu|resultado|number)\s*[:\-]?\s*([1-4])", re.I)
-
-def parse_signal(text: str) -> Optional[Dict[str, Any]]:
-    if not _re_confirm.search(text or ""):
-        return None
-    m = _re_cands.search(text)
-    if not m:
-        return None
-    seq = m.group(1).replace("–", "-")
-    candidatos = [int(x) for x in seq.split("-") if x in "1234"]
-    g = 2  # default
-    gm = _re_gales.search(text)
-    if gm:
-        try:
-            g = int(gm.group("g"))
-        except Exception:
-            pass
-    modo = "G1" if g <= 1 else "G2"
-    return {"candidatos": candidatos, "modo": modo}
-
-def parse_result(text: str) -> Optional[Dict[str, Any]]:
-    """Tenta extrair GREEN/RED e o número (se vier)."""
-    if not text:
-        return None
-    if _re_green.search(text):
-        # tenta achar número explícito (nem sempre vem)
-        m = _re_res_num.search(text)
-        n = int(m.group(1)) if m else None
-        return {"green": True, "numero": n}
-    # (Opcional) procurar 'RED' se o canal publicar
-    if "RED" in text.upper():
-        m = _re_res_num.search(text)
-        n = int(m.group(1)) if m else None
-        return {"green": False, "numero": n}
-    return None
-
-# =========================
-# Envio pro destino (Telegram)
-# =========================
-async def tg_send(text: str):
-    try:
-        await bot.send_message(chat_id=DESTINO_CHAT_ID, text=text)
-    except Exception as e:
-        log.error("Falha ao enviar msg destino: %s", e)
-
-async def send_seco(candidatos: List[int], modo: str, conf: float, seco: int):
-    global _last_signal
-    msg = (
-        f"🎯 SECO: {seco}  (de {'–'.join(map(str, candidatos))} | modo={modo})\n"
-        f"🔎 confiança: {pretty_conf(conf)} | janela: {RESULTS_WINDOW}\n"
-        f"📊 hits: {_stats['hits']} | erros: {_stats['miss']} | total: {_stats['total']}"
-    )
-    await tg_send(msg)
-    _last_signal = {"ts": now_ts(), "seco": seco, "candidatos": candidatos, "modo": modo}
-
-async def send_score(prefix: str = "📊"):
-    msg = f"{prefix} hits: {_stats['hits']} | erros: {_stats['miss']} | total: {_stats['total']}"
-    await tg_send(msg)
-
-# =========================
-# Retroativo (opcional)
-# =========================
-async def retro_scrape_loop():
-    if not AUTO_SCRAPE or not PUBLIC_CHANNEL:
-        return
-    await app_started.wait()
-    ch = PUBLIC_CHANNEL
-    log.info("fantan-auto: 🔁 loop retroativo ligado (%s)...", ch)
-    while True:
-        try:
-            # varre mensagens mais recentes
-            async for msg in client.iter_messages(ch, limit=SCRAPE_LIMIT):
-                txt = msg.message or ""
-                # 1) acúmulo simples de números (caso apareça explícito)
-                res = _re_res_num.search(txt)
-                if res:
-                    _hist.append(int(res.group(1)))
-                # 2) emite seco quando identificar um sinal (no scrape não disparamos seco p/ evitar duplicar do webhook)
-                # (Deixamos apenas aprender histórico)
-            log.info("INFORMAÇÕES | fantan-auto | Raspe concluído. Mensagens processadas: %d", SCRAPE_LIMIT)
-        except Exception as e:
-            log.error("retro scrape erro: %s", e)
-        await asyncio.sleep(SCRAPE_EVERY_S)
-
-# =========================
-# Telegram webhook do Bot
-# =========================
-async def ensure_webhook():
-    """Registra o webhook do Bot para receber posts do canal."""
-    if not (TG_BOT_TOKEN and RENDER_EXTERNAL_URL):
-        log.warning("Webhook do Bot NÃO registrado (faltando TG_BOT_TOKEN ou RENDER_EXTERNAL_URL).")
-        return
-    import aiohttp
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/setWebhook"
-    hook = f"{RENDER_EXTERNAL_URL}/webhook/{TG_BOT_TOKEN}"
-    data = {"url": hook, "drop_pending_updates": True}
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(url, data=data, timeout=20) as r:
-                js = await r.json()
-        ok = js.get("ok")
+    # soma ponderada
+    w_sum = 0.0
+    w_pos = 0.0
+    for ts, ok in s:
+        w = _decay_weight(ts, now)
+        w_sum += w
         if ok:
-            log.info("fantan-auto: 🌐 Webhook registrado em %s", hook)
-        else:
-            log.warning("fantan-auto: falha ao registrar webhook: %s", js)
-    except Exception as e:
-        log.error("setWebhook erro: %s", e)
+            w_pos += w
 
-# Modelo p/ saúde
-class Status(BaseModel):
-    ok: bool
-    conf: Dict[str, Any]
-    scrape: Dict[str, Any]
-    bot: Dict[str, Any]
-    webhook: str
+    p = w_pos / max(1e-9, w_sum)
 
-@app.get("/status")
-async def status():
-    return Status(
-        ok=True,
-        conf={
-            "CONF_MIN": CONF_MIN,
-            "COOLDOWN_S": COOLDOWN_S,
-            "RESULTS_WINDOW": RESULTS_WINDOW,
-        },
-        scrape={
-            "PUBLIC_CHANNEL": PUBLIC_CHANNEL,
-            "SCRAPE_EVERY_S": SCRAPE_EVERY_S,
-            "SCRAPE_LIMIT": SCRAPE_LIMIT,
-            "AUTO_SCRAPE": AUTO_SCRAPE,
-        },
-        bot={"enabled": bool(TG_BOT_TOKEN)},
-        webhook="/webhook",
-    )
+    # Wilson lower bound (aprox) com "n efetivo" = soma dos pesos
+    n_eff = w_sum
+    if n_eff <= 0:
+        wilson = 0.0
+    else:
+        z = Z_WILSON
+        # fórmula com n efetivo
+        num = p + z*z/(2*n_eff) - z * ((p*(1-p)/n_eff + z*z/(4*n_eff*n_eff)) ** 0.5)
+        den = 1 + z*z/n_eff
+        wilson = num / den
+
+    return {"p": p, "n_eff": n_eff, "wilson": max(0.0, min(1.0, wilson))}
+
+def choose_single(numbers: List[int]) -> Dict[str, Any]:
+    """
+    Escolhe o “número seco” dentre numbers com base em:
+    1) maior wilson
+    2) desempate por maior p (média)
+    3) desempate por maior n_eff
+    """
+    cand = []
+    for n in numbers:
+        m = score_number(n)
+        cand.append((n, m["wilson"], m["p"], m["n_eff"]))
+    cand.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
+    if not cand:
+        # fallback
+        return {"num": numbers[0], "chance": 0.5, "obs": 0}
+
+    n, w, p, n_eff = cand[0]
+    # chance estimada = wilson (mais conservadora)
+    return {"num": n, "chance": w, "obs": int(round(n_eff))}
+
+async def send_message(chat_id: int, text: str, parse_mode: Optional[str] = "HTML"):
+    if BOT_ENABLED != "1":
+        return
+    async with httpx.AsyncClient(timeout=15) as cli:
+        await cli.post(f"{BASE_URL}/sendMessage", data={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode or ""
+        })
+
+def extract_numbers(text: str) -> List[int]:
+    nums = [int(m.group(1)) for m in RE_NUMS.finditer(text)]
+    # mantemos apenas 1..4 únicos, na ordem de aparição
+    seen, out = set(), []
+    for x in nums:
+        if x not in seen and 1 <= x <= 4:
+            seen.add(x)
+            out.append(x)
+    return out
+
+def looks_like_entry(text: str) -> bool:
+    return "ENTRADA" in text.upper()
+
+def looks_like_close(text: str) -> bool:
+    return ("APOSTA ENCERRADA" in text.upper()) or RE_GREEN.search(text) or RE_RED.search(text)
+
+# ========================
+# Webhook Telegram Bot
+# ========================
+
+def _validate_token(token_in_path: str):
+    if TG_BOT_TOKEN == "" or token_in_path != TG_BOT_TOKEN:
+        raise HTTPException(status_code=403, detail="Token inválido")
 
 @app.post("/webhook/{token}")
 async def webhook_dyn(token: str, request: Request):
-    if token.strip() != TG_BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido")
-    body = await request.body()
-    try:
-        data = json.loads(body.decode("utf-8", errors="ignore"))
-    except Exception:
-        data = {}
-    log.info("%s", json.dumps(data, ensure_ascii=False))
+    _validate_token(token)
+    data = await request.json()
+    # Telegram envia updates de vários tipos; vamos focar em channel_post e message
+    update = data
+    msg = update.get("channel_post") or update.get("message")
+    if not msg:
+        return JSONResponse({"ok": True, "skip": "sem message/channel_post"})
 
-    # Telegram update → channel_post / message
-    text = None
-    if "channel_post" in data:
-        text = data["channel_post"].get("text") or data["channel_post"].get("caption")
-    elif "message" in data:
-        text = data["message"].get("text") or data["message"].get("caption")
-    else:
-        return {"ok": True}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    text = msg.get("text") or ""
 
-    if not text:
-        return {"ok": True}
+    # Filtra somente o canal público configurado (se informado)
+    if PUBLIC_CHANNEL and (chat.get("username") or "") != PUBLIC_CHANNEL.lstrip("@"):
+        # passa batido, mas seguimos logando
+        return JSONResponse({"ok": True, "skip": "outro chat"})
 
-    # 1) aprender número do resultado, se explícito
-    mr = parse_result(text)
-    if mr:
-        n = mr.get("numero")
-        if n in (1, 2, 3, 4):
-            _hist.append(n)
-            # se temos last_signal, podemos tentar marcar hit/miss
-            if _last_signal.get("seco") in (1, 2, 3, 4):
-                if n == _last_signal["seco"] and mr.get("green", True):
-                    _stats["hits"] += 1
-                else:
-                    # se vier RED e número diferente do seco → miss
-                    if mr.get("green") is False or (_last_signal["seco"] != n):
-                        _stats["miss"] += 1
-                _stats["total"] = _stats["hits"] + _stats["miss"]
-                await send_score("✅📊" if mr.get("green", True) else "❌📊")
-        return {"ok": True}
+    # 1) Sinal de ENTRADA -> escolher “número seco” e avisar
+    if looks_like_entry(text):
+        nums = extract_numbers(text)
+        # Queremos entradas como “2 | 3” (2 números) ou “2 | 4 | 1” (3 números)
+        nums = [n for n in nums if 1 <= n <= 4]
+        # Evitar pegar números do “Placar do dia 26 1” etc:
+        # regra simples: se houver 2 ou 3 números, tratamos como candidatos
+        if 2 <= len(nums) <= 3:
+            choice = choose_single(nums)
+            seco = choice["num"]
+            obs  = max(choice["obs"], sum(len(stats[i]) for i in range(1,5)))  # aproximação
+            chance = choice["chance"]
+            pct = f"{chance*100:.2f}%"
 
-    # 2) se é um SINAL → escolhe e envia seco
-    sig = parse_signal(text)
-    if sig:
-        # cooldown para não floodar
-        global _last_sent_ts
-        if now_ts() - _last_sent_ts < COOLDOWN_S:
-            return {"ok": True}
+            # Guarda previsão por message_id (para casar com fechamento)
+            message_id = msg.get("message_id")
+            if message_id:
+                predicted[message_id] = {"num": seco, "at": _now()}
 
-        candidatos = [n for n in sig["candidatos"] if n in (1,2,3,4)]
-        if not candidatos:
-            return {"ok": True}
+            # Envia o alerta “número seco”
+            out = (
+                f"🎯 <b>Número seco sugerido:</b> <code>{seco}</code>\n"
+                f"📊 <i>Baseado em ~{obs} sinais retroativos</i>\n"
+                f"✅ Chance estimada: <b>{pct}</b>"
+            )
+            await send_message(chat_id, out)
 
-        res = choose_single_number(candidatos, sig["modo"])
-        if res["conf"] >= CONF_MIN and res["numero"] in (1,2,3,4):
-            await send_seco(candidatos, res["modo"], res["conf"], res["numero"])
-            _last_sent_ts = now_ts()
-        return {"ok": True}
+            return JSONResponse({"ok": True, "sent": out, "candidates": nums})
 
-    return {"ok": True}
+    # 2) Mensagem de FECHAMENTO -> atualizar acerto/erro da última previsão
+    if looks_like_close(text):
+        # Busca “GREEN/VERDE” como acerto, “RED/LOSS” como erro
+        ok = 1 if RE_GREEN.search(text) else (0 if RE_RED.search(text) else None)
+        # Se não conseguimos identificar GREEN/RED, tentamos heurística:
+        if ok is None:
+            if "✅" in text: ok = 1
+            elif "❌" in text: ok = 0
 
-# =========================
-# Startup do app
-# =========================
-app_started = asyncio.Event()
+        # Tenta relacionar com a última previsão do mesmo chat.
+        # Estratégia simples: pega o maior message_id anterior a este que tenha previsão
+        msg_id = msg.get("message_id")
+        guess_id = None
+        if msg_id is not None:
+            # mensagem mais recente anterior:
+            keys = [k for k in predicted.keys() if k <= msg_id]
+            if keys:
+                guess_id = max(keys)
 
-@app.on_event("startup")
-async def on_startup():
-    global client, bot
-    # Conecta Telethon (para retroativo e futuras expansões)
-    if API_ID and API_HASH and SESSION_STRING:
-        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-        await client.start()
-        log.info("fantan-auto: 📬 Retroativo conectado no Telegram com Telethon")
-    else:
-        log.warning("Telethon não inicializado (faltam credenciais).")
+        if guess_id and guess_id in predicted and ok is not None:
+            seco = predicted[guess_id]["num"]
+            stats[seco].append((_now(), int(ok)))
 
-    if TG_BOT_TOKEN:
-        bot = Bot(TG_BOT_TOKEN)
-    else:
-        raise RuntimeError("TG_BOT_TOKEN ausente.")
+        return JSONResponse({"ok": True, "close_recorded_for": predicted.get(guess_id, {})})
 
-    # registra webhook do bot (se base pública informada)
-    await ensure_webhook()
+    return JSONResponse({"ok": True, "noop": True})
 
-    # inicia loop retroativo
-    if client and AUTO_SCRAPE:
-        asyncio.create_task(retro_scrape_loop())
+# ========================
+# Status & saúde
+# ========================
 
-    app_started.set()
-    log.info("INFORMAÇÕES: Inicialização do aplicativo concluída.")
-    log.info("Seu serviço está ativo 🎉")
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "conf": {
+            "Z_WILSON": Z_WILSON,
+            "HIST_MAX": HIST_MAX,
+            "DECAY_DAYS": DECAY_DAYS,
+            "MIN_OBS_FOR_CONF": MIN_OBS_FOR_CONF
+        },
+        "bot": {"enabled": BOT_ENABLED == "1"},
+        "webhook": "/webhook"
+    }
 
-# Rodar localmente com: uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
+@app.get("/status")
+async def status():
+    now = _now()
+    table = {}
+    for n in range(1, 5):
+        m = score_number(n)
+        table[n] = {
+            "p_media": round(m["p"], 4),
+            "n_eff": round(m["n_eff"], 1),
+            "wilson_low": round(m["wilson"], 4),
+            "last_events": len(stats[n]),
+        }
+    return {"ok": True, "stats": table, "now": now}
+
+# ========================
+# Inicialização (somente API do bot — o scraper já está no worker atual)
+# ========================
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("webhook_app:app", host="0.0.0.0", port=port)
