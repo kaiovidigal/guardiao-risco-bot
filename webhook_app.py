@@ -10,10 +10,7 @@ from pydantic import BaseModel
 # =========================
 # CONFIG
 # =========================
-# Banco fixo e gravável no Render (persistente dentro da pasta do app)
-DB_PATH        = "/opt/render/project/src/data/data.db"
-
-# Vars mínimas exigidas pelo Telegram (mantenha no Render)
+DB_PATH        = "/opt/render/project/src/data/data.db"  # gravável no Render
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()   # -100... ou @canal
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
@@ -23,9 +20,9 @@ if not TG_BOT_TOKEN or not PUBLIC_CHANNEL or not WEBHOOK_TOKEN:
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# Réplica somente do SINAL G0 (embutida)
+# Réplica do SINAL G0
 REPL_ENABLED  = True
-REPL_CHANNEL  = -1003052132833   # ID numérico do canal réplica
+REPL_CHANNEL  = -1003052132833
 
 # Modelo / hiperparâmetros
 WINDOW = 400
@@ -34,7 +31,7 @@ W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
 ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
 GAP_MIN = 0.08
 
-app = FastAPI(title="Fantan Guardião — Número Seco", version="2.6.1")
+app = FastAPI(title="Fantan Guardião — Número Seco", version="2.8.0")
 
 # =========================
 # SQLite helpers (WAL + retry)
@@ -123,7 +120,6 @@ def init_db():
         seen_numbers TEXT DEFAULT ''
     )""")
     con.commit()
-    # migração idempotente
     try:
         cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''")
         con.commit()
@@ -200,23 +196,23 @@ def prob_from_ngrams(ctx: List[int], candidate: int) -> float:
 # =========================
 # Parsers do canal
 # =========================
-MUST_HAVE = (r"ENTRADA\s+CONFIRMADA", r"Mesa:\s*Fantan\s*-\s*Evolution")
+# Permissivo com variações/emojis
+MUST_HAVE = (
+    r"ENTRADA\s+CONFIRMADA",
+    r"Mesa:\s*.*?Fantan.*?Evolution",
+)
 MUST_NOT  = (r"\bANALISANDO\b", r"\bPlacar do dia\b", r"\bAPOSTA ENCERRADA\b")
 
 def is_real_entry(text: str) -> bool:
     t = re.sub(r"\s+", " ", text).strip()
     for bad in MUST_NOT:
-        if re.search(bad, t, flags=re.I): return False
-    for good in MUST_HAVE:
-        if not re.search(good, t, flags=re.I): return False
-    has_ctx = any(re.search(p, t, flags=re.I) for p in [
-        r"Sequ[eê]ncia:\s*[\d\s\|\-]+",
-        r"\bKWOK\s*[1-4]\s*-\s*[1-4]",
-        r"\bSS?H\s*[1-4](?:-[1-4]){0,3}",
-        r"\bODD\b|\bEVEN\b",
-        r"Entrar\s+ap[oó]s\s+o\s+[1-4]"
-    ])
-    return bool(has_ctx)
+        if re.search(bad, t, flags=re.I):
+            print(f"[SKIP] Bloqueado por MUST_NOT ({bad}): {t[:160]}")
+            return False
+    ok = all(re.search(g, t, flags=re.I|re.S) for g in MUST_HAVE)
+    if not ok:
+        print(f"[SKIP] Faltou algum MUST_HAVE: {t[:160]}")
+    return ok
 
 def extract_strategy(text: str) -> Optional[str]:
     m = re.search(r"Estrat[eé]gia:\s*(\d+)", text, flags=re.I)
@@ -227,7 +223,8 @@ def extract_seq_raw(text: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 def extract_after_num(text: str) -> Optional[int]:
-    m = re.search(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", text, flags=re.I)
+    # aceita "após o 2" / "após 2" com/sem acento
+    m = re.search(r"ap[oó]s\s*(?:o\s*)?([1-4])\b", text, flags=re.I)
     return int(m.group(1)) if m else None
 
 def bases_from_sequence_left_recent(seq_left_recent: List[int], k: int = 3) -> List[int]:
@@ -240,26 +237,48 @@ def bases_from_sequence_left_recent(seq_left_recent: List[int], k: int = 3) -> L
 
 def parse_bases_and_pattern(text: str) -> Tuple[List[int], str]:
     t = re.sub(r"\s+", " ", text).strip()
+
+    # ODD / EVEN
+    if re.search(r"\bODD\b", t, flags=re.I):
+        return [1, 3], "ODD"
+    if re.search(r"\bEVEN\b", t, flags=re.I):
+        return [2, 4], "EVEN"
+
+    # KWOK A-B
     m = re.search(r"\bKWOK\s*([1-4])\s*-\s*([1-4])", t, flags=re.I)
-    if m: a,b = int(m.group(1)), int(m.group(2)); return [a,b], f"KWOK-{a}-{b}"
-    if re.search(r"\bODD\b", t, flags=re.I):  return [1,3], "ODD"
-    if re.search(r"\bEVEN\b", t, flags=re.I): return [2,4], "EVEN"
+    if m:
+        a,b = int(m.group(1)), int(m.group(2))
+        return [a, b], f"KWOK-{a}-{b}"
+
+    # SSH 4-3-2...
     m = re.search(r"\bSS?H\s*([1-4])(?:-([1-4]))?(?:-([1-4]))?(?:-([1-4]))?", t, flags=re.I)
     if m:
         nums = [int(g) for g in m.groups() if g]
         return nums, "SSH-" + "-".join(str(x) for x in nums)
+
+    # Sequência: 4 | 3 | 2
     m = re.search(r"Sequ[eê]ncia:\s*([\d\s\|\-]+)", t, flags=re.I)
     if m:
         parts = re.findall(r"[1-4]", m.group(1))
-        base = bases_from_sequence_left_recent([int(x) for x in parts], 3)
-        if base: return base, "SEQ"
+        base, seen = [], set()
+        for x in parts:
+            xi = int(x)
+            if xi not in seen:
+                seen.add(xi); base.append(xi)
+            if len(base) == 3:
+                break
+        if base:
+            return base, "SEQ"
+
+    # fallback
     return [], "GEN"
 
 GREEN_RE   = re.compile(r"APOSTA\s+ENCERRADA.*?GREEN.*?\((\d)\)", re.I | re.S)
 RED_NUM_RE = re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\((.*?)\)", re.I | re.S)
 
 def extract_green_number(text: str) -> Optional[int]:
-    m = GREEN_RE.search(text);  return int(m.group(1)) if m else None
+    m = GREEN_RE.search(text)
+    return int(m.group(1)) if m else None
 
 def extract_red_last_left(text: str) -> Optional[int]:
     m = RED_NUM_RE.search(text)
@@ -303,9 +322,6 @@ def bump_strategy(strategy: str, number: int, won: bool):
     """, (strategy, number, w, l))
 
 def update_daily_score(stage: Optional[int], won: bool):
-    """
-    stage: 0(G0),1(G1),2(G2) ou None(Loss)
-    """
     y = today_key()
     row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
     if not row: g0=g1=g2=loss=streak=0
@@ -347,7 +363,7 @@ async def send_scoreboard():
     await tg_send_text(PUBLIC_CHANNEL, txt)
 
 # =========================
-# Pendências + mensagens mínimas
+# Pendências + mensagens mínimas (resultado imediato)
 # =========================
 def open_pending(strategy: Optional[str], suggested: int):
     exec_write("""
@@ -363,22 +379,20 @@ def _parse_seen(txt: str) -> list[int]:
     if not txt: return []
     return [int(x) for x in txt.split("|") if x.strip().isdigit()]
 
-# Silenciar permanentemente os "Resultado não contabilizado"
 async def send_not_counted_result(n_real:int, sug:int, stage:int):
+    # silenciado
     return
 
-# Mensagens mínimas de resultado
 async def short_log_win(suggested:int, stage:int, seen:list[int]):
     gtxt = f"G{stage}"
-    await tg_send_text(PUBLIC_CHANNEL, f"✅ <b>GREEN</b> ({gtxt})")
+    msg = f"✅ <b>GREEN imediato</b> ({gtxt}) → Número: <b>{suggested}</b>"
+    await tg_send_text(PUBLIC_CHANNEL, msg)
 
 async def short_log_loss(suggested:int, seen:list[int]):
-    await tg_send_text(PUBLIC_CHANNEL, "❌ <b>LOSS</b>")
+    msg = f"❌ <b>LOSS imediato</b> → Número sugerido: <b>{suggested}</b>"
+    await tg_send_text(PUBLIC_CHANNEL, msg)
 
 async def close_pending_with_result(n_real: int, event_kind: str):
-    """
-    event_kind: 'GREEN' | 'RED'
-    """
     rows = query_all("SELECT id,strategy,suggested,stage,window_left,seen_numbers FROM pending_outcome WHERE open=1 ORDER BY id")
     for r in rows:
         pid      = int(r["id"])
@@ -398,9 +412,8 @@ async def close_pending_with_result(n_real: int, event_kind: str):
             await short_log_win(sug, stage, _parse_seen(seen_txt2))
             await send_scoreboard()
         else:
-            # Divergência com GREEN externo: silêncio total
             if event_kind == "GREEN":
-                pass
+                pass  # silêncio total
             left -= 1
             if left <= 0:
                 bump_pattern("PEND", sug, False)
@@ -531,7 +544,7 @@ async def webhook(token: str, request: Request):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     t = re.sub(r"\s+", " ", text)
 
-    # 1) GREEN / RED — registra e fecha pendências
+    # 1) GREEN / RED — registra e fecha pendências (resultado imediato)
     gnum = extract_green_number(t)
     redn = extract_red_last_left(t)
 
@@ -568,6 +581,7 @@ async def webhook(token: str, request: Request):
 
     # 3) ENTRADA CONFIRMADA — sugerir 1 número seco e abrir pendência
     if not is_real_entry(t):
+        print("[SKIP] Não é ENTRADA CONFIRMADA válida para Fantan:", t[:200])
         return {"ok": True, "skipped": True}
 
     source_msg_id = msg.get("message_id")
@@ -596,7 +610,7 @@ async def webhook(token: str, request: Request):
     """, (strategy, source_msg_id, int(number), "CTX", pattern_key, "G0", now_ts()))
     open_pending(strategy, int(number))
 
-    # envia SINAL G0 (principal + réplica) — mais nada
+    # envia SINAL G0 (principal + réplica)
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_send_text(PUBLIC_CHANNEL, out)
     await tg_replicate_signal(out)
