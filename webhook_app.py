@@ -30,17 +30,17 @@ W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
 # pesos dos componentes (n-grams / padrão / estratégia)
 ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
 
-# gatilhos de envio (não publica “tiro fraco”)
-MIN_CONF    = 0.55       # ajuste fino depois (0.55~0.65 como início)
-MIN_SAMPLES = 800        # exige suporte mínimo nos n-grams
-GAP_MIN     = 0.08       # 8% de folga entre 1º e 2º colocado
+# Aviso visual quando a confiança estiver baixa (NÃO bloqueia envio)
+MIN_CONF_VISUAL    = 0.55
+MIN_SAMPLES_VISUAL = 800
+GAP_MIN            = 0.08   # 8% de folga entre 1º e 2º colocado (para escolher melhor candidato)
 
-TRIGGER_P   = 0.82       # (mantido) alerta de padrão — não usado p/ “Entrada Confirmada”
+TRIGGER_P   = 0.82
 TRIGGER_SUP = 12
 
-COOLDOWN_S = 12          # anti-duplicata rápida por chat
+COOLDOWN_S = 12            # anti-duplicata rápida por chat
 
-app = FastAPI(title="Fantan Guardião — Número Seco", version="2.1.0")
+app = FastAPI(title="Fantan Guardião — Número Seco", version="2.2.0")
 
 # =========================
 # DB
@@ -363,7 +363,7 @@ async def send_scoreboard(w:int,l:int,acc:float,streak:int):
 # Dedup / Cooldown
 # =========================
 def already_suggested(con: sqlite3.Connection, source_msg_id: int) -> bool:
-    row = con.execute("SELECT 1 FROM suggestions WHERE source_msg_id=?", (source_msg_id)).fetchone()
+    row = con.execute("SELECT 1 FROM suggestions WHERE source_msg_id=?", (source_msg_id,)).fetchone()
     return row is not None
 
 def remember_suggestion(con: sqlite3.Connection, source_msg_id:int, strategy:str, seq_raw:str,
@@ -380,7 +380,7 @@ def remember_suggestion(con: sqlite3.Connection, source_msg_id:int, strategy:str
     """, (strategy or "", source_msg_id, suggested, context_key, pattern_key, stage, now_ts()))
 
 def cooldown_ok(con: sqlite3.Connection, chat_id:int) -> bool:
-    row = con.execute("SELECT last_ts FROM cooldown WHERE chat_id=?", (chat_id)).fetchone()
+    row = con.execute("SELECT last_ts FROM cooldown WHERE chat_id=?", (chat_id,)).fetchone()
     now = time.time()
     if row and now - row["last_ts"] < COOLDOWN_S:
         return False
@@ -488,9 +488,12 @@ def suggest_number(con: sqlite3.Connection, base: List[int], pattern_key: str, s
     total = sum(scores.values()) or 1e-9
     post = {k: v/total for k,v in scores.items()}
 
-    # melhor candidato com gap mínimo
+    # melhor candidato com gap mínimo (só para escolher; NÃO bloqueia envio)
     number = confident_best(post, gap=GAP_MIN)
-    conf = post.get(number, 0.0) if number is not None else 0.0
+    if number is None:
+        # se não houver gap suficiente, escolha o maior mesmo assim (publica sempre)
+        number = max(post.items(), key=lambda kv: kv[1])[0]
+    conf = post.get(number, 0.0)
 
     # estimativa de amostra (peso total nos n-grams)
     roww = con.execute("SELECT SUM(weight) AS s FROM ngram_stats").fetchone()
@@ -504,12 +507,16 @@ def suggest_number(con: sqlite3.Connection, base: List[int], pattern_key: str, s
 def build_suggestion_msg(number:int, base:List[int], pattern_key:str, after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
     base_txt = ", ".join(str(x) for x in base) if base else "—"
     aft_txt = f" após {after_num}" if after_num else ""
-    return (
-        f"🎯 <b>Número seco ({stage}):</b> <b>{number}</b>\n"
+    header = "🎯 <b>Número seco ({})</b>: <b>{}</b>".format(stage, number)
+    body = (
         f"🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n"
         f"🧮 <b>Base:</b> [{base_txt}]\n"
         f"📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
     )
+    # Aviso visual quando confiança/amostra estão baixos (mas SEM bloquear envio)
+    if conf < MIN_CONF_VISUAL or samples < MIN_SAMPLES_VISUAL:
+        return "⚠️ <b>Confiança baixa</b>\n" + header + "\n" + body
+    return header + "\n" + body
 
 # =========================
 # Webhook models
@@ -543,7 +550,6 @@ def close_pending_with_result(con: sqlite3.Connection, n_real: int):
         pid, strat, sug, stage, left = r["id"], (r["strategy"] or ""), int(r["suggested"]), int(r["stage"]), int(r["window_left"])
         if n_real == sug:
             # WIN no estágio atual
-            # usamos uma chave de padrão genérica para logar; no envio real usamos pattern_key correto.
             bump_pattern(con, "PEND", sug, True)
             if strat:
                 bump_strategy(con, strat, sug, True)
@@ -681,7 +687,7 @@ async def webhook(token: str, request: Request):
         con.close()
         return {"ok": True, "analise": True}
 
-    # 3) ENTRADA CONFIRMADA → sugerir 1 número seco (com filtros de confiança)
+    # 3) ENTRADA CONFIRMADA → sugerir 1 número seco (sempre publica)
     if not is_real_entry(t):
         con.close()
         return {"ok": True, "skipped": True}
@@ -703,20 +709,13 @@ async def webhook(token: str, request: Request):
     # cálculo
     number, conf, samples, post = suggest_number(con, base, pattern_key, strategy, after_num)
 
-    # filtros de envio
-    if (number is None) or (conf < MIN_CONF) or (samples < MIN_SAMPLES):
-        # não enviar número seco fraco
-        con.close()
-        await tg_send_text(PUBLIC_CHANNEL, "⚠️ <b>Análise fraca</b>: confiança baixa para número seco. Mantendo <i>neutro</i>.")
-        return {"ok": True, "neutro": True, "conf": conf, "samples": samples}
-
-    # grava ponte, dedupe e abrir pendência (janela G0/G1/G2)
+    # grava ponte, abrir pendência (janela G0/G1/G2) e enviar SEM bloquear
     remember_suggestion(con, source_msg_id, strategy, seq_raw, "CTX", pattern_key, base, number, stage="G0")
     open_pending(con, strategy, number)
     con.commit()
     con.close()
 
-    # envia 1 única mensagem
+    # envia 1 única mensagem (sempre)
     out = build_suggestion_msg(number, base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_send_text(PUBLIC_CHANNEL, out)
     return {"ok": True, "sent": True, "conf": conf, "samples": samples}
