@@ -1,361 +1,236 @@
-# -*- coding: utf-8 -*-
-# Fantan — Número SECO em tempo real + aprendizado por COMBINAÇÃO (SQLite)
-# - Sempre envia 1 número (sem pular sinal)
-# - Aprende no fechamento (GREEN/RED), persistente entre deploys
-# - Logs de decisão (DEBUG_SUGGEST=1)
-
-import os, re, time, math, json, logging, sqlite3, asyncio
+# webhook_app.py
+import json, re, time, asyncio
 from typing import Any, Dict, List, Optional, Tuple
-
-import nest_asyncio
-nest_asyncio.apply()
-
-import uvicorn
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request
 import httpx
-from aiogram import Bot
 
-# =========================
-# Config via ENV
-# =========================
-TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", os.getenv("DESTINO_CHAT_ID","0")) or "0")
-PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()  # ex: @fantanvidigal
-PUBLIC_URL     = (os.getenv("PUBLIC_URL", "") or os.getenv("RENDER_EXTERNAL_URL","")).rstrip("/")
-BOT_ENABLED    = int(os.getenv("BOT_ENABLED", "1"))
-DEBUG_SUGGEST  = int(os.getenv("DEBUG_SUGGEST", "1"))
-Z_WILSON       = float(os.getenv("Z_WILSON", "1.96"))
-DB_PATH        = os.getenv("DB_PATH", "data/retro.db")
-COOLDOWN_S     = int(os.getenv("COOLDOWN_S", "0"))   # 0 = sem cooldown (não perder sinal)
-DEDUP_TTL_S    = int(os.getenv("DEDUP_TTL_S", "0"))  # 0 = sem dedupe
-REC_BONUS_H    = int(os.getenv("REC_BONUS_H", "6"))  # bônus de recência (horas)
-REC_BONUS      = float(os.getenv("REC_BONUS", "0.02"))
+# =======================
+# CONFIG embutida
+# =======================
+CONFIG = {
+    # Canal onde o BOT vai postar a sugestão (saída)
+    "TARGET_CHANNEL": "@SEU_CANAL_SAIDA",      # ex.: "@fantanvidigal" ou id -1002810...
+    # Canal de onde vêm os sinais (só para telemetria/checagem leve)
+    "PUBLIC_CHANNEL": "@SEU_CANAL_SINAIS",
 
-# Mensagens que reconhecemos
-RE_ENTRY  = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-RE_SEQ    = re.compile(r"Sequ[eê]ncia[:\s]*([^\n]+)", re.I)
-RE_G1     = re.compile(r"\bG1\b", re.I)
-RE_CLOSE  = re.compile(r"APOSTA\s+ENCERRADA", re.I)
-RE_GREEN  = re.compile(r"\b(GREEN|VERDE)\b", re.I)
-RE_RED    = re.compile(r"\bRED\b|\bLOSS\b", re.I)
-RE_NUM    = re.compile(r"\b([1-4])\b")
+    # Token do BOT que posta
+    "TG_BOT_TOKEN": "8217345207:COLOQUE_SEU_TOKEN_AQUI",
 
-# =========================
-# App & Log
-# =========================
-app = FastAPI()
-log = logging.getLogger("fantan-seco")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    # Segurança simples do webhook: o mesmo token no path
+    "WEBHOOK_TOKEN": "8217345207:COLOQUE_SEU_TOKEN_AQUI",
 
-# =========================
-# SQLite (persistente)
-# =========================
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    # Modo de sugestão (2 = número seco com aprendizado + fallback)
+    "SUGGEST_MODE": 2,
 
-def _db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS combo_stats(
-        combo TEXT PRIMARY KEY,               -- ex.: "G2|2-3"  ou "G1|4-3-2"
-        win1  INTEGER NOT NULL DEFAULT 0,
-        win2  INTEGER NOT NULL DEFAULT 0,
-        win3  INTEGER NOT NULL DEFAULT 0,
-        win4  INTEGER NOT NULL DEFAULT 0,
-        last1 INTEGER NOT NULL DEFAULT 0,     -- último ts de acerto
-        last2 INTEGER NOT NULL DEFAULT 0,
-        last3 INTEGER NOT NULL DEFAULT 0,
-        last4 INTEGER NOT NULL DEFAULT 0
-    );
-    """)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS meta(
-        k TEXT PRIMARY KEY,
-        v TEXT NOT NULL
-    );
-    """)
-    return conn
+    # Nunca pular sinais
+    "CONF_MIN": 0.0,
+    "COOLDOWN_S": 0,
+    "DEDUP_MINUTES": 0,
 
-DB = _db()
+    # Persistência
+    "MEMORY_PATH": "memory.json",
+}
 
-def meta_set(k:str, v:Any):
-    with DB:
-        DB.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, json.dumps(v)))
+# =======================
+# Memória (persistente em arquivo)
+# =======================
+def load_memory(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "freq": {},            # chave -> {"total": int, "counts": {"1":..,"2":..,"3":..,"4":..}}
+            "pending": {}          # strategy_id -> {"offered":[...], "ts": float}
+        }
 
-def meta_get(k:str, default=None):
-    cur = DB.execute("SELECT v FROM meta WHERE k=?", (k,))
-    r = cur.fetchone()
-    return json.loads(r[0]) if r else default
+def save_memory(path: str, data: Dict[str, Any]) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"[MEM][EXC] {e}")
 
-# =========================
-# Estado em memória
-# =========================
-# dedupe por message_id (timestamp para expirar)
-_seen_msgs: Dict[int, float] = {}  # message_id -> ts
-_last_sent_ts: float = 0.0
+MEM = load_memory(CONFIG["MEMORY_PATH"])
 
-# pareamento simples por chat: última combinação vista
-_last_combo_by_chat: Dict[int, Dict[str, Any]] = {}  # chat_id -> {"modo","nums","ts"}
-
-# desempate determinístico se empatar score
-FIX_TIE_ORDER = [2,3,1,4]
-
-# =========================
+# =======================
 # Util
-# =========================
-def now() -> float: return time.time()
+# =======================
+def norm_offered(nums: List[int]) -> List[int]:
+    return sorted([n for n in nums if n in (1,2,3,4)])
 
-def wilson_lower(p:float, n:float, z:float=Z_WILSON)->float:
-    if n <= 0: return 0.0
-    denom  = 1 + (z*z)/n
-    centre = p + (z*z)/(2*n)
-    margin = z * math.sqrt((p*(1-p)/n) + (z*z)/(4*n*n))
-    return max(0.0, (centre - margin)/denom)
+def key_for(strategy_id: Optional[str], offered: List[int]) -> str:
+    offered_key = ",".join(map(str, norm_offered(offered)))
+    sid = strategy_id or "NA"
+    return f"{sid}|{offered_key}"
 
-def make_combo_key(modo:str, candidatos:List[int]) -> str:
-    return f"{modo.upper()}|{'-'.join(map(str, candidatos))}"
+def wilson_p(count: int, total: int, z: float = 1.96) -> float:
+    if total <= 0: return 0.0
+    p = count / total
+    denom = 1 + (z**2)/total
+    num   = p + (z**2)/(2*total)
+    rad   = z * ((p*(1-p) + (z**2)/(4*total)) / total) ** 0.5
+    lower = (num - rad) / denom
+    upper = (num + rad) / denom
+    return max(0.0, min(1.0, upper))
 
-def record_outcome(modo:str, candidatos:List[int], winner:int, ts:int|None=None):
-    if ts is None: ts = int(now())
-    key = make_combo_key(modo, candidatos)
-    col_win  = f"win{winner}"
-    col_last = f"last{winner}"
-    with DB:
-        DB.execute("INSERT OR IGNORE INTO combo_stats(combo) VALUES(?)", (key,))
-        DB.execute(f"UPDATE combo_stats SET {col_win}={col_win}+1, {col_last}=? WHERE combo=?", (ts, key))
-    if DEBUG_SUGGEST:
-        log.info(f"[LEARN] combo={key} -> winner={winner}")
+# =======================
+# Parsers
+# =======================
+RE_TRIO = re.compile(r"Sequ[eê]ncia\s*:\s*(\d)\s*\|\s*(\d)\s*\|\s*(\d)", re.IGNORECASE)
+RE_PAIR = re.compile(r"Sequ[eê]ncia\s*:\s*(\d)\s*\|\s*(\d)", re.IGNORECASE)
+RE_STRAT= re.compile(r"Estrat[eé]gia\s*:\s*(\d+)", re.IGNORECASE)
+RE_GREEN= re.compile(r"GREEN.+?\((\d)\)", re.IGNORECASE)   # ex: GREEN!!! (3)
+RE_REDWN= re.compile(r"VENCEDOR\s*:\s*(\d)", re.IGNORECASE) # opcional se tiver "VENCEDOR: x"
 
-def get_combo_stats(modo:str, candidatos:List[int]):
-    key = make_combo_key(modo, candidatos)
-    cur = DB.execute("SELECT win1,win2,win3,win4,last1,last2,last3,last4 FROM combo_stats WHERE combo=?", (key,))
-    row = cur.fetchone()
-    if not row:
-        return key, {1:0,2:0,3:0,4:0}, {1:0,2:0,3:0,4:0}
-    wins = {1:row[0],2:row[1],3:row[2],4:row[3]}
-    last = {1:row[4],2:row[5],3:row[6],4:row[7]}
-    return key, wins, last
-
-def parse_candidates(text:str) -> Tuple[Optional[List[int]], Optional[str]]:
-    m = RE_SEQ.search(text or "")
-    if not m:
-        return None, None
-    seq = m.group(1)
-    nums = [int(x) for x in re.findall(r"[1-4]", seq)]
-    if len(nums) not in (2,3):
-        return None, None
-    modo = "G1" if RE_G1.search(text) else "G2"
-    return nums, modo
-
-def parse_close(text:str) -> Optional[Dict[str,Any]]:
-    if RE_CLOSE.search(text) or RE_GREEN.search(text) or RE_RED.search(text):
-        win = None
-        mw = RE_NUM.search(text)
-        if mw:
-            win = int(mw.group(1))
-        return {"close": True, "winner": win, "green": bool(RE_GREEN.search(text))}
+def extract_offered(text: str) -> Optional[List[int]]:
+    m = RE_TRIO.search(text)
+    if m: return [int(m.group(1)), int(m.group(2)), int(m.group(3))]
+    m = RE_PAIR.search(text)
+    if m: return [int(m.group(1)), int(m.group(2))]
     return None
 
-async def ensure_webhook():
-    if not (TG_BOT_TOKEN and PUBLIC_URL):
-        log.warning("Webhook NÃO registrado (faltando TG_BOT_TOKEN ou PUBLIC_URL).")
-        return
-    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/setWebhook"
-    hook = f"{PUBLIC_URL}/webhook/{TG_BOT_TOKEN}"
-    data = {"url": hook, "drop_pending_updates": True}
+def extract_strategy(text: str) -> Optional[str]:
+    m = RE_STRAT.search(text)
+    return m.group(1) if m else None
+
+def extract_winner(text: str) -> Optional[int]:
+    m = RE_GREEN.search(text)
+    if m: return int(m.group(1))
+    m = RE_REDWN.search(text)
+    if m: return int(m.group(1))
+    return None
+
+# =======================
+# Aprendizado
+# =======================
+def remember_offer(strategy_id: Optional[str], offered: List[int]):
     try:
-        async with httpx.AsyncClient(timeout=20) as s:
-            r = await s.post(url, data=data)
-            js = r.json()
-        if js.get("ok"):
-            log.info("🌐 Webhook registrado em %s", hook)
+        if not offered: return
+        if strategy_id:
+            MEM["pending"][strategy_id] = {"offered": norm_offered(offered), "ts": time.time()}
+            save_memory(CONFIG["MEMORY_PATH"], MEM)
+    except Exception as e:
+        print(f"[MEM][PENDING][EXC] {e}")
+
+def learn_from_result(strategy_id: Optional[str], winner: int):
+    try:
+        if not strategy_id or winner not in (1,2,3,4): return
+        pend = MEM["pending"].pop(strategy_id, None)
+        if not pend:
+            # sem pendente: ainda assim aprende por estratégia “geral”
+            key = key_for(strategy_id, [])
         else:
-            log.warning("Falha setWebhook: %s", js)
+            key = key_for(strategy_id, pend["offered"])
+
+        bucket = MEM["freq"].setdefault(key, {"total":0, "counts":{"1":0,"2":0,"3":0,"4":0}})
+        bucket["total"] += 1
+        bucket["counts"][str(winner)] += 1
+        save_memory(CONFIG["MEMORY_PATH"], MEM)
+        print(f"[LEARN] key={key} winner={winner} total={bucket['total']}")
     except Exception as e:
-        log.error("setWebhook erro: %s", e)
+        print(f"[MEM][LEARN][EXC] {e}")
 
-async def send_text(chat_id:int, text:str):
-    if not BOT_ENABLED:
-        if DEBUG_SUGGEST: log.info("[SEND] pulado (BOT_ENABLED=0): %s", text)
-        return
-    try:
-        bot = Bot(token=TG_BOT_TOKEN, parse_mode="HTML")
-        await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
-        await bot.session.close()
-    except Exception as e:
-        log.error("Falha ao enviar mensagem: %s", e)
+def choose_number(strategy_id: Optional[str], offered: List[int]) -> Tuple[int, float, int]:
+    offered = norm_offered(offered)
+    key_exact = key_for(strategy_id, offered)
+    key_fallback = key_for(strategy_id, [])
+    cand_keys = [key_exact, key_fallback]
 
-def should_skip_by_dedupe(msg_id:int)->bool:
-    if DEDUP_TTL_S <= 0:
-        return False
-    ts = now()
-    # limpa antigos
-    for k,v in list(_seen_msgs.items()):
-        if ts - v > DEDUP_TTL_S:
-            _seen_msgs.pop(k, None)
-    if msg_id in _seen_msgs:
-        return True
-    _seen_msgs[msg_id] = ts
-    return False
+    best_num, best_score, base_total = None, -1.0, 0
+    for k in cand_keys:
+        b = MEM["freq"].get(k)
+        if not b: continue
+        total = b.get("total", 0)
+        if total <= 0: continue
+        # avalia só entre os oferecidos
+        for n in offered:
+            cnt = b["counts"].get(str(n), 0)
+            score = wilson_p(cnt, total, z=1.96)
+            if score > best_score:
+                best_num, best_score, base_total = n, score, total
 
-def cooldown_ok() -> bool:
-    global _last_sent_ts
-    if COOLDOWN_S <= 0:
-        return True
-    if now() - _last_sent_ts >= COOLDOWN_S:
-        _last_sent_ts = now()
-        return True
-    return False
+    # caso não tenha histórico, manda mesmo assim: pega o primeiro oferecido
+    if best_num is None:
+        best_num, best_score, base_total = offered[0], 0.0, 0
 
-def choose_single(modo:str, candidatos:List[int]) -> Dict[str,Any]:
-    """
-    Escolhe SEMPRE 1 número com base na combinação:
-      - p_hat com Laplace: (wins+1)/(sum(wins_cand)+len(cand))
-      - Wilson lower bound como 'confiança'
-      - bônus de recência se last < REC_BONUS_H
-      - desempate determinístico por FIX_TIE_ORDER
-    """
-    key, wins, last = get_combo_stats(modo, candidatos)
-    total = sum(wins[c] for c in candidatos)
-    n_eff = max(1.0, float(total))  # simples
-    rows = []
-    now_ts = int(now())
+    return best_num, best_score, base_total
 
-    for n in candidatos:
-        w = wins[n]
-        p_hat = (w + 1.0) / (total + len(candidatos) + 1e-9)
-        wl = wilson_lower(p_hat, n_eff, Z_WILSON)
-        rec = REC_BONUS if (last[n] and (now_ts - last[n] < REC_BONUS_H*3600)) else 0.0
-        score = wl + rec
-        rows.append((score, wl, p_hat, rec, n))
+# =======================
+# Envio para Telegram
+# =======================
+async def tg_send(token: str, chat: str | int, text: str):
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = {"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10, connect=10)) as c:
+        r = await c.post(url, json=data)
+        if r.status_code != 200 or not r.json().get("ok", False):
+            print(f"[SEND][ERR] status={r.status_code} body={r.text}")
+        else:
+            print(f"[SEND][OK] -> {chat}")
 
-    # ordena por score; se empatar, usa ordem fixa
-    rows.sort(key=lambda t: (t[0], -FIX_TIE_ORDER.index(t[4]) if t[4] in FIX_TIE_ORDER else 99), reverse=True)
-    choice = rows[0][4]
+# =======================
+# FastAPI
+# =======================
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"ok": True, "webhook": "/webhook/<TOKEN>", "status": "/status"}
+
+@app.get("/status")
+def status():
     return {
-        "choice": choice,
-        "key": key,
-        "obs": int(total),
-        "rows": [{"n":r[4],"score":round(r[0],4),"wl":round(r[1],4),"p":round(r[2],4),"rec":round(r[3],4)} for r in rows]
+        "ok": True,
+        "mem_keys": len(MEM.get("freq", {})),
+        "pending": list(MEM.get("pending", {}).keys()),
+        "target": CONFIG["TARGET_CHANNEL"],
+        "source": CONFIG["PUBLIC_CHANNEL"],
+        "mode": CONFIG["SUGGEST_MODE"]
     }
-
-async def handle_signal(chat_id:int, msg_id:int, text:str):
-    # filtro por canal de origem, se PUBLIC_CHANNEL estiver definido (username do chat)
-    # (Nota: updates de canal enviados ao webhook trazem channel_post com chat.username)
-    # O filtro por chat.username é feito no webhook abaixo, aqui focamos apenas na lógica.
-
-    # dedupe / cooldown
-    if should_skip_by_dedupe(msg_id):
-        if DEBUG_SUGGEST: log.info("[SKIP] dedupe msg_id=%s", msg_id)
-        return
-    if not cooldown_ok():
-        if DEBUG_SUGGEST: log.info("[SKIP] cooldown")
-        return
-
-    cand, modo = parse_candidates(text)
-    if not cand:
-        if DEBUG_SUGGEST: log.info("[SKIP] sem candidatos (Sequência não detectada)")
-        return
-    choice = choose_single(modo, cand)
-    if DEBUG_SUGGEST:
-        log.info(f"[SUGGEST] {choice['key']} -> choice={choice['choice']} rows={choice['rows']} obs={choice['obs']}")
-    msg = (
-        f"🎯 <b>Número seco sugerido:</b> <code>{choice['choice']}</code>\n"
-        f"📊 <i>Base:</i> ~{choice['obs']} (combinação {choice['key']})\n"
-        f"✅ Conf. (Wilson): <b>{choice['rows'][0]['wl']*100:.2f}%</b>"
-    )
-    # envia para o destino configurado; se não houver, responde no próprio chat
-    dest = TARGET_CHAT_ID if TARGET_CHAT_ID != 0 else chat_id
-    await send_text(dest, msg)
-    _last_combo_by_chat[chat_id] = {"modo": modo, "nums": cand, "ts": int(now())}
-
-async def handle_close(chat_id:int, text:str):
-    # tenta obter vencedor explícito
-    m = RE_NUM.search(text or "")
-    winner = int(m.group(1)) if m else None
-    # pega a última combinação vista para esse chat
-    last = _last_combo_by_chat.get(chat_id)
-    if not last or winner not in (1,2,3,4):
-        if DEBUG_SUGGEST: log.info("[CLOSE] sem last combo ou sem winner")
-        return
-    record_outcome(last["modo"], last["nums"], winner)
-
-# =========================
-# Webhook
-# =========================
-def _validate_token(token_in_path: str):
-    if TG_BOT_TOKEN == "" or token_in_path != TG_BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido")
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
-    _validate_token(token)
-    data = await request.json()
-    upd = data
-    msg = upd.get("channel_post") or upd.get("message") or {}
-    text = msg.get("text") or msg.get("caption") or ""
-    chat = msg.get("chat") or {}
-    chat_id = int(chat.get("id") or 0)
-    msg_id  = int(msg.get("message_id") or 0)
+    if token != CONFIG["WEBHOOK_TOKEN"]:
+        return {"ok": False, "err": "bad token"}
 
-    # Se PUBLIC_CHANNEL foi definido, filtre por username do canal de origem
-    if PUBLIC_CHANNEL:
-        username = (chat.get("username") or "").lower()
-        if username != PUBLIC_CHANNEL.lstrip("@").lower():
-            return JSONResponse({"ok":True, "skip":"origem diferente"})
+    body = await request.json()
+    # Telegram pode mandar em channel_post, message, edited_channel_post etc.
+    msg = body.get("channel_post") or body.get("message") or body.get("edited_channel_post") or {}
+    text: str = (msg.get("text") or msg.get("caption") or "").strip()
+    chat = msg.get("chat", {})
+    ch_user = chat.get("username")
+    msg_id = msg.get("message_id")
+    date_ts = msg.get("date")
 
-    if not text:
-        return JSONResponse({"ok": True})
+    print(f"[RX] chat=@{ch_user} id={msg_id} ts={date_ts} text={text[:60]!r}")
 
-    # Entrada confirmada → escolher e enviar SECO
-    if RE_ENTRY.search(text):
-        await handle_signal(chat_id, msg_id, text)
-        return JSONResponse({"ok": True, "handled": "entry"})
+    # 1) Sinal com sequência
+    offered = extract_offered(text)
+    if offered:
+        strat = extract_strategy(text)
+        # registra pendência para aprender depois quando chegar o GREEN
+        remember_offer(strat, offered)
 
-    # Fechamento → aprender vencedor
-    if RE_CLOSE.search(text) or RE_GREEN.search(text) or RE_RED.search(text):
-        await handle_close(chat_id, text)
-        return JSONResponse({"ok": True, "handled": "close"})
+        # escolhe número seco
+        num, score, base = choose_number(strat, offered)
+        pct = f"{score*100:.2f}%"
 
-    # Nenhum caso relevante
-    return JSONResponse({"ok": True})
+        # envia SEMPRE (não pula sinal)
+        out = (
+            f"🎯 <b>Número seco sugerido:</b> <b>{num}</b>\n"
+            f"🧩 Base: estratégia {strat or 'N/D'} | oferta {', '.join(map(str, offered))}\n"
+            f"📊 Aprendizado em ~{base} sinais\n"
+            f"✅ Chance estimada: {pct}"
+        )
+        await tg_send(CONFIG["TG_BOT_TOKEN"], CONFIG["TARGET_CHANNEL"], out)
+        return {"ok": True, "sent": True}
 
-# =========================
-# Status & Saúde
-# =========================
-@app.get("/")
-async def root():
-    return {
-        "ok": True,
-        "bot_enabled": bool(BOT_ENABLED),
-        "public_channel": PUBLIC_CHANNEL,
-        "target_chat_id": TARGET_CHAT_ID,
-        "cooldown_s": COOLDOWN_S,
-        "dedup_ttl_s": DEDUP_TTL_S,
-        "webhook": f"/webhook/{TG_BOT_TOKEN[:10]}..." if TG_BOT_TOKEN else ""
-    }
+    # 2) Resultado (GREEN!!! (x)) → aprender
+    winner = extract_winner(text)
+    if winner:
+        strat = extract_strategy(text)
+        learn_from_result(strat, winner)
+        return {"ok": True, "learned": True, "winner": winner}
 
-@app.get("/status")
-async def status():
-    # retorna top combos e stats resumidos
-    rows = []
-    cur = DB.execute("SELECT combo, win1,win2,win3,win4 FROM combo_stats ORDER BY (win1+win2+win3+win4) DESC LIMIT 15")
-    for combo, w1,w2,w3,w4 in cur.fetchall():
-        tot = w1+w2+w3+w4
-        if tot <= 0: continue
-        rows.append({"combo": combo, "total": tot, "w": {1:w1,2:w2,3:w3,4:w4}})
-    return {"ok": True, "combos": rows, "now": int(now())}
-
-# =========================
-# Startup
-# =========================
-@app.on_event("startup")
-async def on_startup():
-    if TG_BOT_TOKEN and PUBLIC_URL:
-        await ensure_webhook()
-    log.info("✅ Serviço ativo. BOT_ENABLED=%s | TARGET_CHAT_ID=%s | PUBLIC_CHANNEL=%s",
-             BOT_ENABLED, TARGET_CHAT_ID, PUBLIC_CHANNEL)
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("webhook_app:app", host="0.0.0.0", port=port)
+    return {"ok": True, "ignored": True}
