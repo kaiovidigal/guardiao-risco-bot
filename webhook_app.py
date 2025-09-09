@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, re, json, time, sqlite3, hashlib
+import os, re, json, time, sqlite3, shutil
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
@@ -14,6 +14,9 @@ TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()   # -100... ou @canal
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 
+# **NOVO**: caminho do banco em disco persistente (Render)
+DB_PATH = os.getenv("DB_PATH", "/data/data.db").strip()
+
 if not TG_BOT_TOKEN or not PUBLIC_CHANNEL or not WEBHOOK_TOKEN:
     print("⚠️ Defina TG_BOT_TOKEN, PUBLIC_CHANNEL e WEBHOOK_TOKEN.")
 
@@ -22,41 +25,51 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 # =========================
 # Hiperparâmetros do modelo
 # =========================
-WINDOW = 400        # cauda maior melhora padrão recorrente
-DECAY  = 0.985      # decaimento mais lento
-
-# pesos do back-off (contexto longo tem mais peso)
+WINDOW = 400
+DECAY  = 0.985
 W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
-# pesos dos componentes (n-grams / padrão / estratégia)
 ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
 
-# Aviso visual quando a confiança estiver baixa (NÃO bloqueia envio)
-MIN_CONF_VISUAL    = 0.55
-MIN_SAMPLES_VISUAL = 800
-GAP_MIN            = 0.08   # 8% de folga entre 1º e 2º colocado (para escolher melhor candidato)
+# sempre sugere (mesmo com confiança baixa)
+MIN_CONF, MIN_SAMPLES, GAP_MIN = 0.0, 0, 0.0
+COOLDOWN_S = 12
 
-TRIGGER_P   = 0.82
-TRIGGER_SUP = 12
-
-COOLDOWN_S = 12            # anti-duplicata rápida por chat
-
-app = FastAPI(title="Fantan Guardião — Número Seco", version="2.2.0")
+app = FastAPI(title="Fantan Guardião — Número Seco", version="2.3.1")
 
 # =========================
-# DB
+# DB helpers (com WAL e migração)
 # =========================
-DB_PATH = "data.db"
+def ensure_db_dir():
+    d = os.path.dirname(DB_PATH) or "."
+    os.makedirs(d, exist_ok=True)
+
+def migrate_old_db_if_needed():
+    # caminho antigo durante build/exec do Render
+    old = "/opt/render/project/src/data.db"
+    if not os.path.exists(DB_PATH) and os.path.exists(old):
+        try:
+            shutil.copyfile(old, DB_PATH)
+            print(f"📦 Migrado data.db -> {DB_PATH}")
+        except Exception as e:
+            print("⚠️ Falha ao migrar DB:", e)
 
 def db() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    ensure_db_dir()
+    con = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)  # autocommit
     con.row_factory = sqlite3.Row
+    # PRAGMAs seguros para serviço
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA temp_store=MEMORY;")
     return con
 
 def init_db():
+    ensure_db_dir()
+    migrate_old_db_if_needed()
     con = db()
     cur = con.cursor()
 
-    # timeline (linha do tempo dos números reais da mesa)
+    # timeline
     cur.execute("""
     CREATE TABLE IF NOT EXISTS timeline (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +77,7 @@ def init_db():
         number INTEGER NOT NULL
     )""")
 
-    # n-gram stats (pesos acumulados)
+    # n-grams
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ngram_stats (
         n INTEGER NOT NULL,
@@ -74,7 +87,7 @@ def init_db():
         PRIMARY KEY (n, ctx, next)
     )""")
 
-    # histórico por padrão (KWOK-2-3, SSH-3-2-1, ODD, EVEN, SEQ, ...)
+    # stats por padrão
     cur.execute("""
     CREATE TABLE IF NOT EXISTS stats_pattern (
         pattern_key TEXT NOT NULL,
@@ -84,7 +97,7 @@ def init_db():
         PRIMARY KEY (pattern_key, number)
     )""")
 
-    # histórico por estratégia (id)
+    # stats por estratégia
     cur.execute("""
     CREATE TABLE IF NOT EXISTS stats_strategy (
         strategy TEXT NOT NULL,
@@ -94,7 +107,7 @@ def init_db():
         PRIMARY KEY (strategy, number)
     )""")
 
-    # sugestões enviadas (dedupe por message_id do canal)
+    # sugestões (dedupe)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS suggestions (
         source_msg_id INTEGER PRIMARY KEY,
@@ -102,13 +115,13 @@ def init_db():
         seq_raw TEXT,
         context_key TEXT,
         pattern_key TEXT,
-        base TEXT,                 -- JSON dos candidatos usados
+        base TEXT,
         suggested_number INTEGER,
-        stage TEXT,                -- G0/G1/G2
+        stage TEXT,
         sent_at INTEGER
     )""")
 
-    # ponte para casar resultado por estratégia
+    # ponte última sugestão por estratégia
     cur.execute("""
     CREATE TABLE IF NOT EXISTS last_by_strategy (
         strategy TEXT PRIMARY KEY,
@@ -120,7 +133,7 @@ def init_db():
         created_at INTEGER
     )""")
 
-    # placar diário
+    # placar diário (geral)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS daily_score (
         yyyymmdd TEXT PRIMARY KEY,
@@ -129,23 +142,33 @@ def init_db():
         streak INTEGER NOT NULL DEFAULT 0
     )""")
 
-    # cooldown simples por chat
+    # **NOVO** placar por estágio
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS daily_score_stage (
+        yyyymmdd TEXT NOT NULL,
+        stage INTEGER NOT NULL,
+        wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (yyyymmdd, stage)
+    )""")
+
+    # cooldown
     cur.execute("""
     CREATE TABLE IF NOT EXISTS cooldown (
         chat_id INTEGER PRIMARY KEY,
         last_ts REAL
     )""")
 
-    # pending outcome: janela de 3 resultados para fechar G0/G1/G2
+    # pendências (G0/G1/G2)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS pending_outcome (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER NOT NULL,
         strategy TEXT,
         suggested INTEGER NOT NULL,
-        stage INTEGER NOT NULL,       -- 0,1,2  (G0/G1/G2)
-        open INTEGER NOT NULL,        -- 1 = aberto
-        window_left INTEGER NOT NULL  -- quantos resultados faltam observar
+        stage INTEGER NOT NULL,
+        open INTEGER NOT NULL,
+        window_left INTEGER NOT NULL
     )""")
 
     con.commit()
@@ -160,7 +183,7 @@ def today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
 
 # =========================
-# Utils Telegram
+# Telegram
 # =========================
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     async with httpx.AsyncClient(timeout=15) as client:
@@ -177,7 +200,7 @@ def append_timeline(con: sqlite3.Connection, number: int):
 
 def get_recent_tail(con: sqlite3.Connection, window: int = WINDOW) -> List[int]:
     rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (window,)).fetchall()
-    return [r["number"] for r in rows][::-1]  # antigo -> recente
+    return [r["number"] for r in rows][::-1]
 
 def update_ngrams(con: sqlite3.Connection, decay: float = DECAY, max_n: int = 5, window: int = WINDOW):
     tail = get_recent_tail(con, window)
@@ -189,7 +212,7 @@ def update_ngrams(con: sqlite3.Connection, decay: float = DECAY, max_n: int = 5,
         w = (decay ** dist)
         for n in range(2, max_n+1):
             if t-(n-1) < 0: break
-            ctx = tail[t-(n-1):t]  # n-1 itens (cronológico)
+            ctx = tail[t-(n-1):t]
             ctx_key = ",".join(str(x) for x in ctx)
             con.execute("""
                 INSERT INTO ngram_stats (n, ctx, next, weight)
@@ -198,7 +221,6 @@ def update_ngrams(con: sqlite3.Connection, decay: float = DECAY, max_n: int = 5,
             """, (n, ctx_key, int(nxt), float(w)))
 
 def prob_from_ngrams(con: sqlite3.Connection, ctx: List[int], candidate: int) -> float:
-    """P(candidate | ctx) proporcional ao peso; se não houver, retorna 0."""
     n = len(ctx) + 1
     if n < 2 or n > 5: return 0.0
     ctx_key = ",".join(str(x) for x in ctx)
@@ -210,7 +232,7 @@ def prob_from_ngrams(con: sqlite3.Connection, ctx: List[int], candidate: int) ->
     return w / tot
 
 # =========================
-# Filtros / Parsers
+# Parsers
 # =========================
 MUST_HAVE = (r"ENTRADA\s+CONFIRMADA", r"Mesa:\s*Fantan\s*-\s*Evolution")
 MUST_NOT  = (r"\bANALISANDO\b", r"\bPlacar do dia\b", r"\bAPOSTA ENCERRADA\b")
@@ -243,7 +265,6 @@ def extract_after_num(text: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 def bases_from_sequence_left_recent(seq_left_recent: List[int], k: int = 3) -> List[int]:
-    """Pega até k distintos a partir do MAIS RECENTE (esquerda)."""
     seen, base = set(), []
     for n in seq_left_recent:
         if n not in seen:
@@ -253,43 +274,33 @@ def bases_from_sequence_left_recent(seq_left_recent: List[int], k: int = 3) -> L
 
 def parse_bases_and_pattern(text: str) -> Tuple[List[int], str]:
     t = re.sub(r"\s+", " ", text).strip()
-
-    # KWOK X-Y
     m = re.search(r"\bKWOK\s*([1-4])\s*-\s*([1-4])", t, flags=re.I)
     if m:
         a, b = int(m.group(1)), int(m.group(2))
         return [a,b], f"KWOK-{a}-{b}"
-
-    # ODD / EVEN
     if re.search(r"\bODD\b", t, flags=re.I):  return [1,3], "ODD"
     if re.search(r"\bEVEN\b", t, flags=re.I): return [2,4], "EVEN"
-
-    # SSH A-B(-C)(-D)
     m = re.search(r"\bSS?H\s*([1-4])(?:-([1-4]))?(?:-([1-4]))?(?:-([1-4]))?", t, flags=re.I)
     if m:
         nums = [int(g) for g in m.groups() if g]
         return nums, "SSH-" + "-".join(str(x) for x in nums)
-
-    # Sequência
     m = re.search(r"Sequ[eê]ncia:\s*([\d\s\|\-]+)", t, flags=re.I)
     if m:
         parts = re.findall(r"[1-4]", m.group(1))
-        seq_left_recent = [int(x) for x in parts]     # esquerda = mais recente (padrão do seu canal)
+        seq_left_recent = [int(x) for x in parts]
         base = bases_from_sequence_left_recent(seq_left_recent, 3)
         if base:
             return base, "SEQ"
-
     return [], "GEN"
 
 GREEN_RE   = re.compile(r"APOSTA\s+ENCERRADA.*?GREEN.*?\((\d)\)", re.I | re.S)
-RED_NUM_RE = re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\((.*?)\)", re.I | re.S)  # ex: (2 | 4 | 2)
+RED_NUM_RE = re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\((.*?)\)", re.I | re.S)
 
 def extract_green_number(text: str) -> Optional[int]:
     m = GREEN_RE.search(text)
     return int(m.group(1)) if m else None
 
 def extract_red_last_left(text: str) -> Optional[int]:
-    """Se o canal publicar RED (...), pegamos o mais à esquerda (no teu canal = mais RECENTE)."""
     m = RED_NUM_RE.search(text)
     if not m: return None
     inside = m.group(1)
@@ -304,7 +315,7 @@ def is_analise(text:str) -> bool:
     return bool(re.search(r"\bANALISANDO\b", text, flags=re.I))
 
 # =========================
-# Estatísticas (padrão/estratégia)
+# Stats
 # =========================
 def bump_pattern(con: sqlite3.Connection, pattern_key: str, number: int, won: bool):
     row = con.execute("SELECT wins, losses FROM stats_pattern WHERE pattern_key=? AND number=?",
@@ -353,11 +364,31 @@ def update_daily_score(con: sqlite3.Connection, won: bool) -> Tuple[int,int,floa
     acc = (wins/total) if total else 0.0
     return wins, losses, acc, streak
 
-async def send_scoreboard(w:int,l:int,acc:float,streak:int):
-    txt = (f"📊 <b>Placar do dia</b> — 🟢 {w} 🔴 {l}\n"
-           f"✅ Acerto: {acc*100:.2f}%\n"
-           f"🔥 Streak: {streak} GREEN(s)")
-    await tg_send_text(PUBLIC_CHANNEL, txt)
+def update_daily_score_stage(con: sqlite3.Connection, stage: int, won: bool):
+    y = today_key()
+    row = con.execute(
+        "SELECT wins, losses FROM daily_score_stage WHERE yyyymmdd=? AND stage=?",
+        (y, stage)
+    ).fetchone()
+    w = (row["wins"] if row else 0) + (1 if won else 0)
+    l = (row["losses"] if row else 0) + (0 if won else 1)
+    con.execute("""
+      INSERT INTO daily_score_stage (yyyymmdd, stage, wins, losses)
+      VALUES (?,?,?,?)
+      ON CONFLICT(yyyymmdd, stage)
+      DO UPDATE SET wins=excluded.wins, losses=excluded.losses
+    """, (y, stage, w, l))
+
+def read_stage_scores_today(con: sqlite3.Connection):
+    y = today_key()
+    rows = con.execute("""
+      SELECT stage, wins, losses FROM daily_score_stage
+      WHERE yyyymmdd=? ORDER BY stage
+    """, (y,)).fetchall()
+    out = {0:(0,0), 1:(0,0), 2:(0,0)}
+    for r in rows:
+        out[int(r["stage"])] = (int(r["wins"]), int(r["losses"]))
+    return out
 
 # =========================
 # Dedup / Cooldown
@@ -391,114 +422,73 @@ def cooldown_ok(con: sqlite3.Connection, chat_id:int) -> bool:
 # Cálculo do número seco
 # =========================
 def ngram_backoff_score(con: sqlite3.Connection, tail: List[int], after_num: Optional[int], candidate: int) -> float:
-    """
-    Usa back-off de contextos terminando em 'after_num' (se fornecido).
-    Se after_num for None, usa a cauda diretamente (últimos k-1).
-    """
     score = 0.0
-    if not tail:
-        return 0.0
-
-    # Encontrar a posição mais recente do gatilho 'after_num' na cauda
+    if not tail: return 0.0
     if after_num is not None:
         idxs = [i for i,v in enumerate(tail) if v == after_num]
         if not idxs:
-            # sem gatilho, usar os últimos contextos genéricos (CORRIGIDO: slices finais)
             ctx4 = tail[-4:] if len(tail) >= 4 else []
             ctx3 = tail[-3:] if len(tail) >= 3 else []
             ctx2 = tail[-2:] if len(tail) >= 2 else []
             ctx1 = tail[-1:] if len(tail) >= 1 else []
         else:
             i = idxs[-1]
-            # ctx termina no after_num (inclui o after_num no fim)
             ctx1 = tail[max(0, i): i+1]
             ctx2 = tail[max(0, i-1): i+1] if i-1 >= 0 else []
             ctx3 = tail[max(0, i-2): i+1] if i-2 >= 0 else []
             ctx4 = tail[max(0, i-3): i+1] if i-3 >= 0 else []
     else:
-        # CORRIGIDO: slices finais (sem -0)
         ctx4 = tail[-4:] if len(tail) >= 4 else []
         ctx3 = tail[-3:] if len(tail) >= 3 else []
         ctx2 = tail[-2:] if len(tail) >= 2 else []
         ctx1 = tail[-1:] if len(tail) >= 1 else []
-
     parts = []
     if len(ctx4)==4: parts.append((W4, prob_from_ngrams(con, ctx4[:-1], candidate)))
     if len(ctx3)==3: parts.append((W3, prob_from_ngrams(con, ctx3[:-1], candidate)))
     if len(ctx2)==2: parts.append((W2, prob_from_ngrams(con, ctx2[:-1], candidate)))
     if len(ctx1)==1: parts.append((W1, prob_from_ngrams(con, ctx1[:-1], candidate)))
-
-    for w,p in parts:
-        score += w * p
+    for w,p in parts: score += w * p
     return score
 
 def laplace_ratio(wins:int, losses:int) -> float:
     return (wins + 1.0) / (wins + losses + 2.0)
 
-def confident_best(post: Dict[int,float], gap: float = GAP_MIN) -> Optional[int]:
+def confident_best(post: Dict[int,float], gap: float = 0.0) -> Optional[int]:
     a = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     if not a: return None
-    if len(a) == 1: return a[0][0]
-    if a[0][1] - a[1][1] >= gap:
-        return a[0][0]
-    return None
+    return a[0][0]
 
 def suggest_number(con: sqlite3.Connection, base: List[int], pattern_key: str, strategy: Optional[str], after_num: Optional[int]) -> Tuple[Optional[int],float,int,Dict[int,float]]:
-    """
-    Combina: prior (uniforme na base) × ngram_backoff^ALPHA × pattern^BETA × strategy^GAMMA.
-    Retorna (numero_ou_None, conf, samples, breakdown).
-    """
-    if not base:
-        base = [1,2,3,4]
-
-    # sazonalidade leve por bloco de 2h
+    if not base: base = [1,2,3,4]
     hour_block = int(datetime.now(timezone.utc).hour // 2)
     pat_key = f"{pattern_key}|h{hour_block}"
 
     tail = get_recent_tail(con, WINDOW)
     scores: Dict[int, float] = {}
-    parts_dbg: Dict[int, Dict[str,float]] = {}
 
     for c in base:
-        # n-gram likelihood
         ng = ngram_backoff_score(con, tail, after_num, c)
-
-        # padrão (com chave sazonal)
         rowp = con.execute("SELECT wins, losses FROM stats_pattern WHERE pattern_key=? AND number=?", (pat_key, c)).fetchone()
         pw = rowp["wins"] if rowp else 0
         pl = rowp["losses"] if rowp else 0
         p_pat = laplace_ratio(pw, pl)
-
-        # estratégia
         p_str = 1/len(base)
         if strategy:
             rows = con.execute("SELECT wins, losses FROM stats_strategy WHERE strategy=? AND number=?", (strategy, c)).fetchone()
             sw = rows["wins"] if rows else 0
             sl = rows["losses"] if rows else 0
             p_str = laplace_ratio(sw, sl)
-
-        # prior uniforme dentro da base
         prior = 1.0/len(base)
+        scores[c] = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA)
 
-        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA)
-        scores[c] = score
-        parts_dbg[c] = {"prior":prior, "ng":ng, "pat":p_pat, "str":p_str}
-
-    # normaliza para confiança
     total = sum(scores.values()) or 1e-9
     post = {k: v/total for k,v in scores.items()}
 
-    # melhor candidato com gap mínimo (só para escolher; NÃO bloqueia envio)
-    number = confident_best(post, gap=GAP_MIN)
-    if number is None:
-        # se não houver gap suficiente, escolha o maior mesmo assim (publica sempre)
-        number = max(post.items(), key=lambda kv: kv[1])[0]
-    conf = post.get(number, 0.0)
+    number = confident_best(post)
+    conf = post.get(number, 0.0) if number is not None else 0.0
 
-    # estimativa de amostra (peso total nos n-grams)
     roww = con.execute("SELECT SUM(weight) AS s FROM ngram_stats").fetchone()
     samples = int(roww["s"] or 0)
-
     return number, conf, samples, post
 
 # =========================
@@ -507,16 +497,27 @@ def suggest_number(con: sqlite3.Connection, base: List[int], pattern_key: str, s
 def build_suggestion_msg(number:int, base:List[int], pattern_key:str, after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
     base_txt = ", ".join(str(x) for x in base) if base else "—"
     aft_txt = f" após {after_num}" if after_num else ""
-    header = "🎯 <b>Número seco ({})</b>: <b>{}</b>".format(stage, number)
-    body = (
+    header = "⚠️ Confiança baixa\n" if conf < 0.55 else ""
+    return header + (
+        f"🎯 <b>Número seco ({stage}):</b> <b>{number}</b>\n"
         f"🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n"
         f"🧮 <b>Base:</b> [{base_txt}]\n"
         f"📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
     )
-    # Aviso visual quando confiança/amostra estão baixos (mas SEM bloquear envio)
-    if conf < MIN_CONF_VISUAL or samples < MIN_SAMPLES_VISUAL:
-        return "⚠️ <b>Confiança baixa</b>\n" + header + "\n" + body
-    return header + "\n" + body
+
+async def send_scoreboard(con: sqlite3.Connection, w:int,l:int,acc:float,int_streak:int):
+    s = read_stage_scores_today(con)
+    g0w,g0l = s[0]; g1w,g1l = s[1]; g2w,g2l = s[2]
+    txt = (
+        f"📊 <b>Placar do dia</b> — 🟢 {w} 🔴 {l}\n"
+        f"✅ Acerto: {acc*100:.2f}%\n"
+        f"🔥 Streak: {int_streak} GREEN(s)\n\n"
+        f"📍 <b>Por estágio</b>:\n"
+        f"• G0: 🟢 {g0w} 🔴 {g0l}\n"
+        f"• G1: 🟢 {g1w} 🔴 {g1l}\n"
+        f"• G2: 🟢 {g2w} 🔴 {g2l}"
+    )
+    await tg_send_text(PUBLIC_CHANNEL, txt)
 
 # =========================
 # Webhook models
@@ -537,35 +538,35 @@ def open_pending(con: sqlite3.Connection, strategy: Optional[str], suggested: in
         (now_ts(), strategy or "", int(suggested), 0)
     )
 
-def close_pending_with_result(con: sqlite3.Connection, n_real: int):
-    """
-    A cada número real observado (ANALISANDO/GREEN), tentamos fechar pendências:
-    - Se bateu: win no estágio atual.
-    - Se não bateu e acabou a janela de 3 observações: loss.
-    """
+def close_pending_with_result(con: sqlite3.Connection, n_real: int) -> List[Tuple[int,int,float,int]]:
+    scores_to_publish: List[Tuple[int,int,float,int]] = []
     rows = con.execute(
         "SELECT id, strategy, suggested, stage, window_left FROM pending_outcome WHERE open=1 ORDER BY id"
     ).fetchall()
     for r in rows:
         pid, strat, sug, stage, left = r["id"], (r["strategy"] or ""), int(r["suggested"]), int(r["stage"]), int(r["window_left"])
         if n_real == sug:
-            # WIN no estágio atual
+            stage_hit = 3 - left  # 3->G0, 2->G1, 1->G2
             bump_pattern(con, "PEND", sug, True)
             if strat:
                 bump_strategy(con, strat, sug, True)
+            update_daily_score_stage(con, stage_hit, True)
             w,l,acc,streak = update_daily_score(con, True)
             con.execute("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
+            scores_to_publish.append((w,l,acc,streak))
         else:
             left -= 1
             if left <= 0:
-                # LOSS total (não bateu em G0/G1/G2)
                 bump_pattern(con, "PEND", sug, False)
                 if strat:
                     bump_strategy(con, strat, sug, False)
+                update_daily_score_stage(con, 2, False)  # loss até G2
                 w,l,acc,streak = update_daily_score(con, False)
                 con.execute("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
+                scores_to_publish.append((w,l,acc,streak))
             else:
                 con.execute("UPDATE pending_outcome SET window_left=? WHERE id=?", (left, pid))
+    return scores_to_publish
 
 # =========================
 # Routes
@@ -574,29 +575,10 @@ def close_pending_with_result(con: sqlite3.Connection, n_real: int):
 async def root():
     return {"ok": True, "detail": "Use POST /webhook/<WEBHOOK_TOKEN>"}
 
-@app.get("/debug/stats")
-async def debug_stats():
-    con = db()
-    out = {
-        "stats_pattern": [dict(r) for r in con.execute("SELECT * FROM stats_pattern LIMIT 200").fetchall()],
-        "stats_strategy": [dict(r) for r in con.execute("SELECT * FROM stats_strategy LIMIT 200").fetchall()],
-        "ngrams_total": con.execute("SELECT COUNT(*) c FROM ngram_stats").fetchone()["c"],
-        "timeline_len": con.execute("SELECT COUNT(*) c FROM timeline").fetchone()["c"],
-    }
-    con.close()
-    return out
-
 @app.get("/debug/score")
 async def debug_score():
     con = db()
     out = [dict(r) for r in con.execute("SELECT * FROM daily_score ORDER BY yyyymmdd DESC LIMIT 14").fetchall()]
-    con.close()
-    return out
-
-@app.get("/debug/suggestions")
-async def debug_suggestions():
-    con = db()
-    out = [dict(r) for r in con.execute("SELECT * FROM suggestions ORDER BY sent_at DESC LIMIT 20").fetchall()]
     con.close()
     return out
 
@@ -606,14 +588,6 @@ async def debug_last():
     tail = get_recent_tail(con, 30)
     con.close()
     return {"tail_old_to_new": tail}
-
-@app.get("/debug/last-posterior")
-async def last_posterior():
-    con = db()
-    base = [1,2,3,4]
-    num, conf, samples, post = suggest_number(con, base, "DBG", None, None)
-    con.close()
-    return {"samples": samples, "conf": conf, "post": post, "pick": num}
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -634,7 +608,7 @@ async def webhook(token: str, request: Request):
 
     con = db()
 
-    # 1) GREEN / RED / GALE → timeline + tentativa de fechar pendências
+    # 1) GREEN / RED / GALE → timeline + fechar pendências
     try:
         gnum = extract_green_number(t)
         gale_n = is_gale_info(t)
@@ -646,13 +620,17 @@ async def webhook(token: str, request: Request):
         elif red_last is not None:
             append_timeline(con, red_last); update_ngrams(con); n_observed = red_last
 
+        published_any = False
         if n_observed is not None:
-            # fechar janelas pendentes (G0/G1/G2)
-            close_pending_with_result(con, n_observed)
+            scores_list = close_pending_with_result(con, n_observed)
+            con.commit()
+            for (w,l,acc,streak) in scores_list:
+                await send_scoreboard(con, w,l,acc,streak)
+                published_any = True
 
-        # aprendizado por estratégia (se GREEN com número e ponte existente)
+        # aprendizado direto por estratégia quando GREEN
         strat = extract_strategy(t) or ""
-        row = con.execute("SELECT suggested_number, context_key, pattern_key FROM last_by_strategy WHERE strategy=?", (strat,)).fetchone()
+        row = con.execute("SELECT suggested_number, pattern_key FROM last_by_strategy WHERE strategy=?", (strat,)).fetchone()
         if row and gnum is not None:
             suggested = int(row["suggested_number"])
             pat_key   = row["pattern_key"] or "GEN"
@@ -661,38 +639,36 @@ async def webhook(token: str, request: Request):
             if strat:
                 bump_strategy(con, strat, suggested, won)
             w,l,acc,streak = update_daily_score(con, won)
-            await send_scoreboard(w,l,acc,streak)
+            await send_scoreboard(con, w,l,acc,streak)
+            published_any = True
 
-        con.commit()
+        con.commit(); con.close()
         if gnum is not None or red_last is not None or gale_n is not None:
-            con.close()
-            return {"ok": True, "learned_or_updated": True}
+            return {"ok": True, "learned_or_updated": True, "published_score": published_any}
     finally:
         pass
 
-    # 2) ANALISANDO → alimentar timeline (NÃO enviar sugestão)
+    # 2) ANALISANDO → alimentar timeline
     if is_analise(t):
         seq_raw = extract_seq_raw(t)
         if seq_raw:
             parts = re.findall(r"[1-4]", seq_raw)
-            # Seu canal: ESQUERDA = mais RECENTE → precisamos reverter para cronologia antes de gravar
             seq_left_recent = [int(x) for x in parts]
             seq_old_to_new  = seq_left_recent[::-1]
             for n in seq_old_to_new:
                 append_timeline(con, n)
-                # a cada número observado, tentamos fechar pendências
-                close_pending_with_result(con, n)
+                for (w,l,acc,streak) in close_pending_with_result(con, n):
+                    await send_scoreboard(con, w,l,acc,streak)
             update_ngrams(con)
             con.commit()
         con.close()
         return {"ok": True, "analise": True}
 
-    # 3) ENTRADA CONFIRMADA → sugerir 1 número seco (sempre publica)
+    # 3) ENTRADA CONFIRMADA → sugerir 1 número seco
     if not is_real_entry(t):
         con.close()
         return {"ok": True, "skipped": True}
 
-    # Dedupe por message_id
     if already_suggested(con, source_msg_id):
         con.close()
         return {"ok": True, "dup": True}
@@ -701,21 +677,15 @@ async def webhook(token: str, request: Request):
     seq_raw    = extract_seq_raw(t) or ""
     after_num  = extract_after_num(t)
     base, pattern_key = parse_bases_and_pattern(t)
-
     if not base:
-        base = [1,2,3,4]
-        pattern_key = "GEN"
+        base = [1,2,3,4]; pattern_key = "GEN"
 
-    # cálculo
     number, conf, samples, post = suggest_number(con, base, pattern_key, strategy, after_num)
 
-    # grava ponte, abrir pendência (janela G0/G1/G2) e enviar SEM bloquear
     remember_suggestion(con, source_msg_id, strategy, seq_raw, "CTX", pattern_key, base, number, stage="G0")
     open_pending(con, strategy, number)
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
-    # envia 1 única mensagem (sempre)
     out = build_suggestion_msg(number, base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_send_text(PUBLIC_CHANNEL, out)
     return {"ok": True, "sent": True, "conf": conf, "samples": samples}
