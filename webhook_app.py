@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-# Fantan — Número Seco com padrões (n-grama):
-# 1) Prioriza "Até G1 = 100%" (exato, com amostra mínima)
-# 2) Fallback "G0 ≥ 90%" (limite inferior de Wilson 95% com amostra mínima)
-# 3) Se nada bater, "Neutro — avaliando combinações"
-# Extras:
-# • /ingest para importar histórico retroativo (JSONL/JSON em lotes)
-# • /scrape (com token) usando Telethon (userbot) para baixar o histórico e alimentar
-# • Resumo automático a cada 5 sinais e métricas embutidas em cada SINAL
-# • Suporte "Entrar após o k" no contexto
+# Fantan — Webhook completo (FastAPI + Aiogram + Telethon)
+# • Núcleo IA: n-gramas
+# • Prioridade: Até G1 = 100% (amostra mínima)
+# • Fallback:   G0 ≥ 90% (Wilson 95%, amostra mínima)
+# • Sinal só quando ≥ 90% | Neutro caso contrário
+# • Resumo automático a cada REPORT_EVERY sinais (ex: 5)
+# • /ingest para treino por JSON (retroativo offline)
+# • /scrape para retroativo online (canal público + SESSION_STRING)
+# • Persistência simples (data/state.json)
 
 import os, re, json, time, logging, math, asyncio
 from typing import Dict, Tuple, List, Optional
@@ -16,17 +16,17 @@ from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
+
 from aiogram import Bot, Dispatcher, types
 
-# ---- opcional: Telethon userbot embutido
-ENABLE_USERBOT = int(os.getenv("ENABLE_USERBOT", "1"))
-try:
-    from telethon import TelegramClient
-except Exception:
-    TelegramClient = None
+# ---------- Telethon (userbot p/ retroativo online)
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.errors import SessionPasswordNeededError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("fantan-numero-seco")
+log = logging.getLogger("fantan-webhook")
 
 # =========================
 # ENV / Config
@@ -35,40 +35,43 @@ BOT_TOKEN   = os.getenv("TG_BOT_TOKEN") or ""
 if not BOT_TOKEN:
     raise RuntimeError("Faltando TG_BOT_TOKEN")
 
-# Seu canal:
-CHANNEL_ID  = int(os.getenv("CHANNEL_ID", "-1002810508717"))  # <- seu canal
-PUBLIC_URL  = (os.getenv("PUBLIC_URL") or "").rstrip("/")
+# Canal:
+CHANNEL_ID   = int(os.getenv("CHANNEL_ID", "-1002810508717"))      # id numérico
+CHANNEL_USER = (os.getenv("CHANNEL_USERNAME") or "").strip()       # username público, ex: "fantanvidigal" (sem @)
+
+PUBLIC_URL  = (os.getenv("PUBLIC_URL") or "").rstrip("/")          # URL pública do Render
 COOLDOWN_S  = int(os.getenv("COOLDOWN_S", "10"))
 
-# Padrões / critérios
+# Modelo / critérios
 N_MAX        = int(os.getenv("N_MAX", "4"))
 MIN_SUP_G0   = int(os.getenv("MIN_SUP_G0", "20"))
 MIN_SUP_G1   = int(os.getenv("MIN_SUP_G1", "20"))
 CONF_MIN     = float(os.getenv("CONF_MIN", "0.90"))
 Z_WILSON     = float(os.getenv("Z_WILSON", "1.96"))
 
-# Relatório
+# Relatórios
 SEND_SIGNALS   = int(os.getenv("SEND_SIGNALS", "1"))
 REPORT_EVERY   = int(os.getenv("REPORT_EVERY", "5"))
 RESULTS_WINDOW = int(os.getenv("RESULTS_WINDOW", "30"))
 
-# Userbot (Telethon)
-API_ID        = int(os.getenv("API_ID", "0"))
-API_HASH      = os.getenv("API_HASH", "")
-EXPORT_CHAN   = os.getenv("EXPORT_CHANNEL", "")     # @canal ou link privado
-SCRAPER_TOKEN = os.getenv("SCRAPER_TOKEN", "")      # senha do endpoint /scrape
-SCRAPER_FILTER= os.getenv("SCRAPER_FILTER_REGEX", r"Sequ[eê]ncia|ENTRADA\s+CONFIRMADA|APOSTA\s+ENCERRADA")
-SCRAPER_SINCE = os.getenv("SCRAPER_SINCE", "")      # YYYY-MM-DD
-SCRAPER_UNTIL = os.getenv("SCRAPER_UNTIL", "")      # YYYY-MM-DD
-SCRAPER_LIMIT = int(os.getenv("SCRAPER_LIMIT", "0"))# 0 = tudo
-SCRAPER_ON_START = int(os.getenv("SCRAPER_ON_START", "0"))
+# Telethon (retroativo online)
+API_ID         = int(os.getenv("API_ID", "0"))
+API_HASH       = os.getenv("API_HASH", "") or ""
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+ENABLE_SCRAPE  = bool(SESSION_STRING and API_ID and API_HASH)
 
+# =========================
+# Bots & App
+# =========================
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp  = Dispatcher(bot)
 app = FastAPI()
 
+# Telethon client (lazy)
+tele_client: Optional[TelegramClient] = None
+
 # =========================
-# Estado persistente
+# Persistência simples
 # =========================
 STATE_FILE = "data/state.json"
 os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
@@ -92,20 +95,16 @@ def save_state():
 load_state()
 
 # =========================
-# Modelo (n-gramas)
+# Buffers / Modelo n-gramas
 # =========================
-# G0: próximo número
-pattern_counts_g0: Dict[Tuple[int,...], List[int]] = defaultdict(lambda: [0,0,0,0,0])  # idx 1..4
+pattern_counts_g0: Dict[Tuple[int,...], List[int]] = defaultdict(lambda: [0,0,0,0,0])
 pattern_totals_g0: Dict[Tuple[int,...], int]       = defaultdict(int)
-# G1: próximo OU o seguinte (exato)
 pattern_hits_g1:   Dict[Tuple[int,...], List[int]] = defaultdict(lambda: [0,0,0,0,0])
 pattern_trials_g1: Dict[Tuple[int,...], int]       = defaultdict(int)
 
 recent_nums = deque(maxlen=N_MAX)
-
-# Histórico de resultados (para resumo)
-hist_long  = deque(maxlen=300)
-hist_short = deque(maxlen=60)
+hist_long   = deque(maxlen=300)
+hist_short  = deque(maxlen=60)
 
 # =========================
 # Parsers
@@ -132,12 +131,12 @@ def eh_resultado(txt:str)->Optional[int]:
     return None
 
 # =========================
-# Alimentação do modelo (inclui G1 exato)
+# Alimentação do modelo
 # =========================
 def alimentar_sequencia(nums: List[int]):
-    """Para cada i, pad = nums[i-n:i] (n=1..N_MAX)
+    """Para cada i, pad=nums[i-n:i]
        G0: conta nxt = nums[i]
-       G1: se houver i+1, trial++ e hit_X++ se nxt==X ou nxt2==X
+       G1: se houver i+1, trial++ e hit_X++ para nxt e nxt2
     """
     if not nums: return
     L = len(nums)
@@ -152,18 +151,15 @@ def alimentar_sequencia(nums: List[int]):
             if not pad: continue
             if any((x<1 or x>4) for x in pad): continue
 
-            # G0
             pattern_counts_g0[pad][nxt] += 1
             pattern_totals_g0[pad]      += 1
 
-            # G1 (precisa t+1)
             if nxt2 is not None:
                 pattern_trials_g1[pad] += 1
                 pattern_hits_g1[pad][nxt] += 1
                 if nxt2 != nxt:
                     pattern_hits_g1[pad][nxt2] += 1
 
-    # contexto online
     for x in nums:
         if 1 <= x <= 4:
             if len(recent_nums) == N_MAX: recent_nums.popleft()
@@ -190,7 +186,10 @@ def contexto_candidato(apos: Optional[int])->List[Tuple[int,...]]:
     return cands
 
 def decidir_numero(apos: Optional[int]):
-    """Prioridade: G1=100% (trials>=MIN_SUP_G1) -> G0≥90% (Wilson; total>=MIN_SUP_G0)."""
+    """1) G1=100% (trials≥MIN_SUP_G1)
+       2) G0 ≥ 90% (Wilson; total≥MIN_SUP_G0)
+       Caso contrário: None (neutro)
+    """
     cands = contexto_candidato(apos)
 
     # 1) Até G1 = 100%
@@ -201,22 +200,20 @@ def decidir_numero(apos: Optional[int]):
             best = None
             for x in (1,2,3,4):
                 if hits[x] == trials and trials > 0:
-                    # desempate por trials (mais suporte), depois menor X
                     item = (trials, -x, x)
                     if (best is None) or (item > best):
                         best = item
             if best:
                 trials, _negx, x = best
-                # usar dist G0 como info de distribuição
                 cnts_g0 = pattern_counts_g0.get(pad, [0,0,0,0,0])
-                total_g0 = pattern_totals_g0.get(pad, 1) or 1
+                total_g0 = max(1, pattern_totals_g0.get(pad, 1))
                 dist = {i: (cnts_g0[i]/total_g0) for i in (1,2,3,4)}
                 return ("G1_100", x, pad, len(pad), 1.0, 1.0, trials, dist)
 
     # 2) G0 ≥ 90% (Wilson)
     for pad in cands:
         total = pattern_totals_g0.get(pad, 0)
-        if total < MIN_SUP_G0: 
+        if total < MIN_SUP_G0:
             continue
         cnts = pattern_counts_g0.get(pad, [0,0,0,0,0])
         best = None
@@ -236,13 +233,14 @@ def decidir_numero(apos: Optional[int]):
     return None
 
 # =========================
-# Mensagens / Métricas
+# Métricas / Mensagens
 # =========================
 def fmt_dist(dist: Dict[int,float])->str:
     return " | ".join(f"{i}:{dist[i]*100:.1f}%" for i in (1,2,3,4))
 
 def taxa(d): 
     d = list(d); return (sum(d)/len(d)) if d else 0.0
+
 def taxa_ultimos(d, n):
     d = list(d)[-n:]; return (sum(d)/len(d)) if d else 0.0
 
@@ -308,17 +306,18 @@ async def envia_resumo_periodico():
     await bot.send_message(CHANNEL_ID, msg, parse_mode="HTML")
 
 # =========================
-# Handlers Telegram
+# Telegram Bot Handlers
 # =========================
 @dp.message_handler(commands=["start"])
 async def cmd_start(msg: types.Message):
     info = (
         "🤖 Fantan — Número Seco por combinações\n"
-        f"• Canal: <code>{CHANNEL_ID}</code>\n"
+        f"• Canal: <code>{CHANNEL_ID}</code> {'(@'+CHANNEL_USER+')' if CHANNEL_USER else ''}\n"
         f"• N_MAX={N_MAX} | MIN_SUP_G0={MIN_SUP_G0} | MIN_SUP_G1={MIN_SUP_G1} | CONF_MIN={CONF_MIN}\n"
         f"• REPORT_EVERY={REPORT_EVERY} | RESULTS_WINDOW={RESULTS_WINDOW}\n"
-        "• Critérios: prioridade ‘Até G1=100%’, senão ‘G0≥90% (Wilson)’.\n"
-        "• Entradas: ‘Sequência: ...’, ‘ENTRADA CONFIRMADA ...’, ‘APOSTA ENCERRADA ✅/❌’."
+        "• Critérios: prioridade ‘Até G1=100%’, senão ‘G0≥90% (Wilson)’. "
+        "Sinal só quando ≥ 90%; do contrário envia Neutro.\n"
+        "• Entradas aceitas: ‘Sequência: ...’, ‘ENTRADA CONFIRMADA ...’, ‘APOSTA ENCERRADA ✅/❌’."
     )
     await msg.answer(info, parse_mode="HTML")
 
@@ -328,28 +327,30 @@ async def cmd_status(msg: types.Message):
 
 @dp.channel_post_handler(content_types=["text"])
 async def on_channel_post(message: types.Message):
-    if message.chat.id != CHANNEL_ID: 
+    if message.chat.id != CHANNEL_ID:
         return
     txt = (message.text or "").strip()
-    if not txt: return
+    if not txt:
+        return
 
-    # 1) Treino com SEQUÊNCIA
+    # 1) Treino a partir de "Sequência:"
     seq = extrai_sequencia(txt)
-    if seq: alimentar_sequencia(seq)
+    if seq:
+        alimentar_sequencia(seq)
 
-    # 2) GREEN/RED para métricas
+    # 2) Green/Red p/ métricas
     r = eh_resultado(txt)
     if r is not None:
         hist_long.append(r); hist_short.append(r)
         if r == 1: state["greens_total"] += 1
-        else: state["reds_total"] += 1
+        else:      state["reds_total"]   += 1
         save_state()
         return
 
-    # 3) SINAL → decidir
+    # 3) SINAL
     if eh_sinal(txt):
         now = time.time()
-        if now < state.get("cooldown_until", 0): 
+        if now < state.get("cooldown_until", 0):
             return
         apos = extrai_apos(txt)
         dec = decidir_numero(apos)
@@ -366,7 +367,7 @@ async def on_channel_post(message: types.Message):
         save_state()
 
 # =========================
-# FastAPI: ingest/scrape/webhook
+# FastAPI: /ingest e /scrape
 # =========================
 class IngestItem(BaseModel):
     id: Optional[int] = None
@@ -389,77 +390,85 @@ async def ingest(payload: IngestPayload):
         if r is not None:
             hist_long.append(r); hist_short.append(r)
             if r == 1: state["greens_total"] += 1
-            else: state["reds_total"] += 1
+            else:      state["reds_total"]   += 1
             added_res += 1
     save_state()
     return {"ok": True, "added_sequences": added_seq, "added_results": added_res}
 
-def _parse_date(d):
-    return datetime.strptime(d, "%Y-%m-%d") if d else None
+async def ensure_tele_client() -> TelegramClient:
+    global tele_client
+    if tele_client: 
+        return tele_client
+    if not ENABLE_SCRAPE:
+        raise RuntimeError("Defina SESSION_STRING + API_ID + API_HASH para habilitar /scrape.")
+    tele_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    await tele_client.connect()
+    if not await tele_client.is_user_authorized():
+        raise RuntimeError("SESSION_STRING inválida ou sem autorização.")
+    if CHANNEL_USER:
+        try:
+            await tele_client(JoinChannelRequest(CHANNEL_USER))
+        except Exception:
+            pass
+    return tele_client
 
 @app.post("/scrape")
-async def scrape(request: Request):
-    # proteção simples por token
-    token = (request.query_params.get("token") or "").strip()
-    if not SCRAPER_TOKEN or token != SCRAPER_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if not ENABLE_USERBOT or TelegramClient is None:
-        raise HTTPException(status_code=400, detail="Userbot desabilitado ou Telethon ausente")
-    if not (API_ID and API_HASH and EXPORT_CHAN):
-        raise HTTPException(status_code=400, detail="Defina API_ID, API_HASH e EXPORT_CHANNEL")
+async def scrape():
+    if not ENABLE_SCRAPE:
+        raise HTTPException(
+            status_code=400,
+            detail=("Retroativo online desabilitado: defina SESSION_STRING + API_ID + API_HASH. "
+                    "Alternativas: /ingest com export do Telegram Desktop.")
+        )
+    try:
+        client = await ensure_tele_client()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Falha ao iniciar userbot: {e}")
 
-    since_dt = _parse_date(SCRAPER_SINCE)
-    until_dt = _parse_date(SCRAPER_UNTIL)
-    rx = re.compile(SCRAPER_FILTER, re.I) if SCRAPER_FILTER else None
+    added_seq = 0
+    added_res = 0
+    scanned   = 0
+    target    = CHANNEL_USER if CHANNEL_USER else CHANNEL_ID
 
-    async def _run():
-        client = TelegramClient("sessao_scrape", API_ID, API_HASH)
-        await client.start()
-        ent = await client.get_entity(EXPORT_CHAN)
-        n = 0
-        async for m in client.iter_messages(ent, reverse=True, limit=None if SCRAPER_LIMIT==0 else SCRAPER_LIMIT):
-            if m.date:
-                if since_dt and m.date < since_dt: continue
-                if until_dt and m.date > until_dt: continue
-            text = m.message or ""
-            if not text: continue
-            if rx and not rx.search(text): continue
-            # alimentar diretamente
-            seq = extrai_sequencia(text)
-            if seq:
-                alimentar_sequencia(seq); n += 1
-            r = eh_resultado(text)
-            if r is not None:
-                hist_long.append(r); hist_short.append(r)
-                if r == 1: state["greens_total"] += 1
-                else: state["reds_total"] += 1
-        save_state()
-        await client.disconnect()
-        return n
+    async for msg in client.iter_messages(entity=target, limit=None):
+        scanned += 1
+        t = (msg.message or "").strip()
+        if not t:
+            continue
+        seq = extrai_sequencia(t)
+        if seq:
+            alimentar_sequencia(seq)
+            added_seq += 1
+        r = eh_resultado(t)
+        if r is not None:
+            hist_long.append(r); hist_short.append(r)
+            if r == 1: state["greens_total"] += 1
+            else:      state["reds_total"]   += 1
+            added_res += 1
+        if scanned % 5000 == 0:
+            await asyncio.sleep(0.01)
 
-    n = await _run()
-    return {"ok": True, "sequences_ingested": n}
+    save_state()
+    return {
+        "ok": True,
+        "scanned": scanned,
+        "added_sequences": added_seq,
+        "added_results": added_res,
+        "g0_patterns": len(pattern_totals_g0),
+        "g1_patterns": len(pattern_trials_g1),
+    }
 
+# =========================
+# Webhook Telegram
+# =========================
 @app.on_event("startup")
 async def on_startup():
     if PUBLIC_URL:
         await bot.delete_webhook(drop_pending_updates=True)
         await bot.set_webhook(f"{PUBLIC_URL}/webhook/{BOT_TOKEN}")
+        log.info("Webhook setado: %s/webhook/%s", PUBLIC_URL, BOT_TOKEN)
     else:
         log.warning("PUBLIC_URL não definida; configure no Render.")
-
-    # scraper automático se habilitado
-    if SCRAPER_ON_START and ENABLE_USERBOT and TelegramClient and API_ID and API_HASH and EXPORT_CHAN and SCRAPER_TOKEN:
-        # roda em background
-        async def kickoff():
-            from starlette.concurrency import run_in_threadpool
-            try:
-                class DummyReq:  # simula chamada local ao /scrape
-                    query_params = {"token": SCRAPER_TOKEN}
-                await scrape(DummyReq)
-            except Exception as e:
-                log.warning("SCRAPER_ON_START falhou: %s", e)
-        asyncio.create_task(kickoff())
 
 @app.post(f"/webhook/{BOT_TOKEN}")
 async def telegram_webhook(request: Request):
