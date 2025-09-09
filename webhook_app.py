@@ -10,10 +10,11 @@ from pydantic import BaseModel
 # =========================
 # ENV / CONFIG
 # =========================
-DB_PATH = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
+DB_PATH = os.getenv("DB_PATH", "/data/data.db").strip() or "/data/data.db"
 
 # --- Migração automática do DB antigo (preserva aprendizado) ---
 OLD_DB_CANDIDATES = [
+    "/var/data/data.db",
     "/opt/render/project/src/data.db",
     "/opt/render/project/src/data/data.db",
     "/data/data.db",
@@ -47,9 +48,16 @@ if not TG_BOT_TOKEN or not PUBLIC_CHANNEL or not WEBHOOK_TOKEN:
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# Canal de réplica (fixo, como combinado)
+# Canal de réplica (fixo)
 REPL_ENABLED  = True
 REPL_CHANNEL  = "-1003052132833"  # @fantanautomatico2
+
+# =========================
+# MODO: Resultado rápido com recuperação
+# =========================
+MAX_STAGE    = 3         # 3 = G0, G1, G2 (recuperação)
+FAST_RESULT  = True      # publica G0 imediatamente; G1/G2 só informam "Recuperou" se bater
+SCORE_G0_ONLY= True      # placar do dia só conta G0 e Loss (limpo)
 
 # Modelo / hiperparâmetros
 WINDOW = 400
@@ -58,7 +66,7 @@ W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
 ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
 GAP_MIN = 0.08
 
-app = FastAPI(title="Fantan Guardião — Número Seco", version="2.6.0")
+app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.1.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -144,14 +152,15 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL,
         strategy TEXT, suggested INTEGER NOT NULL, stage INTEGER NOT NULL,
         open INTEGER NOT NULL, window_left INTEGER NOT NULL,
-        seen_numbers TEXT DEFAULT ''
+        seen_numbers TEXT DEFAULT '',
+        announced INTEGER NOT NULL DEFAULT 0  -- 0=não anunciou resultado público, 1=já anunciou (G0)
     )""")
     con.commit()
-    try:
-        cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''")
-        con.commit()
-    except sqlite3.OperationalError:
-        pass
+    # migrações idempotentes
+    try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''"); con.commit()
+    except sqlite3.OperationalError: pass
+    try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN announced INTEGER NOT NULL DEFAULT 0"); con.commit()
+    except sqlite3.OperationalError: pass
     con.close()
 
 init_db()
@@ -175,18 +184,21 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
         )
 
 async def tg_broadcast(text: str, parse: str="HTML"):
-    # Envia ao canal principal e ao canal réplica
     if PUBLIC_CHANNEL:
         await tg_send_text(PUBLIC_CHANNEL, text, parse)
     if REPL_ENABLED and REPL_CHANNEL:
         await tg_send_text(REPL_CHANNEL, text, parse)
 
-# === Mensagens de resultado imediato ===
-async def send_green_imediato(sugerido:int, stage:int):
-    await tg_broadcast(f"✅ <b>GREEN</b> em <b>G{stage}</b> — Número: <b>{sugerido}</b>")
+# === Mensagens ===
+async def send_green_imediato(sugerido:int, stage_txt:str="G0"):
+    await tg_broadcast(f"✅ <b>GREEN</b> em <b>{stage_txt}</b> — Número: <b>{sugerido}</b>")
 
-async def send_loss_imediato(sugerido:int):
-    await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b>")
+async def send_loss_imediato(sugerido:int, stage_txt:str="G0"):
+    await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b> (em {stage_txt})")
+
+async def send_recovery(stage_txt:str):
+    # mensagem curtíssima de recuperação
+    await tg_broadcast(f"♻️ Recuperou em <b>{stage_txt}</b> (GREEN)")
 
 # =========================
 # Timeline & n-grams
@@ -333,21 +345,30 @@ def bump_strategy(strategy: str, number: int, won: bool):
 
 def update_daily_score(stage: Optional[int], won: bool):
     """
-    stage: 0(G0),1(G1),2(G2) ou None(Loss)
+    Se SCORE_G0_ONLY=True: só conta G0 e Loss.
+    Caso contrário, conta G0/G1/G2 separadamente.
     """
     y = today_key()
     row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
     if not row: g0=g1=g2=loss=streak=0
     else:       g0,g1,g2,loss,streak = row["g0"],row["g1"],row["g2"],row["loss"],row["streak"]
 
-    if won:
-        if stage == 0: g0 += 1
-        elif stage == 1: g1 += 1
-        elif stage == 2: g2 += 1
-        streak += 1
+    if SCORE_G0_ONLY:
+        if won and stage == 0:
+            g0 += 1
+            streak += 1
+        elif not won:
+            loss += 1
+            streak = 0
     else:
-        loss += 1
-        streak = 0
+        if won:
+            if stage == 0: g0 += 1
+            elif stage == 1: g1 += 1
+            elif stage == 2: g2 += 1
+            streak += 1
+        else:
+            loss += 1
+            streak = 0
 
     exec_write("""
       INSERT INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
@@ -356,87 +377,124 @@ def update_daily_score(stage: Optional[int], won: bool):
         g0=excluded.g0, g1=excluded.g1, g2=excluded.g2, loss=excluded.loss, streak=excluded.streak
     """, (y,g0,g1,g2,loss,streak))
 
-    total = g0 + g1 + g2 + loss
-    acc = (g0+g1+g2)/total if total else 0.0
-    return g0,g1,g2,loss,acc,streak
+    if SCORE_G0_ONLY:
+        total = g0 + loss
+        acc = (g0/total) if total else 0.0
+        return g0, loss, acc, streak
+    else:
+        total = g0 + g1 + g2 + loss
+        acc = ((g0+g1+g2)/total) if total else 0.0
+        return g0, g1, g2, loss, acc, streak
 
 async def send_scoreboard():
     y = today_key()
     row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
-    if not row:
-        g0=g1=g2=loss=streak=0
-    else:
-        g0,g1,g2,loss,streak = row["g0"],row["g1"],row["g2"],row["loss"],row["streak"]
-    total = g0 + g1 + g2 + loss
-    acc = (g0 + g1 + g2) / total * 100 if total else 0.0
+    g0=row["g0"] if row else 0
+    g1=row["g1"] if row else 0
+    g2=row["g2"] if row else 0
+    loss=row["loss"] if row else 0
+    streak=row["streak"] if row else 0
 
-    txt = (f"📊 <b>Placar do dia</b>\n"
-           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
-           f"✅ Acerto: {acc:.2f}%\n"
-           f"🔥 Streak: {streak} GREEN(s)")
+    if SCORE_G0_ONLY:
+        total = g0 + loss
+        acc = (g0/total*100) if total else 0.0
+        txt = (f"📊 <b>Placar do dia</b>\n"
+               f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
+               f"✅ Acerto: {acc:.2f}%\n"
+               f"🔥 Streak: {streak} GREEN(s)")
+    else:
+        total = g0 + g1 + g2 + loss
+        acc = ((g0+g1+g2)/total*100) if total else 0.0
+        txt = (f"📊 <b>Placar do dia</b>\n"
+               f"🟢 G0:{g0} | G1:{g1} | G2:{g2}  🔴 Loss:{loss}\n"
+               f"✅ Acerto: {acc:.2f}%\n"
+               f"🔥 Streak: {streak} GREEN(s)")
     await tg_broadcast(txt)
 
 # =========================
-# Pendências + mensagens enxutas (resultado imediato)
+# Pendências (FastResult: G0 imediato + recuperação G1/G2)
 # =========================
 def open_pending(strategy: Optional[str], suggested: int):
     exec_write("""
         INSERT INTO pending_outcome
-        (created_at,strategy,suggested,stage,open,window_left,seen_numbers)
-        VALUES (?,?,?,?,1,3,'')
-    """, (now_ts(), strategy or "", int(suggested), 0))
-
-def _append_seen(txt: str, n: int) -> str:
-    return (txt + ("|" if txt else "") + str(int(n))) if txt is not None else str(int(n))
-
-def _parse_seen(txt: str) -> list[int]:
-    if not txt: return []
-    return [int(x) for x in txt.split("|") if x.strip().isdigit()]
-
-async def send_not_counted_result(n_real:int, sug:int, stage:int):
-    # silenciado para não poluir
-    return
-async def short_log_win(suggested:int, stage:int, seen:list[int]): return
-async def short_log_loss(suggested:int, seen:list[int]):           return
+        (created_at,strategy,suggested,stage,open,window_left,seen_numbers,announced)
+        VALUES (?,?,?,?,1,?, '', 0)
+    """, (now_ts(), strategy or "", int(suggested), 0, MAX_STAGE))
 
 async def close_pending_with_result(n_real: int, event_kind: str):
     """
-    event_kind: 'GREEN' | 'RED'
-    Saída limpa: apenas GREEN/LOSS imediato + placar.
+    FastResult:
+      - No primeiro resultado (G0): publica GREEN/LOSS imediatamente (announced=1).
+      - Mantém pendência aberta até G1/G2 (se MAX_STAGE>1):
+          * Se bater depois: envia "♻️ Recuperou em G1/G2" (não mexe no placar quando SCORE_G0_ONLY=True).
+          * Se não bater: pendência fecha ao fim da janela (sem poluir).
     """
-    rows = query_all("SELECT id,strategy,suggested,stage,window_left,seen_numbers FROM pending_outcome WHERE open=1 ORDER BY id")
+    rows = query_all("""
+        SELECT id,strategy,suggested,stage,open,window_left,seen_numbers,announced
+        FROM pending_outcome
+        WHERE open=1
+        ORDER BY id
+    """)
     for r in rows:
-        pid      = int(r["id"])
-        strat    = (r["strategy"] or "")
-        sug      = int(r["suggested"])
-        stage    = int(r["stage"])          # 0,1,2 => G0,G1,G2
-        left     = int(r["window_left"])
-        seen_txt = r["seen_numbers"] or ""
-        seen_txt2= _append_seen(seen_txt, n_real)
+        pid   = int(r["id"])
+        strat = (r["strategy"] or "")
+        sug   = int(r["suggested"])
+        stage = int(r["stage"])
+        left  = int(r["window_left"])
+        announced = int(r["announced"])
+
+        # registra visto
+        seen_txt = (r["seen_numbers"] or "")
+        seen_txt2 = (seen_txt + ("|" if seen_txt else "") + str(n_real))
         exec_write("UPDATE pending_outcome SET seen_numbers=? WHERE id=?", (seen_txt2, pid))
 
-        if n_real == sug:
-            # WIN no estágio atual
-            bump_pattern("PEND", sug, True)
-            if strat: bump_strategy(strat, sug, True)
-            update_daily_score(stage, True)
-            exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-            await send_green_imediato(sug, stage)
-            await send_scoreboard()
-        else:
-            # Consome tentativa da janela
-            left -= 1
-            if left <= 0:
-                # LOSS total
-                bump_pattern("PEND", sug, False)
-                if strat: bump_strategy(strat, sug, False)
-                update_daily_score(None, False)
+        hit = (n_real == sug)
+
+        if announced == 0:
+            # PRIMEIRO resultado público (G0)
+            if hit:
+                bump_pattern("PEND", sug, True)
+                if strat: bump_strategy(strat, sug, True)
+                update_daily_score(0, True)
+                await send_green_imediato(sug, "G0")
+                exec_write("UPDATE pending_outcome SET announced=1 WHERE id=?", (pid,))
+                # mantém aberta se quiser observar G1/G2? não precisa: já acertou; fechamos:
                 exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-                await send_loss_imediato(sug)
                 await send_scoreboard()
             else:
-                next_stage = min(stage+1, 2)
-                exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
+                # LOSS imediato público (em G0)
+                bump_pattern("PEND", sug, False if SCORE_G0_ONLY else False)
+                if strat: bump_strategy(strat, sug, False if SCORE_G0_ONLY else False)
+                update_daily_score(None, False)  # conta LOSS no placar (G0-only)
+                await send_loss_imediato(sug, "G0")
+                exec_write("UPDATE pending_outcome SET announced=1 WHERE id=?", (pid,))
+                await send_scoreboard()
+
+                # Se MAX_STAGE>1, seguimos tentando recuperação silenciosa
+                left -= 1
+                if left <= 0 or MAX_STAGE <= 1:
+                    exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
+                else:
+                    next_stage = min(stage+1, MAX_STAGE-1)
+                    exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
+        else:
+            # Já anunciamos G0; agora só cuidamos de RECUPERAÇÃO (silenciosa)
+            left -= 1
+            if hit:
+                # Recuperou (GREEN) em G1/G2 — só avisar
+                stxt = f"G{stage}"
+                await send_recovery(stxt)
+                # (placar: se SCORE_G0_ONLY=True, não muda; só aprendizado extra)
+                bump_pattern("RECOV", sug, True)
+                if strat: bump_strategy(strat, sug, True)
+                exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
+            else:
+                if left <= 0:
+                    # Não recuperou, só fechar
+                    exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
+                else:
+                    next_stage = min(stage+1, MAX_STAGE-1)
+                    exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
 
 # =========================
 # Predição (número seco)
@@ -557,7 +615,7 @@ async def webhook(token: str, request: Request):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     t = re.sub(r"\s+", " ", text)
 
-    # 1) GREEN / RED — registra número real e fecha pendências (saída enxuta)
+    # 1) GREEN / RED — registra número real e fecha/atualiza pendências
     gnum = extract_green_number(t)
     redn = extract_red_last_left(t)
     if gnum is not None or redn is not None:
@@ -567,7 +625,7 @@ async def webhook(token: str, request: Request):
         update_ngrams()
         await close_pending_with_result(n_observed, event_kind)
 
-        # aprendizado auxiliar por estratégia (sem mexer no placar)
+        # aprendizado auxiliar por estratégia (idempotente)
         strat = extract_strategy(t) or ""
         row = query_one("SELECT suggested_number, pattern_key FROM last_by_strategy WHERE strategy=?", (strat,))
         if row and gnum is not None:
@@ -579,7 +637,7 @@ async def webhook(token: str, request: Request):
 
         return {"ok": True, "observed": n_observed, "kind": event_kind}
 
-    # 2) ANALISANDO — só alimenta timeline (NÃO fecha pendência / NÃO mexe placar)
+    # 2) ANALISANDO — só alimenta timeline
     if is_analise(t):
         seq_raw = extract_seq_raw(t)
         if seq_raw:
@@ -609,7 +667,6 @@ async def webhook(token: str, request: Request):
     if number is None:
         number = max(post, key=post.get)
 
-    # grava ponte e abre pendência G0/G1/G2
     exec_write("""
       INSERT OR REPLACE INTO suggestions
       (source_msg_id, strategy, seq_raw, context_key, pattern_key, base, suggested_number, stage, sent_at)
@@ -620,9 +677,10 @@ async def webhook(token: str, request: Request):
       (strategy, source_msg_id, suggested_number, context_key, pattern_key, stage, created_at)
       VALUES (?,?,?,?,?,?,?)
     """, (strategy, source_msg_id, int(number), "CTX", pattern_key, "G0", now_ts()))
+
     open_pending(strategy, int(number))
 
-    # ENTRADA — formato completo que você pediu
+    # ENTRADA — formato completo
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_broadcast(out)
     return {"ok": True, "sent": True, "number": number, "conf": conf, "samples": samples}
