@@ -1,204 +1,333 @@
-import os, re, json, hmac, hashlib, time
-from typing import Any, Dict
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import os
+import re
+import asyncio
+import json
+import logging
+import time
+from typing import List, Dict, Any, Optional
+from collections import deque, Counter
+
 import nest_asyncio
 nest_asyncio.apply()
 
-# ===== Config =====
-CONF_MIN = float(os.getenv("CONF_MIN", "0.90"))
-REQUIRE_G1 = os.getenv("REQUIRE_G1", "1") == "1"
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.types import PeerChannel
+from aiogram import Bot
 
+# =========================
+# Config & Globals
+# =========================
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
+PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()  # ex: @fantanvidigal
+DESTINO_CHAT_ID = int(os.getenv("DESTINO_CHAT_ID", "0"))  # id numérico do chat destino
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-DEST_CHAT_ID = int(os.getenv("DEST_CHAT_ID", "0"))
 
-PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "@fantanvidigal")
-AUTO_SCRAPE = os.getenv("AUTO_SCRAPE", "1") == "1"
+# Thresholds e ritmo
+CONF_MIN = float(os.getenv("CONF_MIN", "0.82"))
+COOLDOWN_S = int(os.getenv("COOLDOWN_S", "6"))
+RESULTS_WINDOW = int(os.getenv("RESULTS_WINDOW", "30"))
+
+# Retroativo (scraper)
+AUTO_SCRAPE = int(os.getenv("AUTO_SCRAPE", "1"))
 SCRAPE_EVERY_S = int(os.getenv("SCRAPE_EVERY_S", "120"))
-SCRAPE_LIMIT = int(os.getenv("SCRAPE_LIMIT", "1000"))
+SCRAPE_LIMIT = int(os.getenv("SCRAPE_LIMIT", "800"))
 
-# ===== Bot (aiogram 2.x) =====
-from aiogram import Bot, types
-from aiogram.utils.exceptions import MessageNotModified
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-bot: Bot | None = None
-if TG_BOT_TOKEN and DEST_CHAT_ID:
-    bot = Bot(token=TG_BOT_TOKEN, parse_mode="HTML")
+# Estado
+app = FastAPI()
+log = logging.getLogger("fantan-auto")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
 
-# ===== App =====
-app = FastAPI(title="fantan-auto webhook")
+client: Optional[TelegramClient] = None
+bot: Optional[Bot] = None
 
-# Cache simples pra evitar duplicados (hash->expiração)
-CACHE: Dict[str, float] = {}
-CACHE_TTL = 30 * 60  # 30 min
+# memória recente de resultados e escolhas
+_hist = deque(maxlen=RESULTS_WINDOW)     # números sorteados observados (1..4)
+_stats = {"hits": 0, "miss": 0, "total": 0}
+_last_signal: Dict[str, Any] = {}       # guarda último sinal para conferência
+_last_sent_ts = 0.0
 
-def _now() -> float:
+# ======= util =======
+def now_ts() -> float:
     return time.time()
 
-def cache_seen(key: str) -> bool:
-    # purge
-    now = _now()
-    expired = [k for k,v in CACHE.items() if v < now]
-    for k in expired:
-        CACHE.pop(k, None)
-    if key in CACHE:
-        return True
-    CACHE[key] = now + CACHE_TTL
-    return False
+def pretty_conf(p: float) -> str:
+    try:
+        return f"{p*100:.2f}%"
+    except Exception:
+        return "n/a"
 
-# ===== Parsers =====
-RE_PCT = re.compile(r"Acertamos\s+(\d{1,3}(?:[.,]\d+)?)%\s+das", re.I)
-RE_SEQ = re.compile(r"Sequ[eê]ncia\s*:\s*([0-9]+)", re.I)
-RE_MESA = re.compile(r"Mesa\s*:\s*([^\n\r]+)", re.I)
-RE_ESTR = re.compile(r"Estrat[eé]gia\s*:\s*([0-9]+)", re.I)
-RE_GALES = re.compile(r"Fazer até\s*([0-9]+)\s*gales", re.I)
+# =========================
+# Escolha de número seco
+# =========================
+def choose_single_number(candidatos: List[int], modo: str = "G2") -> Dict[str, Any]:
+    """
+    Heurística leve:
+      1) frequência recente na janela (Counter de _hist)
+      2) desempate favorece centro (2,3) > pontas (1,4)
+      3) pequeno ajuste por modo (G1/G2)
+    Retorna: {"numero": n, "conf": 0~1, "modo": modo}
+    """
+    if not candidatos:
+        return {"numero": None, "conf": 0.0, "modo": modo}
 
-def parse_signal(text: str) -> Dict[str, Any] | None:
-    """Retorna um dict com os campos do sinal se for 'ENTRADA CONFIRMADA'."""
-    if "ENTRADA CONFIRMADA" not in text.upper():
+    cnt = Counter(_hist)
+    # rank base pela frequência
+    ranked = sorted(candidatos, key=lambda n: (cnt.get(n, 0), n in (2,3), -abs(2.5-n)), reverse=True)
+    escolhido = ranked[0]
+
+    # confiança simples: fração da freq do escolhido + bônus de densidade
+    total_seen = max(1, sum(cnt.values()))
+    freq = cnt.get(escolhido, 0) / total_seen
+    dens = sum(cnt.get(n, 0) for n in candidatos) / total_seen
+
+    conf = 0.55*freq + 0.35*dens + 0.10*(1 if escolhido in (2,3) else 0)
+    # ajuste pelo modo (G1 costuma ser mais conservador)
+    if modo.upper() == "G1":
+        conf += 0.03
+    conf = max(0.0, min(conf, 0.99))
+
+    return {"numero": escolhido, "conf": conf, "modo": modo.upper()}
+
+# =========================
+# Parser de mensagens do canal
+# =========================
+_re_confirm = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
+_re_cands   = re.compile(r"(?:Ssh|KWOK)[^\d]*([1-4](?:[-–][1-4]){1,3})")
+_re_gales   = re.compile(r"até\s+(?P<g>\d)\s+gale", re.I)
+_re_green   = re.compile(r"\bGREEN\b", re.I)
+_re_res_num = re.compile(r"\b(?:saiu|resultado|number)\s*[:\-]?\s*([1-4])", re.I)
+
+def parse_signal(text: str) -> Optional[Dict[str, Any]]:
+    if not _re_confirm.search(text or ""):
         return None
+    m = _re_cands.search(text)
+    if not m:
+        return None
+    seq = m.group(1).replace("–", "-")
+    candidatos = [int(x) for x in seq.split("-") if x in "1234"]
+    g = 2  # default
+    gm = _re_gales.search(text)
+    if gm:
+        try:
+            g = int(gm.group("g"))
+        except Exception:
+            pass
+    modo = "G1" if g <= 1 else "G2"
+    return {"candidatos": candidatos, "modo": modo}
 
-    pct = None
-    m = RE_PCT.search(text)
-    if m:
-        pct = float(m.group(1).replace(",", "."))
-        pct /= 100.0
+def parse_result(text: str) -> Optional[Dict[str, Any]]:
+    """Tenta extrair GREEN/RED e o número (se vier)."""
+    if not text:
+        return None
+    if _re_green.search(text):
+        # tenta achar número explícito (nem sempre vem)
+        m = _re_res_num.search(text)
+        n = int(m.group(1)) if m else None
+        return {"green": True, "numero": n}
+    # (Opcional) procurar 'RED' se o canal publicar
+    if "RED" in text.upper():
+        m = _re_res_num.search(text)
+        n = int(m.group(1)) if m else None
+        return {"green": False, "numero": n}
+    return None
 
-    seq = None
-    m = RE_SEQ.search(text)
-    if m:
-        seq = int(m.group(1))
+# =========================
+# Envio pro destino (Telegram)
+# =========================
+async def tg_send(text: str):
+    try:
+        await bot.send_message(chat_id=DESTINO_CHAT_ID, text=text)
+    except Exception as e:
+        log.error("Falha ao enviar msg destino: %s", e)
 
-    mesa = None
-    m = RE_MESA.search(text)
-    if m:
-        mesa = m.group(1).strip()
-
-    estrategia = None
-    m = RE_ESTR.search(text)
-    if m:
-        estrategia = m.group(1)
-
-    gales = None
-    m = RE_GALES.search(text)
-    if m:
-        gales = int(m.group(1))
-
-    return {
-        "pct": pct,
-        "seq": seq,
-        "mesa": mesa,
-        "estrategia": estrategia,
-        "gales": gales,
-        "raw": text.strip()
-    }
-
-def approved(sig: Dict[str, Any]) -> bool:
-    # % mínima
-    if sig["pct"] is not None and sig["pct"] < CONF_MIN:
-        return False
-    # G1 exigido
-    if REQUIRE_G1 and (sig["seq"] is None or sig["seq"] != 1):
-        return False
-    return True
-
-def fmt_signal(sig: Dict[str, Any]) -> str:
-    pct_txt = f"{int(sig['pct']*100)}%" if sig["pct"] is not None else "N/D"
-    seq_txt = f"G{sig['seq']}" if sig["seq"] is not None else "G?"
-    mesa = sig["mesa"] or "-"
-    estr = sig["estrategia"] or "-"
-    gales = sig["gales"]
-    gales_txt = f"{gales}" if gales is not None else "?"
-    return (
-        "<b>✅ SINAL CONFIRMADO</b>\n"
-        f"• Mesa: <b>{mesa}</b>\n"
-        f"• Estratégia: <code>{estr}</code>\n"
-        f"• Sequência: <b>{seq_txt}</b>\n"
-        f"• Confiança: <b>{pct_txt}</b>\n"
-        f"• Gales até: <b>{gales_txt}</b>\n"
-        "—\n"
-        "<i>Origem:</i> canal público\n"
+async def send_seco(candidatos: List[int], modo: str, conf: float, seco: int):
+    global _last_signal
+    msg = (
+        f"🎯 SECO: {seco}  (de {'–'.join(map(str, candidatos))} | modo={modo})\n"
+        f"🔎 confiança: {pretty_conf(conf)} | janela: {RESULTS_WINDOW}\n"
+        f"📊 hits: {_stats['hits']} | erros: {_stats['miss']} | total: {_stats['total']}"
     )
+    await tg_send(msg)
+    _last_signal = {"ts": now_ts(), "seco": seco, "candidatos": candidatos, "modo": modo}
 
-# ===== Modelos =====
-class TelegramUpdate(BaseModel):
-    update_id: int | None = None
-    message: Dict[str, Any] | None = None
-    edited_message: Dict[str, Any] | None = None
-    channel_post: Dict[str, Any] | None = None
-    edited_channel_post: Dict[str, Any] | None = None
+async def send_score(prefix: str = "📊"):
+    msg = f"{prefix} hits: {_stats['hits']} | erros: {_stats['miss']} | total: {_stats['total']}"
+    await tg_send(msg)
 
-def extract_text(update: TelegramUpdate) -> tuple[str | None, int | None]:
-    """Retorna (texto, message_id). Lê message / channel_post."""
-    src = update.channel_post or update.message or update.edited_channel_post or update.edited_message
-    if not src:
-        return None, None
-    txt = src.get("text") or src.get("caption")
-    mid = src.get("message_id")
-    return txt, mid
+# =========================
+# Retroativo (opcional)
+# =========================
+async def retro_scrape_loop():
+    if not AUTO_SCRAPE or not PUBLIC_CHANNEL:
+        return
+    await app_started.wait()
+    ch = PUBLIC_CHANNEL
+    log.info("fantan-auto: 🔁 loop retroativo ligado (%s)...", ch)
+    while True:
+        try:
+            # varre mensagens mais recentes
+            async for msg in client.iter_messages(ch, limit=SCRAPE_LIMIT):
+                txt = msg.message or ""
+                # 1) acúmulo simples de números (caso apareça explícito)
+                res = _re_res_num.search(txt)
+                if res:
+                    _hist.append(int(res.group(1)))
+                # 2) emite seco quando identificar um sinal (no scrape não disparamos seco p/ evitar duplicar do webhook)
+                # (Deixamos apenas aprender histórico)
+            log.info("INFORMAÇÕES | fantan-auto | Raspe concluído. Mensagens processadas: %d", SCRAPE_LIMIT)
+        except Exception as e:
+            log.error("retro scrape erro: %s", e)
+        await asyncio.sleep(SCRAPE_EVERY_S)
 
-# ===== Endpoints =====
+# =========================
+# Telegram webhook do Bot
+# =========================
+async def ensure_webhook():
+    """Registra o webhook do Bot para receber posts do canal."""
+    if not (TG_BOT_TOKEN and RENDER_EXTERNAL_URL):
+        log.warning("Webhook do Bot NÃO registrado (faltando TG_BOT_TOKEN ou RENDER_EXTERNAL_URL).")
+        return
+    import aiohttp
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/setWebhook"
+    hook = f"{RENDER_EXTERNAL_URL}/webhook/{TG_BOT_TOKEN}"
+    data = {"url": hook, "drop_pending_updates": True}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, data=data, timeout=20) as r:
+                js = await r.json()
+        ok = js.get("ok")
+        if ok:
+            log.info("fantan-auto: 🌐 Webhook registrado em %s", hook)
+        else:
+            log.warning("fantan-auto: falha ao registrar webhook: %s", js)
+    except Exception as e:
+        log.error("setWebhook erro: %s", e)
+
+# Modelo p/ saúde
+class Status(BaseModel):
+    ok: bool
+    conf: Dict[str, Any]
+    scrape: Dict[str, Any]
+    bot: Dict[str, Any]
+    webhook: str
+
 @app.get("/status")
 async def status():
-    return {
-        "ok": True,
-        "conf": {
+    return Status(
+        ok=True,
+        conf={
             "CONF_MIN": CONF_MIN,
-            "REQUIRE_G1": REQUIRE_G1,
+            "COOLDOWN_S": COOLDOWN_S,
+            "RESULTS_WINDOW": RESULTS_WINDOW,
         },
-        "scrape": {
+        scrape={
             "PUBLIC_CHANNEL": PUBLIC_CHANNEL,
             "SCRAPE_EVERY_S": SCRAPE_EVERY_S,
             "SCRAPE_LIMIT": SCRAPE_LIMIT,
-            "AUTO_SCRAPE": 1 if AUTO_SCRAPE else 0,
+            "AUTO_SCRAPE": AUTO_SCRAPE,
         },
-        "bot": {
-            "enabled": 1 if bot else 0,
-            "DEST_CHAT_ID": DEST_CHAT_ID,
-        },
-        "webhook": "/webhook/{TG_BOT_TOKEN}"
-    }
+        bot={"enabled": bool(TG_BOT_TOKEN)},
+        webhook="/webhook",
+    )
 
 @app.post("/webhook/{token}")
 async def webhook_dyn(token: str, request: Request):
-    # Opcional: recusar se token não confere com o do bot
-    if TG_BOT_TOKEN and token != TG_BOT_TOKEN:
-        return JSONResponse({"ok": False, "error": "bad token"}, status_code=403)
+    if token.strip() != TG_BOT_TOKEN:
+        raise HTTPException(status_code=403, detail="Token inválido")
+    body = await request.body()
+    try:
+        data = json.loads(body.decode("utf-8", errors="ignore"))
+    except Exception:
+        data = {}
+    log.info("%s", json.dumps(data, ensure_ascii=False))
 
-    data = await request.json()
-    upd = TelegramUpdate(**data)
-    text, mid = extract_text(upd)
+    # Telegram update → channel_post / message
+    text = None
+    if "channel_post" in data:
+        text = data["channel_post"].get("text") or data["channel_post"].get("caption")
+    elif "message" in data:
+        text = data["message"].get("text") or data["message"].get("caption")
+    else:
+        return {"ok": True}
 
     if not text:
-        return {"ok": True, "skipped": "no_text"}
+        return {"ok": True}
 
-    # Evitar duplicados por hash de conteúdo
-    key = hashlib.sha1(text.encode("utf-8")).hexdigest()
-    if cache_seen(key):
-        return {"ok": True, "skipped": "duplicate"}
+    # 1) aprender número do resultado, se explícito
+    mr = parse_result(text)
+    if mr:
+        n = mr.get("numero")
+        if n in (1, 2, 3, 4):
+            _hist.append(n)
+            # se temos last_signal, podemos tentar marcar hit/miss
+            if _last_signal.get("seco") in (1, 2, 3, 4):
+                if n == _last_signal["seco"] and mr.get("green", True):
+                    _stats["hits"] += 1
+                else:
+                    # se vier RED e número diferente do seco → miss
+                    if mr.get("green") is False or (_last_signal["seco"] != n):
+                        _stats["miss"] += 1
+                _stats["total"] = _stats["hits"] + _stats["miss"]
+                await send_score("✅📊" if mr.get("green", True) else "❌📊")
+        return {"ok": True}
 
-    # Tenta parsear sinal
+    # 2) se é um SINAL → escolhe e envia seco
     sig = parse_signal(text)
-    if not sig:
-        return {"ok": True, "skipped": "no_signal"}
+    if sig:
+        # cooldown para não floodar
+        global _last_sent_ts
+        if now_ts() - _last_sent_ts < COOLDOWN_S:
+            return {"ok": True}
 
-    if not approved(sig):
-        return {"ok": True, "skipped": "filtered_out", "sig": sig}
+        candidatos = [n for n in sig["candidatos"] if n in (1,2,3,4)]
+        if not candidatos:
+            return {"ok": True}
 
-    # Envia pro destino
-    sent = False
-    if bot and DEST_CHAT_ID:
-        try:
-            await bot.send_message(DEST_CHAT_ID, fmt_signal(sig))
-            sent = True
-        except Exception as e:
-            print("Erro ao enviar ao bot:", e)
+        res = choose_single_number(candidatos, sig["modo"])
+        if res["conf"] >= CONF_MIN and res["numero"] in (1,2,3,4):
+            await send_seco(candidatos, res["modo"], res["conf"], res["numero"])
+            _last_sent_ts = now_ts()
+        return {"ok": True}
 
-    return {"ok": True, "forwarded": sent, "sig": sig}
+    return {"ok": True}
 
-# ===== Início do serviço HTTP =====
-if __name__ == "__main__":
-    import uvicorn, os
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("webhook_app:app", host="0.0.0.0", port=port, reload=False)
+# =========================
+# Startup do app
+# =========================
+app_started = asyncio.Event()
+
+@app.on_event("startup")
+async def on_startup():
+    global client, bot
+    # Conecta Telethon (para retroativo e futuras expansões)
+    if API_ID and API_HASH and SESSION_STRING:
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        await client.start()
+        log.info("fantan-auto: 📬 Retroativo conectado no Telegram com Telethon")
+    else:
+        log.warning("Telethon não inicializado (faltam credenciais).")
+
+    if TG_BOT_TOKEN:
+        bot = Bot(TG_BOT_TOKEN)
+    else:
+        raise RuntimeError("TG_BOT_TOKEN ausente.")
+
+    # registra webhook do bot (se base pública informada)
+    await ensure_webhook()
+
+    # inicia loop retroativo
+    if client and AUTO_SCRAPE:
+        asyncio.create_task(retro_scrape_loop())
+
+    app_started.set()
+    log.info("INFORMAÇÕES: Inicialização do aplicativo concluída.")
+    log.info("Seu serviço está ativo 🎉")
+
+# Rodar localmente com: uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
