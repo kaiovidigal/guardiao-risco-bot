@@ -4,4 +4,3 @@ telethon==1.41.0
 aiogram==2.25.1
 uvicorn==0.27.1
 nest_asyncio==1.6.0
-python-dotenv==1.0.1
