@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, re, json, time, sqlite3, asyncio
+import os, re, json, time, sqlite3
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
@@ -8,10 +8,12 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 
 # =========================
-# ENV / CONFIG
+# CONFIG
 # =========================
-# Banco fixo em /data/data.db (memória persistente entre deploys)
+# Banco fixo e persistente
 DB_PATH        = "/data/data.db"
+
+# Vars mínimas exigidas pelo Telegram (mantenha no Render)
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()   # -100... ou @canal
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
@@ -21,9 +23,9 @@ if not TG_BOT_TOKEN or not PUBLIC_CHANNEL or not WEBHOOK_TOKEN:
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ===== Réplica de sinais para outro canal (sem env) =====
+# Réplica somente do SINAL G0 (embutida)
 REPL_ENABLED  = True
-REPL_CHANNEL  = "@fantanautomatico2"   # ou id numérico: -100xxxxxxxxxx
+REPL_CHANNEL  = -1003052132833   # ID numérico do canal réplica
 
 # Modelo / hiperparâmetros
 WINDOW = 400
@@ -32,10 +34,10 @@ W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
 ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
 GAP_MIN = 0.08
 
-app = FastAPI(title="Fantan Guardião — Número Seco", version="2.5.0")
+app = FastAPI(title="Fantan Guardião — Número Seco", version="2.6.0")
 
 # =========================
-# SQLite helpers (WAL + timeout + retry)
+# SQLite helpers (WAL + retry)
 # =========================
 def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -121,7 +123,7 @@ def init_db():
         seen_numbers TEXT DEFAULT ''
     )""")
     con.commit()
-    # migração idempotente: coluna seen_numbers
+    # migração idempotente
     try:
         cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''")
         con.commit()
@@ -140,18 +142,20 @@ def now_ts() -> int:
 def today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
 
-async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
-    if not TG_BOT_TOKEN or not chat_id:
+async def tg_send_text(chat_id, text: str, parse: str="HTML"):
+    if not TG_BOT_TOKEN or not chat_id or not text:
         return
-    async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(
-            f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": parse, "disable_web_page_preview": True},
-        )
+    async with httpx.AsyncClient(timeout=20) as client:
+        try:
+            await client.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": parse, "disable_web_page_preview": True},
+            )
+        except Exception as e:
+            print(f"[TG] sendMessage error -> chat={chat_id}: {e}")
 
-# Replica apenas sinais para o canal secundário
 async def tg_replicate_signal(text: str):
-    if not REPL_ENABLED or not REPL_CHANNEL:
+    if not REPL_ENABLED or not REPL_CHANNEL or not text:
         return
     await tg_send_text(REPL_CHANNEL, text, parse="HTML")
 
@@ -343,7 +347,7 @@ async def send_scoreboard():
     await tg_send_text(PUBLIC_CHANNEL, txt)
 
 # =========================
-# Pendências + logs curtos
+# Pendências + mensagens mínimas
 # =========================
 def open_pending(strategy: Optional[str], suggested: int):
     exec_write("""
@@ -359,34 +363,21 @@ def _parse_seen(txt: str) -> list[int]:
     if not txt: return []
     return [int(x) for x in txt.split("|") if x.strip().isdigit()]
 
-# ===== Silenciar permanentemente os "Resultado não contabilizado" =====
+# Silenciar permanentemente os "Resultado não contabilizado"
 async def send_not_counted_result(n_real:int, sug:int, stage:int):
-    # Intencionalmente não publica nada para manter o canal limpo.
-    # (mantemos para compatibilidade com chamadas existentes)
     return
 
+# Mensagens mínimas de resultado
 async def short_log_win(suggested:int, stage:int, seen:list[int]):
     gtxt = f"G{stage}"
-    seq  = " | ".join(str(x) for x in seen) if seen else "—"
-    txt = (f"🧾 <b>Log</b> — ✅ GREEN em <b>{gtxt}</b>\n"
-           f"🎯 Sugerido: <b>{suggested}</b>\n"
-           f"🎲 Janela: ({seq})")
-    await tg_send_text(PUBLIC_CHANNEL, txt)
+    await tg_send_text(PUBLIC_CHANNEL, f"✅ <b>GREEN</b> ({gtxt})")
 
 async def short_log_loss(suggested:int, seen:list[int]):
-    seq  = " | ".join(str(x) for x in seen) if seen else "—"
-    txt = (f"🧾 <b>Log</b> — ❌ LOSS após <b>G2</b>\n"
-           f"🎯 Sugerido: <b>{suggested}</b>\n"
-           f"🎲 Janela: ({seq})")
-    await tg_send_text(PUBLIC_CHANNEL, txt)
+    await tg_send_text(PUBLIC_CHANNEL, "❌ <b>LOSS</b>")
 
 async def close_pending_with_result(n_real: int, event_kind: str):
     """
     event_kind: 'GREEN' | 'RED'
-    - Placar só atualiza quando nossa pendência casa (GREEN) ou expira (LOSS).
-    - Se for GREEN externo com número diferente, mantemos silêncio no canal
-      (consome a janela, mas não mexe no placar).
-    - 'ANALISANDO' não chama esta função.
     """
     rows = query_all("SELECT id,strategy,suggested,stage,window_left,seen_numbers FROM pending_outcome WHERE open=1 ORDER BY id")
     for r in rows:
@@ -397,11 +388,9 @@ async def close_pending_with_result(n_real: int, event_kind: str):
         left     = int(r["window_left"])
         seen_txt = r["seen_numbers"] or ""
         seen_txt2= _append_seen(seen_txt, n_real)
-        # salva o novo visto
         exec_write("UPDATE pending_outcome SET seen_numbers=? WHERE id=?", (seen_txt2, pid))
 
         if n_real == sug:
-            # WIN no estágio atual
             bump_pattern("PEND", sug, True)
             if strat: bump_strategy(strat, sug, True)
             update_daily_score(stage, True)
@@ -409,14 +398,11 @@ async def close_pending_with_result(n_real: int, event_kind: str):
             await short_log_win(sug, stage, _parse_seen(seen_txt2))
             await send_scoreboard()
         else:
-            # Divergência com GREEN externo: não publicar nada (canal limpo)
+            # Divergência com GREEN externo: silêncio total
             if event_kind == "GREEN":
                 pass
-
-            # Consome tentativa da janela (GREEN e RED contam para a janela)
             left -= 1
             if left <= 0:
-                # LOSS total
                 bump_pattern("PEND", sug, False)
                 if strat: bump_strategy(strat, sug, False)
                 update_daily_score(None, False)
@@ -545,7 +531,7 @@ async def webhook(token: str, request: Request):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     t = re.sub(r"\s+", " ", text)
 
-    # 1) GREEN / RED — registra número real e fecha pendências (com novas regras)
+    # 1) GREEN / RED — registra e fecha pendências
     gnum = extract_green_number(t)
     redn = extract_red_last_left(t)
 
@@ -556,7 +542,7 @@ async def webhook(token: str, request: Request):
         update_ngrams()
         await close_pending_with_result(n_observed, event_kind)
 
-        # aprendizado auxiliar por estratégia (sem mexer no placar)
+        # aprendizado auxiliar por estratégia (não publica nada)
         strat = extract_strategy(t) or ""
         row = query_one("SELECT suggested_number, pattern_key FROM last_by_strategy WHERE strategy=?", (strat,))
         if row and gnum is not None:
@@ -568,7 +554,7 @@ async def webhook(token: str, request: Request):
 
         return {"ok": True, "observed": n_observed, "kind": event_kind}
 
-    # 2) ANALISANDO — só alimenta timeline (NÃO fecha pendência / NÃO mexe placar)
+    # 2) ANALISANDO — só alimenta timeline (silencioso)
     if is_analise(t):
         seq_raw = extract_seq_raw(t)
         if seq_raw:
@@ -580,7 +566,7 @@ async def webhook(token: str, request: Request):
             update_ngrams()
         return {"ok": True, "analise": True}
 
-    # 3) ENTRADA CONFIRMADA — sempre sugerir 1 número seco e abrir pendência
+    # 3) ENTRADA CONFIRMADA — sugerir 1 número seco e abrir pendência
     if not is_real_entry(t):
         return {"ok": True, "skipped": True}
 
@@ -598,7 +584,6 @@ async def webhook(token: str, request: Request):
     if number is None:
         number = max(post, key=post.get)
 
-    # grava ponte e abre pendência G0/G1/G2
     exec_write("""
       INSERT OR REPLACE INTO suggestions
       (source_msg_id, strategy, seq_raw, context_key, pattern_key, base, suggested_number, stage, sent_at)
@@ -611,8 +596,8 @@ async def webhook(token: str, request: Request):
     """, (strategy, source_msg_id, int(number), "CTX", pattern_key, "G0", now_ts()))
     open_pending(strategy, int(number))
 
-    # envia sugestão (SINAL)
+    # envia SINAL G0 (principal + réplica) — mais nada
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_send_text(PUBLIC_CHANNEL, out)
-    await tg_replicate_signal(out)   # replica somente o sinal para o canal secundário
+    await tg_replicate_signal(out)
     return {"ok": True, "sent": True, "number": number, "conf": conf, "samples": samples}
