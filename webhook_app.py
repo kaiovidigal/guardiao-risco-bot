@@ -1,247 +1,281 @@
+from __future__ import annotations
+
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone
 from typing import Optional, List
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, RpcError
-from telethon.tl.types import Message
+from telethon.errors import FloodWaitError, RPCError  # <- nome correto
+from telethon.tl.types import PeerChannel
 
-# ----------------------------
-# Config / Env
-# ----------------------------
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]
+# ──────────────────────────────────────────────────────────────────────────────
+# Config / Logs
+# ──────────────────────────────────────────────────────────────────────────────
+load_dotenv()
 
-PUBLIC_CHANNEL = os.environ.get("PUBLIC_CHANNEL", "")  # ex: @fantanvidigal
-SCRAPE_LIMIT = int(os.environ.get("SCRAPE_LIMIT", "500"))
-SCRAPE_EVERY_S = int(os.environ.get("SCRAPE_EVERY_S", "120"))
-
-# Parâmetros de sinais (defaults “mais soltos”)
-CONF_MIN   = float(os.environ.get("CONF_MIN",  "0.82"))
-MIN_SUP_G0 = int(os.environ.get("MIN_SUP_G0", "10"))
-MIN_SUP_G1 = int(os.environ.get("MIN_SUP_G1", "8"))
-N_MAX      = int(os.environ.get("N_MAX",      "4"))
-Z_WILSON   = float(os.environ.get("Z_WILSON", "1.96"))
-
-PUBLIC_SEND = os.environ.get("PUBLIC_SEND", "0") == "1"  # habilita envio por bot
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID   = os.environ.get("TG_CHAT_ID", "")  # chat id numérico do destino
-
-# ----------------------------
-# Logging
-# ----------------------------
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("fantan-auto")
 
-# ----------------------------
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+
+PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()  # @usuario ou link
+
+BASE_WEBHOOK_URL = os.getenv("BASE_WEBHOOK_URL", "").rstrip("/")
+
+# thresholds / ritmo – com os valores “mais soltos” que combinamos
+CONF_MIN = float(os.getenv("CONF_MIN", "0.82"))
+MIN_SUP_G0 = int(os.getenv("MIN_SUP_G0", "10"))
+MIN_SUP_G1 = int(os.getenv("MIN_SUP_G1", "8"))
+N_MAX = int(os.getenv("N_MAX", "4"))
+Z_WILSON = float(os.getenv("Z_WILSON", "1.96"))
+
+COOLDOWN_S = int(os.getenv("COOLDOWN_S", "6"))
+SCRAPE_EVERY_S = int(os.getenv("SCRAPE_EVERY_S", "120"))
+SCRAPE_LIMIT = int(os.getenv("SCRAPE_LIMIT", "800"))
+AUTO_SCRAPE = int(os.getenv("AUTO_SCRAPE", "1"))  # 1=liga o loop
+
+# envio por bot (opcional)
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # FastAPI
-# ----------------------------
-app = FastAPI(title="fantan-webhook")
+# ──────────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="guardiao-risco-bot webhook")
 
-# ----------------------------
-# Telethon Client
-# ----------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Telethon
+# ──────────────────────────────────────────────────────────────────────────────
+if not (API_ID and API_HASH and SESSION_STRING):
+    log.error("API_ID/API_HASH/SESSION_STRING ausentes nas variáveis de ambiente.")
+    # Não levantamos exceção aqui para permitir que a API suba e você veja /status
+
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+_connected_event = asyncio.Event()
 
-@app.on_event("startup")
-async def on_startup():
-    # Conecta Telethon
-    await client.connect()
-    if not await client.is_user_authorized():
-        raise RuntimeError("SESSION_STRING inválida/expirada — refaça a sessão.")
-    me = await client.get_me()
-    log.info("📶 Retroativo conectado no Telegram com Telethon (%s)", me.username or me.id)
+# ──────────────────────────────────────────────────────────────────────────────
+# Modelos Pydantic (v2)
+# ──────────────────────────────────────────────────────────────────────────────
+class IngestPayload(BaseModel):
+    text: str = Field(..., description="Texto bruto para análise/ingestão")
+    message_id: Optional[int] = None
+    date: Optional[datetime] = None
 
-    # Resumo de setup
-    log.info("✅ Retroativo inicial concluído.")
-    log.info("ℹ️  Config: CONF_MIN=%.3f G0>=%d G1>=%d N_MAX=%d Z=%.2f",
-             CONF_MIN, MIN_SUP_G0, MIN_SUP_G1, N_MAX, Z_WILSON)
-    if PUBLIC_CHANNEL:
-        log.info("🔎 Canal público alvo: %s", PUBLIC_CHANNEL)
-    else:
-        log.warning("⚠️  PUBLIC_CHANNEL não definido. /scrape não fará nada.")
 
-# ----------------------------
-# Helpers de sinais (placeholder simples)
-# ----------------------------
-def score_signal_from_text(text: str):
+class ScrapeRequest(BaseModel):
+    limit: int = Field(SCRAPE_LIMIT, ge=1, le=5000)
+    from_date: Optional[datetime] = None  # UTC
+    to_date: Optional[datetime] = None    # UTC
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilidades / “Core” bem simples (placeholder do seu analisador)
+# ──────────────────────────────────────────────────────────────────────────────
+_last_signal_ts = 0.0
+
+def _passes_cooldown(now_ts: float) -> bool:
+    global _last_signal_ts
+    if now_ts - _last_signal_ts >= COOLDOWN_S:
+        _last_signal_ts = now_ts
+        return True
+    return False
+
+def analyze_text_to_signal(text: str) -> Optional[str]:
     """
-    Exemplo simplificado:
-    - procura padrões “G0”, “G1”, somas “+1,+2,+3...”, etc.
-    - aqui você encaixa seu analisador real
+    Placeholder simples: você pode ligar aqui seu classificador real.
+    Usa os thresholds definidos (CONF_MIN etc) se quiser.
     """
     t = text.lower()
-    support_g0 = t.count("g0")
-    support_g1 = t.count("g1")
-    ns = sum(1 for x in t.split() if x.strip("+").isdigit())
-    # confiança “fake” baseada em densidade de termos
-    conf = min(0.5 + 0.1 * (support_g0 + support_g1) + 0.05 * ns, 0.99)
+    # Exemplo bobo de “disparo” – troque pelo seu modelo
+    if "entrada" in t or "sinal" in t or "fan tan" in t:
+        return f"✅ SINAL (simulado)\nconf>={CONF_MIN:.2f} | N<={N_MAX} | g0>={MIN_SUP_G0} g1>={MIN_SUP_G1}\n\n{text}"
+    return None
+
+async def send_via_bot(message: str) -> None:
+    """
+    Envia o texto para o chat do bot, se TG_BOT_TOKEN e TG_CHAT_ID estiverem setados.
+    Para evitar dependência do aiogram, usamos curl do Telegram HTTP API via aiohttp opcional.
+    """
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        return
+    import aiohttp
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": message}
+    async with aiohttp.ClientSession() as s:
+        async with s.post(url, json=payload, timeout=30) as r:
+            if r.status != 200:
+                txt = await r.text()
+                log.warning("Falha ao enviar via bot (%s): %s", r.status, txt)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Rotas
+# ──────────────────────────────────────────────────────────────────────────────
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "guardiao-risco-bot", "connected": _connected_event.is_set()}
+
+@app.get("/status")
+async def status():
     return {
-        "conf": conf,
-        "support_g0": support_g0,
-        "support_g1": support_g1,
-        "n": max(1, min(ns, 8)),
+        "ok": True,
+        "conf": {
+            "CONF_MIN": CONF_MIN, "MIN_SUP_G0": MIN_SUP_G0, "MIN_SUP_G1": MIN_SUP_G1,
+            "N_MAX": N_MAX, "Z_WILSON": Z_WILSON,
+            "COOLDOWN_S": COOLDOWN_S,
+        },
+        "scrape": {
+            "PUBLIC_CHANNEL": PUBLIC_CHANNEL,
+            "SCRAPE_EVERY_S": SCRAPE_EVERY_S,
+            "SCRAPE_LIMIT": SCRAPE_LIMIT,
+            "AUTO_SCRAPE": AUTO_SCRAPE,
+        },
+        "bot": {"enabled": bool(TG_BOT_TOKEN and TG_CHAT_ID)},
+        "webhook": BASE_WEBHOOK_URL + "/webhook",
     }
 
-def passes_filters(sig: dict) -> bool:
-    return (
-        sig["conf"] >= CONF_MIN and
-        sig["support_g0"] >= MIN_SUP_G0 and
-        sig["support_g1"] >= MIN_SUP_G1 and
-        sig["n"] <= N_MAX
-    )
-
-async def maybe_send_public(msg: str):
-    """Envia via bot (opcional) se PUBLIC_SEND=1 + TG_BOT_TOKEN + TG_CHAT_ID."""
-    if not (PUBLIC_SEND and TG_BOT_TOKEN and TG_CHAT_ID):
-        return
-    try:
-        # Envia via Bot API (chamada direta simples)
-        import httpx
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
-        async with httpx.AsyncClient(timeout=20) as hx:
-            r = await hx.post(url, json=payload)
-            if r.status_code != 200:
-                log.warning("Bot send falhou: %s %s", r.status_code, r.text)
-    except Exception as e:
-        log.warning("Falha no envio por bot: %s", e)
-
-# ----------------------------
-# Models
-# ----------------------------
-class IngestBody(BaseModel):
-    text: str
-    meta: Optional[dict] = None
-
-class ScrapeBody(BaseModel):
-    limit: int = SCRAPE_LIMIT
-    channel: Optional[str] = None  # se quiser sobrescrever PUBLIC_CHANNEL
-
-# ----------------------------
-# Rotas
-# ----------------------------
-@app.get("/healthz")
-async def healthz():
-    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
-
 @app.post("/ingest")
-async def ingest(body: IngestBody):
+async def ingest(payload: IngestPayload):
     """
-    Recebe 1 mensagem (manual/webhook) e processa como possível sinal.
+    Recebe texto e tenta gerar sinal.
     """
-    sig = score_signal_from_text(body.text)
-    ok = passes_filters(sig)
-    log.info("INGEST conf=%.3f g0=%d g1=%d n=%d -> %s",
-             sig["conf"], sig["support_g0"], sig["support_g1"], sig["n"], "APROVADO" if ok else "descartado")
-    if ok:
-        msg = f"✅ <b>Sinal Aprovado</b>\nconf={sig['conf']:.2f} | g0={sig['support_g0']} g1={sig['support_g1']} n={sig['n']}\n\n<pre>{body.text[:2000]}</pre>"
-        await maybe_send_public(msg)
-    return {"approved": ok, "signal": sig}
+    sig = analyze_text_to_signal(payload.text)
+    if sig:
+        now_ts = datetime.now(tz=timezone.utc).timestamp()
+        if _passes_cooldown(now_ts):
+            await send_via_bot(sig)
+            log.info("SINAL enviado (ingest).")
+            return {"ok": True, "sent": True, "reason": "cooldown passou"}
+        else:
+            log.info("SINAL gerado mas bloqueado por cooldown.")
+            return {"ok": True, "sent": False, "reason": "cooldown"}
+    return {"ok": True, "sent": False, "reason": "sem_padroes"}
 
 @app.post("/scrape")
-async def scrape(body: ScrapeBody):
+async def scrape(req: ScrapeRequest, bt: BackgroundTasks):
     """
-    Varre mensagens recentes do canal público e tenta aprovar sinais.
+    Dispara uma raspagem única do histórico.
     """
-    channel = body.channel or PUBLIC_CHANNEL
-    if not channel:
-        raise HTTPException(400, "Defina PUBLIC_CHANNEL no ambiente ou envie em body.channel")
-
-    count = 0
-    approved = 0
-    try:
-        async for msg in client.iter_messages(entity=channel, limit=max(1, min(body.limit, 2000))):
-            if not isinstance(msg, Message):
-                continue
-            text = (msg.message or "").strip()
-            if not text:
-                continue
-            count += 1
-            sig = score_signal_from_text(text)
-            if passes_filters(sig):
-                approved += 1
-                out = (
-                    f"✅ <b>Sinal do retroativo</b>\n"
-                    f"conf={sig['conf']:.2f} | g0={sig['support_g0']} g1={sig['support_g1']} n={sig['n']}\n"
-                    f"<i>msg_id</i>={msg.id} • <i>data</i>={msg.date}\n\n"
-                    f"<pre>{text[:2000]}</pre>"
-                )
-                await maybe_send_public(out)
-
-        log.info("SCRAPE canal=%s lidos=%d aprovados=%d", channel, count, approved)
-        return {"channel": channel, "read": count, "approved": approved}
-    except FloodWaitError as fw:
-        log.warning("FloodWait %ss no scrape", fw.seconds)
-        raise HTTPException(429, f"Flood wait {fw.seconds}s")
-    except RpcError as e:
-        log.error("Erro Telegram RPC: %s", e)
-        raise HTTPException(502, f"Telegram RPC error: {e}")
-    except Exception as e:
-        log.exception("Falha no scrape")
-        raise HTTPException(500, f"Erro no scrape: {e}")
-
-@app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-    """
-    Endpoint para receber webhook do seu Bot (opcional).
-    Se quiser, configure no BotFather e aponte para /webhook/<seu_token_curto>.
-    Aqui só registramos recebimento e, se houver 'text', aplicamos o mesmo motor.
-    """
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-
-    text = ""
-    # compatível com Telegram Webhook padrão (update.message.text)
-    msg = payload.get("message") or {}
-    text = (msg.get("text") or "").strip()
-
-    if not text:
-        return {"ok": True, "note": "sem texto"}
-
-    sig = score_signal_from_text(text)
-    ok = passes_filters(sig)
-    log.info("WEBHOOK conf=%.3f g0=%d g1=%d n=%d -> %s",
-             sig["conf"], sig["support_g0"], sig["support_g1"], sig["n"], "APROVADO" if ok else "descartado")
-    if ok:
-        await maybe_send_public(
-            f"✅ <b>Sinal (webhook)</b>\nconf={sig['conf']:.2f} | g0={sig['support_g0']} g1={sig['support_g1']} n={sig['n']}\n\n<pre>{text[:2000]}</pre>"
-        )
-    return {"approved": ok, "signal": sig}
-
-# ----------------------------
-# Tarefa automática de scraping (loop)
-# ----------------------------
-async def auto_scraper():
-    await app.router.startup()
-    # só roda se houver PUBLIC_CHANNEL
     if not PUBLIC_CHANNEL:
-        log.warning("auto_scraper desativado: PUBLIC_CHANNEL vazio.")
+        raise HTTPException(400, "PUBLIC_CHANNEL ausente.")
+
+    async def _job():
+        await ensure_connected()
+        await scrape_once(limit=req.limit, from_date=req.from_date, to_date=req.to_date)
+
+    bt.add_task(_job)
+    return {"ok": True, "queued": True}
+
+# Um endpoint simples de webhook “placeholder” (caso queira plugar bot webhook no futuro)
+@app.post("/webhook")
+async def webhook_stub(update: dict):
+    log.info("Webhook recebido: %s", str(update)[:300])
+    return {"ok": True}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Scraper
+# ──────────────────────────────────────────────────────────────────────────────
+async def ensure_connected():
+    if _connected_event.is_set():
         return
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Session inválida: não autorizado")
+        _connected_event.set()
+        log.info("📬 Retroativo conectado no Telegram com Telethon")
+    except Exception as e:
+        log.exception("Falha conectando ao Telegram: %s", e)
+        raise
+
+async def iter_messages_safe(entity, limit: int):
+    """
+    Iterador resiliente com tratamento de FloodWait.
+    """
+    fetched = 0
+    async for msg in client.iter_messages(entity, limit=limit):
+        yield msg
+        fetched += 1
+        if fetched % 200 == 0:
+            await asyncio.sleep(1)
+
+async def scrape_once(limit: int, from_date: Optional[datetime], to_date: Optional[datetime]):
+    await ensure_connected()
+    entity = PUBLIC_CHANNEL
+    try:
+        # Resolve link/@ para Peer
+        entity = await client.get_entity(entity)  # PeerChannel/Channel
+    except RPCError as e:
+        log.error("Erro resolvendo canal (%s): %s", PUBLIC_CHANNEL, e)
+        return
+
+    processed = 0
+    async for m in iter_messages_safe(entity, limit=limit):
+        # Filtra por data, se informado
+        if from_date and m.date and m.date.replace(tzinfo=timezone.utc) < from_date.replace(tzinfo=timezone.utc):
+            continue
+        if to_date and m.date and m.date.replace(tzinfo=timezone.utc) > to_date.replace(tzinfo=timezone.utc):
+            continue
+
+        if not m.message:
+            continue
+
+        sig = analyze_text_to_signal(m.message)
+        if sig:
+            now_ts = datetime.now(tz=timezone.utc).timestamp()
+            if _passes_cooldown(now_ts):
+                await send_via_bot(sig)
+        processed += 1
+
+    log.info("Scrape concluído. Mensagens processadas: %s", processed)
+
+async def scrape_loop():
+    """
+    Loop automático de raspagem, se AUTO_SCRAPE=1.
+    """
+    if not AUTO_SCRAPE:
+        log.info("Loop de scrape automático desativado (AUTO_SCRAPE=0).")
+        return
+    if not PUBLIC_CHANNEL:
+        log.warning("PUBLIC_CHANNEL vazio; loop de scrape não iniciará.")
+        return
+
+    await ensure_connected()
+    log.info("⏳ Loop de scrape iniciado (cada %ss, limite=%s).", SCRAPE_EVERY_S, SCRAPE_LIMIT)
 
     while True:
         try:
-            await scrape(ScrapeBody(limit=SCRAPE_LIMIT))   # chama a própria rota internamente
+            await scrape_once(limit=SCRAPE_LIMIT, from_date=None, to_date=None)
+        except FloodWaitError as e:
+            log.warning("FloodWait: aguardando %ss", int(e.seconds) + 1)
+            await asyncio.sleep(int(e.seconds) + 1)
         except Exception as e:
-            log.warning("auto_scraper erro: %s", e)
+            log.exception("Erro no loop de scrape: %s", e)
+            await asyncio.sleep(5)
         await asyncio.sleep(SCRAPE_EVERY_S)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Lifespan
+# ──────────────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
-async def _start_bg():
-    # dispara o loop de scraping em background
-    asyncio.create_task(auto_scraper())
-    log.info("🧵 Loop de scraping automático iniciado (cada %ss, limit=%d).",
-             SCRAPE_EVERY_S, SCRAPE_LIMIT)
-
-# Para uvicorn: "webhook_app:app"
+async def on_startup():
+    # Conecta e registra logs
+    try:
+        await ensure_connected()
+        if BASE_WEBHOOK_URL:
+            log.info("Webhook registrado em %s/webhook", BASE_WEBHOOK_URL)
+    finally:
+        # inicia loop de scrape em background
+        asyncio.create_task(scrape_loop())
+        log.info("INFORMAÇÕES: Inicialização do aplicativo concluída.")
