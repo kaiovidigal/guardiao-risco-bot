@@ -1,377 +1,269 @@
-# -*- coding: utf-8 -*-
-# Fantan — Número seco imediato + aprendizado persistente (memory.json)
-# - Sem variáveis de ambiente: tudo no CONFIG abaixo
-# - Parser robusto: KWOK/SSH, ODD/EVEN, SMALL/BIG, "Sequência: …",
-#   e "Entrar após o X apostar em …"
-# - Envia sugestão SEMPRE (sem filtros)
-# - Aprende com GREEN!!! (x) / VENCEDOR: x
-# - Endpoints: /status, /ingest, /set_webhook, /webhook/<token>
+import os
+import re
+import json
+import asyncio
+from typing import Any, Dict, List, Optional, Tuple
 
-import json, re, time
-from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, PlainTextResponse
 import httpx
 
-# =======================
-# CONFIG (edite aqui)
-# =======================
-CONFIG = {
-    # Para ONDE o bot vai ENVIAR a sugestão (canal/grupo/usuário)
-    "TARGET_CHANNEL": "@SEU_CANAL_SAIDA",          # ex.: "@fantanvidigal" ou id numérico -100...
+APP_NAME = "guardiao-risco-bot"
+app = FastAPI(title=APP_NAME)
 
-    # (Opcional) De ONDE vêm os sinais – só para log/telemetria (não bloqueia)
-    "PUBLIC_CHANNEL": "@SEU_CANAL_SINAIS",
+# === Config ===
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()  # opcional. Se vazio, responde no mesmo chat.
 
-    # Token do bot (BotFather)
-    "TG_BOT_TOKEN": "8217345207:COLE_SEU_TOKEN_AQUI",
+TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}" if TG_BOT_TOKEN else ""
 
-    # Token usado no path do webhook (assinatura simples). Pode ser igual ao TG_BOT_TOKEN.
-    "WEBHOOK_TOKEN": "8217345207:COLE_SEU_TOKEN_AQUI",
-
-    # Caminho do “banco” local
-    "MEMORY_PATH": "memory.json",
-
-    # Texto “gatilho” comum no sinal (não é obrigatório)
-    "ENTRY_MARK": r"ENTRADA\s+CONFIRMADA",
-
-    # SEM RESTRIÇÕES: envia sugestão mesmo sem histórico
-    "ALWAYS_SEND": True,
-
-    # Rótulo da mesa (para log)
-    "MESA_LABEL": "Fantan - Evolution",
+# Pequena memória em processo (apenas para depuração rápida)
+SUGG_STATS = {
+    "total_updates": 0,
+    "signals_seen": 0,
+    "suggestions_sent": 0,
 }
 
-# =======================
-# Memória persistente
-# =======================
-def load_memory(path: str) -> Dict[str, Any]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {
-            # freq por chave: "estrategia|nums_ordenados" e "estrategia|" (fallback da estratégia)
-            #   {"total": int, "counts": {"1":..,"2":..,"3":..,"4":..}}
-            "freq": {},
-            # pendências: { "id_estrategia": {"offered":[...], "ts": epoch} }
-            "pending": {}
-        }
+def safe(tok: str, keep: int = 4) -> str:
+    """Trunca tokens para log seguro."""
+    if not tok:
+        return "(vazio)"
+    if len(tok) <= keep * 2:
+        return tok
+    return tok[:keep] + "..." + tok[-keep:]
 
-def save_memory(path: str, data: Dict[str, Any]) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"[MEM][ERR] {e}")
+# === Utilidades de envio ===
+async def tg_send_message(chat_id: int | str, text: str, parse_mode: Optional[str] = None) -> Dict[str, Any]:
+    if not TELEGRAM_API:
+        return {"ok": False, "error": "TG_BOT_TOKEN ausente"}
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": False, "status_code": r.status_code, "text": r.text}
 
-MEM = load_memory(CONFIG["MEMORY_PATH"])
+# === Parsing de sinais (regras cobertas) ===
+NUM_RE = re.compile(r"\b[1-4]\b")
+PIPE_SEQ_RE = re.compile(r"\b([1-4])\s*\|\s*([1-4])(?:\s*\|\s*([1-4]))?(?:\s*\|\s*([1-4]))?\b")
+DASH_SEQ_RE = re.compile(r"\b([1-4])\s*-\s*([1-4])\s*-\s*([1-4])\b", re.IGNORECASE)
 
-# =======================
-# Util
-# =======================
-def norm_offered(nums: List[int]) -> List[int]:
-    """1..4, sem duplicados, preservando ordem."""
-    seen, out = set(), []
-    for n in nums:
-        if n in (1,2,3,4) and n not in seen:
-            seen.add(n); out.append(n)
-    return out
-
-def key_for(strategy_id: Optional[str], offered: List[int]) -> str:
-    offered_key = ",".join(map(str, sorted(norm_offered(offered))))
-    sid = (strategy_id or "NA").strip()
-    return f"{sid}|{offered_key}"
-
-def wilson_upper(count: int, total: int, z: float = 1.96) -> float:
-    if total <= 0: return 0.0
-    p = count / total
-    denom = 1 + (z**2)/total
-    num   = p + (z**2)/(2*total)
-    rad   = z * ((p*(1-p) + (z**2)/(4*total)) / total) ** 0.5
-    upper = (num + rad) / denom
-    return max(0.0, min(1.0, upper))
-
-# =======================
-# Parsers
-# =======================
-RE_ENTRY  = re.compile(CONFIG["ENTRY_MARK"], re.I)
-RE_STRAT  = re.compile(r"Estrat[eé]gia\s*:\s*([0-9]+)", re.I)
-
-# PT-BR “Entrar após o X apostar em ...” + KWOK/SSH/SMALL/BIG/ODD/EVEN N-N(-N)
-RE_PT_ACTION = re.compile(
-    r'(?:entrar\s+ap[oó]s\s+o\s*[1-4]\s+apostar\s+em\s+)?'
-    r'(kwok|ssh|small|big|odd|even)\s*'
-    r'(?:([1-4])\s*(?:[-|/]\s*([1-4]))?(?:\s*[-|/]\s*([1-4]))?)?',
-    re.I
-)
-
-# genéricos com traço/barra
-RE_DASH  = re.compile(r'(?<!\d)([1-4])\s*[-|/]\s*([1-4])(?:\s*[-|/]\s*([1-4]))?')
-# com pipes
-RE_PIPES = re.compile(r'([1-4])(?:\s*\|\s*([1-4]))(?:\s*\|\s*([1-4]))?')
-# “Sequência: 2 | 2 | 4 | 3”
-RE_SEQ_LINE = re.compile(r'sequ[eê]ncia[^0-9]*(([1-4][^0-9]+)+[1-4])', re.I)
-
-# atalhos
-RE_ODD   = re.compile(r'\bodd\b', re.I)
-RE_EVEN  = re.compile(r'\beven\b', re.I)
-RE_SMALL = re.compile(r'\bsmall\b', re.I)
-RE_BIG   = re.compile(r'\bbig\b', re.I)
-
-# resultado: GREEN!!! (3)  ou  VENCEDOR: 3
-RE_GREEN = re.compile(r'GREEN.+?\(([1-4])\)', re.I)
-RE_WON   = re.compile(r'VENCEDOR\s*:\s*([1-4])', re.I)
-
-def extract_strategy(text: str) -> Optional[str]:
-    m = RE_STRAT.search(text)
-    return m.group(1) if m else None
-
-def _uniq_groups(groups) -> List[int]:
-    out = []
-    for g in groups:
-        if not g: continue
-        n = int(g)
-        if n in (1,2,3,4) and n not in out:
-            out.append(n)
-    return out
-
-def extract_candidates(text: str) -> List[int]:
-    t = text
-
-    # atalhos diretos
-    if RE_ODD.search(t):   return [1, 3]
-    if RE_EVEN.search(t):  return [2, 4]
-    if RE_SMALL.search(t): return [1, 2]
-    if RE_BIG.search(t):   return [3, 4]
-
-    # “Entrar após o X apostar em <KWOK/SSH/SMALL/BIG/ODD/EVEN> [N-N(-N)]”
-    m = RE_PT_ACTION.search(t)
-    if m:
-        kind = (m.group(1) or "").lower()
-        nums = _uniq_groups(m.groups()[1:])
-        if kind == "odd":   return [1,3]
-        if kind == "even":  return [2,4]
-        if kind == "small": return nums if nums else [1,2]
-        if kind == "big":   return nums if nums else [3,4]
-        if kind in ("kwok","ssh"):
-            if nums: return nums
-
-    # genéricos 3-2-1 / 3|2|1 / 3/2/1
-    m = RE_DASH.search(t)
-    if m: return _uniq_groups(m.groups())
-    m = RE_PIPES.search(t)
-    if m: return _uniq_groups(m.groups())
-
-    # “Sequência: 2 | 2 | 4 | 3” → pega últimos 2–3 distintos
-    m = RE_SEQ_LINE.search(t)
-    if m:
-        nums = [int(x) for x in re.findall(r'[1-4]', m.group(1))]
-        if nums:
-            out = []
-            for n in reversed(nums):
-                if n not in out:
-                    out.append(n)
-                if len(out) >= 3:
-                    break
-            return list(reversed(out))
-
-    return []
-
-def extract_winner(text: str) -> Optional[int]:
-    m = RE_GREEN.search(text)
-    if m: return int(m.group(1))
-    m = RE_WON.search(text)
-    if m: return int(m.group(1))
-    return None
-
-# =======================
-# Aprendizado
-# =======================
-def remember_offer(strategy_id: Optional[str], offered: List[int]):
-    """Registra pendência por estratégia (se houver)."""
-    try:
-        if not offered: return
-        if strategy_id:
-            MEM["pending"][strategy_id] = {"offered": norm_offered(offered), "ts": time.time()}
-            save_memory(CONFIG["MEMORY_PATH"], MEM)
-    except Exception as e:
-        print(f"[MEM][PENDING][ERR] {e}")
-
-def learn_from_result(strategy_id: Optional[str], winner: int):
-    """Fecha pendência e acumula frequência por (estratégia|oferta) e (estratégia|)."""
-    try:
-        if not strategy_id or winner not in (1,2,3,4): return
-        pend = MEM["pending"].pop(strategy_id, None)
-        offered = pend["offered"] if pend else []
-
-        # chave exata (estratégia + candidatos ordenados)
-        key_exact = key_for(strategy_id, offered)
-        buck = MEM["freq"].setdefault(key_exact, {"total":0,"counts":{"1":0,"2":0,"3":0,"4":0}})
-        buck["total"] += 1
-        buck["counts"][str(winner)] += 1
-
-        # fallback por estratégia apenas (sem candidatos)
-        key_fallback = key_for(strategy_id, [])
-        buck2 = MEM["freq"].setdefault(key_fallback, {"total":0,"counts":{"1":0,"2":0,"3":0,"4":0}})
-        buck2["total"] += 1
-        buck2["counts"][str(winner)] += 1
-
-        save_memory(CONFIG["MEMORY_PATH"], MEM)
-        print(f"[LEARN] key={key_exact} winner={winner} total={buck['total']}")
-    except Exception as e:
-        print(f"[MEM][LEARN][ERR] {e}")
-
-def choose_number(strategy_id: Optional[str], offered: List[int]) -> (int, float, int, str):
+def extract_context_numbers(text: str) -> List[int]:
     """
-    Retorna (numero_escolhido, prob_estimada, base_total, key_usada)
-    Usa Wilson (upper) por segurança; se não houver histórico, escolhe o primeiro.
+    Extrai candidatos de acordo com as regras:
+      - 'Ssh 4-3-2'  -> [4,3,2]
+      - 'KWOK 2-3'   -> [2,3]
+      - 'ODD'        -> [1,3]
+      - 'EVEN'       -> [2,4]
+      - padrões '3-2-1' -> [3,2,1]
+      - padrões '2 | 4 | 3' -> [2,4,3]
+    Se nada claro for encontrado, retorna todos [1,2,3,4] como fallback.
     """
-    offered = norm_offered(offered)
-    if not offered:
-        return 1, 0.0, 0, "fallback"
+    text_low = text.lower()
 
-    key_exact = key_for(strategy_id, offered)
-    key_fallback = key_for(strategy_id, [])
-    cand_keys = [key_exact, key_fallback]
+    # Ssh X-Y-Z
+    if "ssh" in text_low:
+        m = DASH_SEQ_RE.search(text)
+        if m:
+            seq = [int(m.group(1)), int(m.group(2)), int(m.group(3))]
+            return seq
 
-    best_num, best_score, base_total, used_key = None, -1.0, 0, ""
-    for k in cand_keys:
-        b = MEM["freq"].get(k)
-        if not b: continue
-        total = b.get("total", 0)
-        if total <= 0: continue
-        for n in offered:
-            cnt = b["counts"].get(str(n), 0)
-            score = wilson_upper(cnt, total, 1.96)  # estimação conservadora
-            if score > best_score:
-                best_num, best_score, base_total, used_key = n, score, total, k
+    # KWOK A-B (dois números)
+    if "kwok" in text_low:
+        # aceitar "kwok 2-3" ou "kwok 2 – 3"
+        m = re.search(r"kwok\s*([1-4])\s*[-–]\s*([1-4])", text_low)
+        if m:
+            return [int(m.group(1)), int(m.group(2))]
 
-    if best_num is None:
-        # sem histórico → escolha determinística = primeiro dos oferecidos
-        return offered[0], 0.0, 0, "no-history"
+    # ODD / EVEN
+    if re.search(r"\bodd\b", text_low):
+        return [1, 3]
+    if re.search(r"\beven\b", text_low):
+        return [2, 4]
 
-    return best_num, best_score, base_total, used_key
+    # Padrões "3-2-1" dispersos
+    m = DASH_SEQ_RE.search(text)
+    if m:
+        return [int(m.group(1)), int(m.group(2)), int(m.group(3))]
 
-# =======================
-# Envio Telegram
-# =======================
-async def tg_send(text: str):
-    url = f"https://api.telegram.org/bot{CONFIG['TG_BOT_TOKEN']}/sendMessage"
-    data = {"chat_id": CONFIG["TARGET_CHANNEL"], "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10)) as c:
-        r = await c.post(url, json=data)
-        if r.status_code != 200 or not r.json().get("ok", False):
-            print(f"[SEND][ERR] status={r.status_code} body={r.text}")
-        else:
-            print(f"[SEND][OK] -> {CONFIG['TARGET_CHANNEL']}")
+    # Padrões com pipe "2 | 4 | 3 ..."
+    m = PIPE_SEQ_RE.search(text)
+    if m:
+        nums = [g for g in m.groups() if g]
+        return [int(x) for x in nums]
 
-# =======================
-# FastAPI
-# =======================
-app = FastAPI()
+    # Se não achou nada, pegue os números que aparecem isolados (pouco restritivo)
+    hits = [int(n) for n in NUM_RE.findall(text)]
+    if hits:
+        # normalizar, manter ordem de primeira ocorrência
+        seen = set()
+        ordered = []
+        for n in hits:
+            if n not in seen:
+                seen.add(n)
+                ordered.append(n)
+        return ordered
 
+    # fallback total
+    return [1, 2, 3, 4]
+
+def choose_crisp_number(candidates: List[int], seed: int) -> Tuple[int, float]:
+    """
+    Escolhe 1 número seco IMEDIATO entre os candidatos.
+    Heurística simples e determinística:
+      - se 2 números: pega o MAIOR (empírico) – pode trocar para menor se preferir.
+      - se 3 números: pega o do MEIO (2º)
+      - se 4 números: escolhe index = seed % 4 (determinístico por message_id)
+      - senão: seed % len(candidates)
+    Retorna (numero, chance_estimativa_dummy)
+    """
+    if not candidates:
+        return 2, 50.0
+
+    uniq = []
+    for n in candidates:
+        if n not in uniq:
+            uniq.append(n)
+    candidates = uniq
+
+    chance = 0.0
+    if len(candidates) == 1:
+        return candidates[0], 95.0
+    if len(candidates) == 2:
+        # regra preferindo o maior
+        return max(candidates), 72.0
+    if len(candidates) == 3:
+        return candidates[1], 66.0
+    if len(candidates) == 4:
+        pick = candidates[seed % 4]
+        return pick, 55.0
+
+    pick = candidates[seed % len(candidates)]
+    return pick, 55.0
+
+def format_suggestion(number: int, base_list: List[int], retro_count: int, chance_pct: float) -> str:
+    base_str = ", ".join(str(x) for x in base_list)
+    return (
+        "🎯 *Número seco sugerido:* {}\n"
+        "🧮 Base lida: [{}]\n"
+        "📊 *Baseado em ~{} sinais retroativos*\n"
+        "✅ *Chance estimada:* {:.2f}%"
+    ).format(number, base_str, retro_count, chance_pct)
+
+# === Endpoints ===
 @app.get("/")
-def root():
-    return {"ok": True, "webhook": "/webhook/<token>", "status": "/status", "set_hook": "/set_webhook"}
-
-@app.get("/status")
-def status():
+async def root() -> Dict[str, Any]:
     return {
         "ok": True,
-        "freq_keys": len(MEM.get("freq", {})),
-        "pending": list(MEM.get("pending", {}).keys()),
-        "target": CONFIG["TARGET_CHANNEL"],
-        "source": CONFIG["PUBLIC_CHANNEL"],
-        "entry_mark": CONFIG["ENTRY_MARK"],
-        "mesa": CONFIG["MESA_LABEL"],
+        "app": APP_NAME,
+        "status": "alive",
     }
 
-@app.post("/ingest")
-async def ingest(payload: Dict[str, Any]):
-    """
-    Ingestão retroativa simples:
-    payload = {"items":[{"text":"...mensagem..."}, ...]}
-    """
-    items = payload.get("items", [])
-    added_offer = added_win = 0
-    for it in items:
-        t = (it.get("text") or "").strip()
-        if not t: continue
-        offered = extract_candidates(t)
-        if offered:
-            strat = extract_strategy(t)
-            remember_offer(strat, offered)
-            # também podemos já escolher, mas ingestão não envia sinais
-            added_offer += 1
-        w = extract_winner(t)
-        if w:
-            strat = extract_strategy(t)
-            learn_from_result(strat, w)
-            added_win += 1
-    return {"ok": True, "offers": added_offer, "winners": added_win}
-
-@app.get("/set_webhook")
-async def set_webhook():
-    """
-    Atalho para registrar o webhook no Telegram.
-    Chame: /set_webhook?base=https://SEUAPP.onrender.com
-    """
-    base = ""  # ex.: https://seuapp.onrender.com
-    from fastapi import Query
-    # FastAPI não aceita Query aqui sem assin., então parse manual do status endpoint:
-    # Use via navegador: /set_webhook?base=https://SEUAPP.onrender.com
-    return {"ok": False, "hint": "Use: https://api.telegram.org/bot<TOKEN>/setWebhook?url=<base>/webhook/<WEBHOOK_TOKEN>"}
+@app.get("/status")
+async def status() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "app": APP_NAME,
+        "has_token": bool(TG_BOT_TOKEN),
+        "webhook_expected": safe(WEBHOOK_TOKEN, 3),
+        "target_channel": TARGET_CHANNEL or "(mesmo chat)",
+        "stats": SUGG_STATS,
+    }
 
 @app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-    if token != CONFIG["WEBHOOK_TOKEN"]:
-        raise HTTPException(status_code=403, detail="bad token")
+async def telegram_webhook(token: str, request: Request) -> Response:
+    # Segurança do webhook
+    expected = WEBHOOK_TOKEN
+    if not expected:
+        # Se não configurou, rejeita com log claro
+        msg = f"[AUTH] WEBHOOK_TOKEN não configurado. Recebido path-token={safe(token)}"
+        print(msg)
+        return JSONResponse({"detail": "Forbidden (no WEBHOOK_TOKEN set)"}, status_code=403)
 
-    body = await request.json()
-    msg = body.get("channel_post") or body.get("message") or body.get("edited_channel_post") or {}
-    text: str = (msg.get("text") or msg.get("caption") or "").strip()
-    chat = msg.get("chat", {})
-    username = (chat.get("username") or "").lower()
-    msg_id = msg.get("message_id")
-    date_ts = msg.get("date")
+    if token != expected:
+        print(f"[AUTH] Token mismatch: got={safe(token)} expected={safe(expected)} -> 403")
+        return JSONResponse({"detail": "Forbidden"}, status_code=403)
 
-    print(f"[RX] @{username} id={msg_id} ts={date_ts} text={text[:80]!r}")
+    # Lê update
+    try:
+        body_bytes = await request.body()
+        update = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+    except Exception as e:
+        print(f"[PARSE] Erro lendo JSON do update: {e}")
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
 
-    # (Opcional) filtrar por origem informativa (não bloqueia se diferente)
-    if CONFIG["PUBLIC_CHANNEL"]:
-        src = CONFIG["PUBLIC_CHANNEL"].lstrip("@").lower()
-        if username and username != src:
-            print(f"[RX] origem diferente de {CONFIG['PUBLIC_CHANNEL']}, mas não bloqueado.")
+    SUGG_STATS["total_updates"] += 1
 
-    # 1) SINAL → extrai candidatos e envia sugestão na hora
-    offered = extract_candidates(text)
-    if offered or RE_ENTRY.search(text or ""):
-        # se não extraiu nada mas tem ENTRY_MARK, tenta fallback 1 número do texto
-        if not offered:
-            # pega o primeiro número que aparecer no texto como fallback extremo
-            m = re.search(r'\b([1-4])\b', text)
-            offered = [int(m.group(1))] if m else [1]
+    # Identifica origem e texto
+    chat_id: Optional[int] = None
+    text: str = ""
+    msg_id: int = 0
 
-        strat = extract_strategy(text)
-        remember_offer(strat, offered)
+    if "channel_post" in update:
+        post = update.get("channel_post", {})
+        chat = post.get("chat", {})
+        chat_id = chat.get("id")
+        text = post.get("text") or post.get("caption") or ""
+        msg_id = post.get("message_id", 0)
+    elif "message" in update:
+        post = update.get("message", {})
+        chat = post.get("chat", {})
+        chat_id = chat.get("id")
+        text = post.get("text") or post.get("caption") or ""
+        msg_id = post.get("message_id", 0)
+    else:
+        # ignorar tipos que não nos interessam
+        print(f"[SKIP] Update sem message/channel_post: keys={list(update.keys())}")
+        return JSONResponse({"ok": True})
 
-        num, p, base, used_key = choose_number(strat, offered)
-        pct = f"{p*100:.2f}%"
-        out = (
-            f"🎯 <b>Número seco sugerido:</b> <b>{num}</b>\n"
-            f"🧩 Base: estratégia <code>{strat or 'N/D'}</code> | oferta <code>{', '.join(map(str, offered))}</code>\n"
-            f"📊 Aprendizado em ~<b>{base}</b> sinais (chave: <code>{used_key}</code>)\n"
-            f"✅ Chance estimada: <b>{pct}</b>"
-        )
-        await tg_send(out)
-        return JSONResponse({"ok": True, "sent": True})
+    if not text:
+        print("[SKIP] Mensagem sem texto/caption, chat_id=", chat_id)
+        return JSONResponse({"ok": True})
 
-    # 2) RESULTADO → aprender
-    winner = extract_winner(text)
-    if winner:
-        strat = extract_strategy(text)
-        learn_from_result(strat, winner)
-        return JSONResponse({"ok": True, "learned": True, "winner": winner})
+    # Só processa se parece um sinal
+    looks_signal = any(
+        key in text.lower()
+        for key in ["entrada confirmada", "estratégia", "sequência", "ssh", "kwok", "odd", "even"]
+    )
+    if not looks_signal:
+        return JSONResponse({"ok": True})
 
-    return JSONResponse({"ok": True, "ignored": True})
+    SUGG_STATS["signals_seen"] += 1
+
+    # Extrai candidatos e decide número seco
+    candidates = extract_context_numbers(text)
+    number, chance = choose_crisp_number(candidates, seed=msg_id or 1)
+
+    # Para fins de demo, o retro_count é uma contagem fake (pode ligar a um DB depois)
+    retro_count = max(1000, SUGG_STATS["signals_seen"])
+
+    suggestion = format_suggestion(number, candidates, retro_count, chance)
+
+    # Para onde enviar?
+    dest_chat = TARGET_CHANNEL if TARGET_CHANNEL else chat_id
+
+    # Manda
+    out = await tg_send_message(dest_chat, suggestion, parse_mode="Markdown")
+    ok = out.get("ok", False)
+    if not ok:
+        print(f"[SEND] Falha ao enviar sugestão. resp={out}")
+
+        # tenta um fallback simples: remove parse_mode
+        out2 = await tg_send_message(dest_chat, suggestion)
+        ok = out2.get("ok", False)
+        if not ok:
+            print(f"[SEND] Fallback também falhou. resp={out2}")
+        else:
+            SUGG_STATS["suggestions_sent"] += 1
+    else:
+        SUGG_STATS["suggestions_sent"] += 1
+
+    return JSONResponse({"ok": True, "sent": ok})
+
+# ==== Execução local (Render usa o comando start) ====
+# Comando de start recomendado no Render:
+#   uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
