@@ -21,6 +21,10 @@ if not TG_BOT_TOKEN or not PUBLIC_CHANNEL or not WEBHOOK_TOKEN:
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
+# ===== Réplica de sinais para outro canal (sem env) =====
+REPL_ENABLED  = True
+REPL_CHANNEL  = "@fantanautomatico2"   # ou id numérico: -100xxxxxxxxxx
+
 # Modelo / hiperparâmetros
 WINDOW = 400
 DECAY  = 0.985
@@ -28,7 +32,7 @@ W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
 ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
 GAP_MIN = 0.08
 
-app = FastAPI(title="Fantan Guardião — Número Seco", version="2.4.0")
+app = FastAPI(title="Fantan Guardião — Número Seco", version="2.5.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -117,7 +121,7 @@ def init_db():
         seen_numbers TEXT DEFAULT ''
     )""")
     con.commit()
-    # migração: coluna seen_numbers (idempotente)
+    # migração idempotente: coluna seen_numbers
     try:
         cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''")
         con.commit()
@@ -144,6 +148,12 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
             f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": parse, "disable_web_page_preview": True},
         )
+
+# Replica apenas sinais para o canal secundário
+async def tg_replicate_signal(text: str):
+    if not REPL_ENABLED or not REPL_CHANNEL:
+        return
+    await tg_send_text(REPL_CHANNEL, text, parse="HTML")
 
 # =========================
 # Timeline & n-grams
@@ -400,7 +410,6 @@ async def close_pending_with_result(n_real: int, event_kind: str):
             await send_scoreboard()
         else:
             # Divergência com GREEN externo: não publicar nada (canal limpo)
-            # (Ainda assim consome a janela abaixo)
             if event_kind == "GREEN":
                 pass
 
@@ -602,7 +611,8 @@ async def webhook(token: str, request: Request):
     """, (strategy, source_msg_id, int(number), "CTX", pattern_key, "G0", now_ts()))
     open_pending(strategy, int(number))
 
-    # envia sugestão
+    # envia sugestão (SINAL)
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_send_text(PUBLIC_CHANNEL, out)
+    await tg_replicate_signal(out)   # replica somente o sinal para o canal secundário
     return {"ok": True, "sent": True, "number": number, "conf": conf, "samples": samples}
