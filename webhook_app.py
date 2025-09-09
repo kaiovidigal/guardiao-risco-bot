@@ -47,6 +47,10 @@ if not TG_BOT_TOKEN or not PUBLIC_CHANNEL or not WEBHOOK_TOKEN:
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
+# Canal de réplica (fixo, como combinado)
+REPL_ENABLED  = True
+REPL_CHANNEL  = "-1003052132833"  # @fantanautomatico2
+
 # Modelo / hiperparâmetros
 WINDOW = 400
 DECAY  = 0.985
@@ -54,7 +58,7 @@ W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
 ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
 GAP_MIN = 0.08
 
-app = FastAPI(title="Fantan Guardião — Número Seco", version="2.5.0")
+app = FastAPI(title="Fantan Guardião — Número Seco", version="2.6.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -143,7 +147,6 @@ def init_db():
         seen_numbers TEXT DEFAULT ''
     )""")
     con.commit()
-    # migração: coluna seen_numbers (idempotente)
     try:
         cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''")
         con.commit()
@@ -171,12 +174,19 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
             json={"chat_id": chat_id, "text": text, "parse_mode": parse, "disable_web_page_preview": True},
         )
 
-# === Mensagens enxutas (resultado imediato) ===
+async def tg_broadcast(text: str, parse: str="HTML"):
+    # Envia ao canal principal e ao canal réplica
+    if PUBLIC_CHANNEL:
+        await tg_send_text(PUBLIC_CHANNEL, text, parse)
+    if REPL_ENABLED and REPL_CHANNEL:
+        await tg_send_text(REPL_CHANNEL, text, parse)
+
+# === Mensagens de resultado imediato ===
 async def send_green_imediato(sugerido:int, stage:int):
-    await tg_send_text(PUBLIC_CHANNEL, f"✅ <b>GREEN</b> em <b>G{stage}</b> — Número: <b>{sugerido}</b>")
+    await tg_broadcast(f"✅ <b>GREEN</b> em <b>G{stage}</b> — Número: <b>{sugerido}</b>")
 
 async def send_loss_imediato(sugerido:int):
-    await tg_send_text(PUBLIC_CHANNEL, f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b>")
+    await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b>")
 
 # =========================
 # Timeline & n-grams
@@ -354,16 +364,17 @@ async def send_scoreboard():
     y = today_key()
     row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
     if not row:
-        g0=g1=g2=loss=streak=0; acc=0.0
+        g0=g1=g2=loss=streak=0
     else:
         g0,g1,g2,loss,streak = row["g0"],row["g1"],row["g2"],row["loss"],row["streak"]
-        total = g0+g1+g2+loss
-        acc = (g0+g1+g2)/total*100 if total else 0.0
+    total = g0 + g1 + g2 + loss
+    acc = (g0 + g1 + g2) / total * 100 if total else 0.0
+
     txt = (f"📊 <b>Placar do dia</b>\n"
-           f"🟢 G0:{g0} | G1:{g1} | G2:{g2}  🔴 Loss:{loss}\n"
+           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
            f"✅ Acerto: {acc:.2f}%\n"
            f"🔥 Streak: {streak} GREEN(s)")
-    await tg_send_text(PUBLIC_CHANNEL, txt)
+    await tg_broadcast(txt)
 
 # =========================
 # Pendências + mensagens enxutas (resultado imediato)
@@ -385,14 +396,8 @@ def _parse_seen(txt: str) -> list[int]:
 async def send_not_counted_result(n_real:int, sug:int, stage:int):
     # silenciado para não poluir
     return
-
-async def short_log_win(suggested:int, stage:int, seen:list[int]):
-    # silenciado para não poluir
-    return
-
-async def short_log_loss(suggested:int, seen:list[int]):
-    # silenciado para não poluir
-    return
+async def short_log_win(suggested:int, stage:int, seen:list[int]): return
+async def short_log_loss(suggested:int, seen:list[int]):           return
 
 async def close_pending_with_result(n_real: int, event_kind: str):
     """
@@ -416,11 +421,10 @@ async def close_pending_with_result(n_real: int, event_kind: str):
             if strat: bump_strategy(strat, sug, True)
             update_daily_score(stage, True)
             exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-            # ✅ GREEN imediato
             await send_green_imediato(sug, stage)
             await send_scoreboard()
         else:
-            # Consome tentativa da janela (sem "não contabilizado")
+            # Consome tentativa da janela
             left -= 1
             if left <= 0:
                 # LOSS total
@@ -428,7 +432,6 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                 if strat: bump_strategy(strat, sug, False)
                 update_daily_score(None, False)
                 exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-                # ❌ LOSS imediato
                 await send_loss_imediato(sug)
                 await send_scoreboard()
             else:
@@ -511,7 +514,8 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
     samples = int((roww["s"] or 0) if roww else 0)
     return number, conf, samples, post
 
-def build_suggestion_msg(number:int, base:List[int], pattern_key:str, after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
+def build_suggestion_msg(number:int, base:List[int], pattern_key:str,
+                         after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
     base_txt = ", ".join(str(x) for x in base) if base else "—"
     aft_txt = f" após {after_num}" if after_num else ""
     return (
@@ -618,7 +622,7 @@ async def webhook(token: str, request: Request):
     """, (strategy, source_msg_id, int(number), "CTX", pattern_key, "G0", now_ts()))
     open_pending(strategy, int(number))
 
-    # envia sugestão (somente nosso G0, com quânticas)
+    # ENTRADA — formato completo que você pediu
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
-    await tg_send_text(PUBLIC_CHANNEL, out)
+    await tg_broadcast(out)
     return {"ok": True, "sent": True, "number": number, "conf": conf, "samples": samples}
