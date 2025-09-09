@@ -10,7 +10,8 @@ from pydantic import BaseModel
 # =========================
 # ENV / CONFIG
 # =========================
-DB_PATH        = os.getenv("DB_PATH", "/opt/render/project/src/data.db").strip() or "/opt/render/project/src/data.db"
+# Banco fixo em /data/data.db (memória persistente entre deploys)
+DB_PATH        = "/data/data.db"
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()   # -100... ou @canal
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
@@ -112,10 +113,11 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS pending_outcome (
         id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL,
         strategy TEXT, suggested INTEGER NOT NULL, stage INTEGER NOT NULL,
-        open INTEGER NOT NULL, window_left INTEGER NOT NULL
+        open INTEGER NOT NULL, window_left INTEGER NOT NULL,
+        seen_numbers TEXT DEFAULT ''
     )""")
     con.commit()
-    # migração: coluna seen_numbers para log curto
+    # migração: coluna seen_numbers (idempotente)
     try:
         cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''")
         con.commit()
@@ -347,15 +349,11 @@ def _parse_seen(txt: str) -> list[int]:
     if not txt: return []
     return [int(x) for x in txt.split("|") if x.strip().isdigit()]
 
+# ===== Silenciar permanentemente os "Resultado não contabilizado" =====
 async def send_not_counted_result(n_real:int, sug:int, stage:int):
-    stage_txt = f"G{stage}"
-    txt = (
-        "⚠️ <b>Resultado não contabilizado</b>\n"
-        f"🎯 <b>Nosso sugerido ({stage_txt}):</b> {sug}\n"
-        f"🎲 <b>Saiu:</b> {n_real}\n"
-        "ℹ️ GREEN do bot externo com número diferente — <b>não impacta</b> no nosso placar."
-    )
-    await tg_send_text(PUBLIC_CHANNEL, txt)
+    # Intencionalmente não publica nada para manter o canal limpo.
+    # (mantemos para compatibilidade com chamadas existentes)
+    return
 
 async def short_log_win(suggested:int, stage:int, seen:list[int]):
     gtxt = f"G{stage}"
@@ -376,7 +374,7 @@ async def close_pending_with_result(n_real: int, event_kind: str):
     """
     event_kind: 'GREEN' | 'RED'
     - Placar só atualiza quando nossa pendência casa (GREEN) ou expira (LOSS).
-    - Se for GREEN externo com número diferente, avisamos "Resultado não contabilizado"
+    - Se for GREEN externo com número diferente, mantemos silêncio no canal
       (consome a janela, mas não mexe no placar).
     - 'ANALISANDO' não chama esta função.
     """
@@ -401,9 +399,10 @@ async def close_pending_with_result(n_real: int, event_kind: str):
             await short_log_win(sug, stage, _parse_seen(seen_txt2))
             await send_scoreboard()
         else:
-            # Divergência com GREEN externo => informar (não mexe no placar)
+            # Divergência com GREEN externo: não publicar nada (canal limpo)
+            # (Ainda assim consome a janela abaixo)
             if event_kind == "GREEN":
-                await send_not_counted_result(n_real, sug, stage)
+                pass
 
             # Consome tentativa da janela (GREEN e RED contam para a janela)
             left -= 1
