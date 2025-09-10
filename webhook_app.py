@@ -20,7 +20,7 @@
 
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -603,6 +603,111 @@ class IntelManager:
 INTEL = IntelManager()
 
 # =========================
+# Health Reporter (30 em 30 min) + Reset diário 00:00 UTC
+# =========================
+def _fmt_bytes(n: int) -> str:
+    try:
+        n = float(n)
+    except Exception:
+        return "—"
+    for unit in ["B","KB","MB","GB","TB","PB"]:
+        if n < 1024.0:
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} EB"
+
+def _get_scalar(sql: str, params: tuple = (), default: int|float = 0):
+    row = query_one(sql, params)
+    if not row:
+        return default
+    try:
+        # primeira coluna
+        return row[0] if row[0] is not None else default
+    except Exception:
+        # tenta por alias comum
+        keys = row.keys()
+        return row[keys[0]] if keys and row[keys[0]] is not None else default
+
+def _daily_score_snapshot():
+    y = today_key_local()
+    row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+    if not row:
+        return 0,0,0,0,0.0
+    g0 = row["g0"] or 0
+    loss = row["loss"] or 0
+    streak = row["streak"] or 0
+    total = g0 + loss
+    acc = (g0/total*100.0) if total else 0.0
+    return g0, loss, streak, total, acc
+
+def _last_snapshot_info():
+    try:
+        latest_path = os.path.join(INTEL_DIR, "snapshots", "latest_top.json")
+        if not os.path.exists(latest_path):
+            return "—"
+        ts = os.path.getmtime(latest_path)
+        return datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc).isoformat()
+    except Exception:
+        return "—"
+
+def _health_text() -> str:
+    timeline_cnt   = _get_scalar("SELECT COUNT(*) FROM timeline")
+    ngram_rows     = _get_scalar("SELECT COUNT(*) FROM ngram_stats")
+    ngram_samples  = _get_scalar("SELECT SUM(weight) FROM ngram_stats")
+    pat_rows       = _get_scalar("SELECT COUNT(*) FROM stats_pattern")
+    pat_events     = _get_scalar("SELECT SUM(wins+losses) FROM stats_pattern")
+    strat_rows     = _get_scalar("SELECT COUNT(*) FROM stats_strategy")
+    strat_events   = _get_scalar("SELECT SUM(wins+losses) FROM stats_strategy")
+    pend_open      = _get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1")
+    intel_size     = _dir_size_bytes(INTEL_DIR)
+    last_snap_ts   = _last_snapshot_info()
+    g0, loss, streak, total, acc = _daily_score_snapshot()
+
+    return (
+        "🩺 <b>Saúde do Guardião</b>\n"
+        f"⏱️ UTC: <code>{utc_iso()}</code>\n"
+        "—\n"
+        f"🗄️ timeline: <b>{timeline_cnt}</b>\n"
+        f"📚 ngram_stats: <b>{ngram_rows}</b> | amostras≈<b>{int(ngram_samples or 0)}</b>\n"
+        f"🧩 stats_pattern: chaves=<b>{pat_rows}</b> | eventos=<b>{int(pat_events or 0)}</b>\n"
+        f"🧠 stats_strategy: chaves=<b>{strat_rows}</b> | eventos=<b>{int(strat_events or 0)}</b>\n"
+        f"⏳ pendências abertas: <b>{pend_open}</b>\n"
+        f"💾 INTEL dir: <b>{_fmt_bytes(intel_size)}</b> | último snapshot: <code>{last_snap_ts}</code>\n"
+        "—\n"
+        f"📊 Placar (hoje - G0 only): G0=<b>{g0}</b> | Loss=<b>{loss}</b> | Total=<b>{total}</b>\n"
+        f"✅ Acerto: <b>{acc:.2f}%</b> | 🔥 Streak: <b>{streak}</b>\n"
+    )
+
+async def _health_reporter_task():
+    # dispara imediatamente e depois a cada 30 minutos
+    while True:
+        try:
+            await tg_broadcast(_health_text())
+        except Exception as e:
+            print(f"[HEALTH] erro ao enviar relatório: {e}")
+        # 30 minutos
+        await asyncio.sleep(30 * 60)
+
+async def _daily_reset_task():
+    # Reset do placar exatamente às 00:00 UTC
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            wait = max(1.0, (tomorrow - now).total_seconds())
+            await asyncio.sleep(wait)
+
+            y = today_key_local()
+            exec_write("""
+              INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
+              VALUES (?,0,0,0,0,0)
+            """, (y,))
+            await tg_broadcast("🕛 <b>Reset diário executado (00:00 UTC)</b>\n📊 Placar zerado para o novo dia.")
+        except Exception as e:
+            print(f"[RESET] erro: {e}")
+            await asyncio.sleep(60)
+
+# =========================
 # Pendências (FastResult: G0 imediato + recuperação G1/G2)
 # =========================
 def open_pending(strategy: Optional[str], suggested: int):
@@ -805,6 +910,15 @@ async def _boot_analyzer():
             INTEL._analyze_task = asyncio.create_task(INTEL._periodic_analyzer())
     except Exception as e:
         print(f"[INTEL] startup analyzer error: {e}")
+    # Inicia health reporter (30min) e reset diário (00:00 UTC)
+    try:
+        asyncio.create_task(_health_reporter_task())
+    except Exception as e:
+        print(f"[HEALTH] startup error: {e}")
+    try:
+        asyncio.create_task(_daily_reset_task())
+    except Exception as e:
+        print(f"[RESET] startup error: {e}")
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
