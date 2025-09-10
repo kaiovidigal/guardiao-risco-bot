@@ -36,6 +36,10 @@
 #   IA_RAMP_UP_AT=0.62                -> se acc IA >= 62% e total>=min, sobe thresholds
 #   IA_RAMP_DOWN_AT=0.52              -> se acc IA <= 52% e total>=min, desce thresholds
 #   IA_DEBUG=0                        -> 1 para logar ajustes/quase-disparos no canal de réplica
+#
+#   --- NOVO (Off-base Prior) ---
+#   ALLOW_OFFBASE=1                   -> avalia candidatos 1..4 mesmo fora da base do padrão
+#   OFFBASE_PRIOR_FRACTION=0.25       -> fração do prior reservada ao off-base (0.0–0.9)
 
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
@@ -141,6 +145,10 @@ IA_RAMP_MIN_EVENTS = int(os.getenv("IA_RAMP_MIN_EVENTS", "20"))
 IA_RAMP_UP_AT      = float(os.getenv("IA_RAMP_UP_AT", "0.62"))
 IA_RAMP_DOWN_AT    = float(os.getenv("IA_RAMP_DOWN_AT", "0.52"))
 IA_DEBUG           = (os.getenv("IA_DEBUG", "0").strip() == "1")
+
+# --- NOVO: Off-base Prior ---
+ALLOW_OFFBASE = (os.getenv("ALLOW_OFFBASE", "1").strip() == "1")
+OFFBASE_PRIOR_FRACTION = float(os.getenv("OFFBASE_PRIOR_FRACTION", "0.25"))
 
 app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.4.0")
 
@@ -971,57 +979,90 @@ def confident_best(post: Dict[int,float], gap: float = GAP_MIN) -> Optional[int]
     if len(a)==1: return a[0][0]
     return a[0][0] if (a[0][1]-a[1][1]) >= gap else None
 
+# ======= SUBSTITUÍDA: suggest_number com prior off-base =======
 def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], after_num: Optional[int]) -> Tuple[Optional[int],float,int,Dict[int,float]]:
-    if not base: base = [1,2,3,4]
+    # Base vazia -> universo completo
+    if not base:
+        base = [1,2,3,4]
+        pattern_key = "GEN"
+
     hour_block = int(datetime.now(timezone.utc).hour // 2)
     pat_key = f"{pattern_key}|h{hour_block}"
 
     tail = get_recent_tail(WINDOW)
     scores: Dict[int, float] = {}
 
-    # Regras “após X”: ignora se não tem lastro na cauda
+    # Regras “após X”: ignora se não tem lastro recente na cauda
     if after_num is not None:
         try:
             last_idx = max([i for i, v in enumerate(tail) if v == after_num])
         except ValueError:
+            # sem lastro: abstém
             return None, 0.0, len(tail), {k: 1/len(base) for k in base}
-        if (len(tail)-1 - last_idx) > 60:
+        # se o "após X" estiver muito distante, abstém
+        if (len(tail) - 1 - last_idx) > 60:
             return None, 0.0, len(tail), {k: 1/len(base) for k in base}
 
-    for c in base:
+    # --- candidatos e prior com off-base ---
+    base_set = set(base)
+    candidates = [1,2,3,4] if ALLOW_OFFBASE else list(base)
+
+    nb = max(1, len(base_set))
+    no = max(1, len([c for c in candidates if c not in base_set]))
+
+    for c in candidates:
+        # Probabilidade por n-gram/backoff (cauda)
         ng = ngram_backoff_score(tail, after_num, c)
 
+        # Estatística por padrão (com janela horária)
         rowp = query_one("SELECT wins, losses FROM stats_pattern WHERE pattern_key=? AND number=?", (pat_key, c))
         pw = rowp["wins"] if rowp else 0
         pl = rowp["losses"] if rowp else 0
         p_pat = laplace_ratio(pw, pl)
 
-        p_str = 1/len(base)
+        # Estatística por estratégia (se houver)
+        p_str = 1/nb
         if strategy:
             rows = query_one("SELECT wins, losses FROM stats_strategy WHERE strategy=? AND number=?", (strategy, c))
             sw = rows["wins"] if rows else 0
             sl = rows["losses"] if rows else 0
             p_str = laplace_ratio(sw, sl)
 
-        # leve boost por horário
-        boost = 1.0
-        if p_pat >= 0.60: boost = 1.05
-        elif p_pat <= 0.40: boost = 0.97
+        # prior com fração reservada ao off-base
+        if ALLOW_OFFBASE:
+            mass_off = max(0.0, min(0.9, OFFBASE_PRIOR_FRACTION))
+            mass_in  = 1.0 - mass_off
+            if c in base_set:
+                prior = mass_in / nb
+            else:
+                prior = mass_off / no
+        else:
+            prior = 1.0 / nb
 
-        prior = 1.0/len(base)
-        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost
+        # Boost leve por “força do padrão”
+        boost = 1.0
+        if p_pat >= 0.60:
+            boost = 1.05
+        elif p_pat <= 0.40:
+            boost = 0.97
+
+        # Score final (mesmos expoentes globais ALPHA/BETA/GAMMA)
+        score = prior * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost
         scores[c] = score
 
+    # Normalização -> posterior
     total = sum(scores.values()) or 1e-9
     post = {k: v/total for k,v in scores.items()}
 
+    # Escolha do top-1 com “gap” mínimo
     number = confident_best(post, gap=GAP_MIN)
     conf = post.get(number, 0.0) if number is not None else 0.0
 
+    # Amostra total de n-grams (para filtros de qualidade)
     roww = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
     samples = int((roww["s"] or 0) if roww else 0)
 
-    # Anti-repique: se último anunciado fechou LOSS com mesmo número, exija mais confiança
+    # Anti-repique: se último anunciado foi LOSS com o mesmo número, exige mais confiança
     last = query_one("SELECT suggested, announced FROM pending_outcome ORDER BY id DESC LIMIT 1")
     if last and number is not None and last["suggested"] == number and (last["announced"] or 0) == 1:
         if post.get(number, 0.0) < (MIN_CONF_G0 + 0.08):
@@ -1042,6 +1083,7 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
         return None, 0.0, samples, post
 
     return number, conf, samples, post
+# ======= FIM da substituição =======
 
 def build_suggestion_msg(number:int, base:List[int], pattern_key:str,
                          after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
