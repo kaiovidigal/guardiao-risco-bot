@@ -78,12 +78,20 @@ MAX_STAGE    = 3         # 3 = G0, G1, G2 (recuperação)
 FAST_RESULT  = True      # publica G0 imediatamente; G1/G2 só informam "Recuperou" se bater
 SCORE_G0_ONLY= True      # placar do dia só conta G0 e Loss (limpo)
 
-# Modelo / hiperparâmetros
+# =========================
+# Hiperparâmetros (ajuste G0 equilibrado)
+# =========================
 WINDOW = 400
 DECAY  = 0.985
-W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
-ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
+# Pesos (menos overfit em contexto longo)
+W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
+ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
 GAP_MIN = 0.08
+
+# Filtros de qualidade para G0 (modo equilibrado)
+MIN_CONF_G0 = 0.55      # confiança mínima do top1
+MIN_GAP_G0  = 0.04      # distância top1 - top2
+MIN_SAMPLES = 20000     # só aplica filtros rígidos quando já há amostra suficiente
 
 # =========================
 # Inteligência em disco (/var/data) — ENV
@@ -326,9 +334,7 @@ def parse_bases_and_pattern(text: str) -> Tuple[List[int], str]:
         if base: return base, "SEQ"
     return [], "GEN"
 
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# DETECÇÃO ROBUSTA DE GREEN / RED
-# Aceita vários formatos do canal (com/sem "APOSTA ENCERRADA", com "Número: X", etc.)
+# Detecção robusta de GREEN/RED (vários formatos)
 GREEN_PATTERNS = [
     re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\((\d)\)", re.I | re.S),
     re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | re.S),
@@ -346,8 +352,7 @@ def extract_green_number(text: str) -> Optional[int]:
         m = rx.search(t)
         if m:
             nums = re.findall(r"[1-4]", m.group(1))
-            if nums:
-                return int(nums[0])
+            if nums: return int(nums[0])
     return None
 
 def extract_red_last_left(text: str) -> Optional[int]:
@@ -356,10 +361,8 @@ def extract_red_last_left(text: str) -> Optional[int]:
         m = rx.search(t)
         if m:
             nums = re.findall(r"[1-4]", m.group(1))
-            if nums:
-                return int(nums[0])
+            if nums: return int(nums[0])
     return None
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 def is_analise(text:str) -> bool:
     return bool(re.search(r"\bANALISANDO\b", text, flags=re.I))
@@ -618,7 +621,7 @@ class IntelManager:
 INTEL = IntelManager()
 
 # =========================
-# Health Reporter (30 em 30 min) + Reset diário 00:00 UTC
+# Health (30 min) + Reset diário 00:00 UTC
 # =========================
 def _fmt_bytes(n: int) -> str:
     try:
@@ -731,6 +734,26 @@ def open_pending(strategy: Optional[str], suggested: int):
     except Exception as e:
         print(f"[INTEL] start_signal error: {e}")
 
+# Conversão de 1 LOSS -> 1 GREEN ao recuperar (aumenta a taxa)
+def _convert_last_loss_to_green():
+    y = today_key_local()
+    row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+    if not row:
+        exec_write("""INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
+                      VALUES (?,0,0,0,0,0)""", (y,))
+        return
+    g0 = row["g0"] or 0
+    loss = row["loss"] or 0
+    streak = row["streak"] or 0
+    if loss > 0:
+        loss -= 1
+        g0   += 1
+        streak += 1
+        exec_write("""
+          INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
+          VALUES (?,?,?,?,?,?)
+        """, (y, g0, row["g1"] or 0, row["g2"] or 0, loss, streak))
+
 async def close_pending_with_result(n_real: int, event_kind: str):
     rows = query_all("""
         SELECT id,strategy,suggested,stage,open,window_left,seen_numbers,announced
@@ -779,6 +802,14 @@ async def close_pending_with_result(n_real: int, event_kind: str):
             if hit:
                 stxt = f"G{stage}"
                 await send_recovery(stxt)
+
+                # >>> aumenta taxa: ao recuperar, converte 1 LOSS -> 1 GREEN
+                try:
+                    _convert_last_loss_to_green()
+                    await send_scoreboard()
+                except Exception as _e:
+                    print(f"[SCORE] convert loss->green erro: {_e}")
+
                 bump_pattern("RECOV", sug, True)
                 if strat: bump_strategy(strat, sug, True)
                 exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
@@ -843,6 +874,15 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
     tail = get_recent_tail(WINDOW)
     scores: Dict[int, float] = {}
 
+    # Regras “após X”: ignora se não tem lastro na cauda
+    if after_num is not None:
+        try:
+            last_idx = max([i for i, v in enumerate(tail) if v == after_num])
+        except ValueError:
+            return None, 0.0, len(tail), {k: 1/len(base) for k in base}
+        if (len(tail)-1 - last_idx) > 60:
+            return None, 0.0, len(tail), {k: 1/len(base) for k in base}
+
     for c in base:
         ng = ngram_backoff_score(tail, after_num, c)
 
@@ -858,8 +898,13 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
             sl = rows["losses"] if rows else 0
             p_str = laplace_ratio(sw, sl)
 
+        # leve boost por horário
+        boost = 1.0
+        if p_pat >= 0.60: boost = 1.05
+        elif p_pat <= 0.40: boost = 0.97
+
         prior = 1.0/len(base)
-        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA)
+        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost
         scores[c] = score
 
     total = sum(scores.values()) or 1e-9
@@ -870,6 +915,27 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
 
     roww = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
     samples = int((roww["s"] or 0) if roww else 0)
+
+    # Anti-repique: se último anunciado fechou LOSS com mesmo número, exija mais confiança
+    last = query_one("SELECT suggested, announced FROM pending_outcome ORDER BY id DESC LIMIT 1")
+    if last and number is not None and last["suggested"] == number and (last["announced"] or 0) == 1:
+        if post.get(number, 0.0) < (MIN_CONF_G0 + 0.08):
+            return None, 0.0, samples, post
+
+    # Filtro de qualidade (modo equilibrado)
+    top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
+    gap = (top2[0][1] - (top2[1][1] if len(top2) > 1 else 0.0)) if top2 else 0.0
+    enough_samples = samples >= MIN_SAMPLES
+    should_abstain = (
+        enough_samples and (
+            (number is None) or
+            (post.get(number, 0.0) < MIN_CONF_G0) or
+            (gap < MIN_GAP_G0)
+        )
+    )
+    if should_abstain:
+        return None, 0.0, samples, post
+
     return number, conf, samples, post
 
 def build_suggestion_msg(number:int, base:List[int], pattern_key:str,
@@ -900,7 +966,7 @@ class Update(BaseModel):
 async def root():
     return {"ok": True, "detail": "Use POST /webhook/<WEBHOOK_TOKEN>"}
 
-# Inicia o analisador mesmo sem sinal ativo (útil para snapshots contínuos)
+# Inicia o analisador/health/reset
 @app.on_event("startup")
 async def _boot_analyzer():
     try:
@@ -964,42 +1030,10 @@ async def webhook(token: str, request: Request):
             update_ngrams()
         return {"ok": True, "analise": True}
 
-    # 3) ENTRADA CONFIRMADA — forçar LOSS do G0 pendente (se houver) e abrir nova pendência
+    # 3) ENTRADA CONFIRMADA — processa G0 da nova janela (pode abster por qualidade)
     if not is_real_entry(t):
         return {"ok": True, "skipped": True}
 
-    # >>>>>> FORÇA LOSS IMEDIATO DO G0 SE UMA NOVA ENTRADA CHEGOU (interpreta como continuação G1/G2)
-    open_rows = query_all("""
-        SELECT id, strategy, suggested, stage, window_left, announced
-        FROM pending_outcome
-        WHERE open=1
-        ORDER BY id
-    """)
-    for r in open_rows:
-        if int(r["announced"]) == 0:
-            sug = int(r["suggested"])
-            strat = (r["strategy"] or "")
-            stage = int(r["stage"])
-            left  = int(r["window_left"])
-
-            bump_pattern("PEND", sug, False)
-            if strat: bump_strategy(strat, sug, False)
-            update_daily_score(None, False)
-            await send_loss_imediato(sug, f"G{stage}")
-            await send_scoreboard()
-
-            left -= 1
-            if left <= 0 or MAX_STAGE <= 1:
-                exec_write("UPDATE pending_outcome SET announced=1, open=0 WHERE id=?", (int(r["id"]),))
-            else:
-                next_stage = min(stage+1, MAX_STAGE-1)
-                exec_write("""
-                    UPDATE pending_outcome
-                    SET announced=1, stage=?, window_left=?
-                    WHERE id=?
-                """, (next_stage, left, int(r["id"])))
-
-    # Agora processa a nova entrada normalmente (G0 da nova janela)
     source_msg_id = msg.get("message_id")
     if query_one("SELECT 1 FROM suggestions WHERE source_msg_id=?", (source_msg_id,)):
         return {"ok": True, "dup": True}
@@ -1012,7 +1046,8 @@ async def webhook(token: str, request: Request):
 
     number, conf, samples, post = suggest_number(base, pattern_key, strategy, after_num)
     if number is None:
-        number = max(post, key=post.get)
+        # Sinal fraco: NÃO abre pendência nem polui o canal réplica
+        return {"ok": True, "skipped_low_conf": True}
 
     exec_write("""
       INSERT OR REPLACE INTO suggestions
