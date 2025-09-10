@@ -59,11 +59,11 @@ _ensure_db_dir()
 _migrate_old_db_if_needed()
 
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()   # -100... ou @canal
+PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()   # -100... ou @canal (apenas leitura)
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 
-if not TG_BOT_TOKEN or not PUBLIC_CHANNEL or not WEBHOOK_TOKEN:
-    print("⚠️ Defina TG_BOT_TOKEN, PUBLIC_CHANNEL e WEBHOOK_TOKEN.")
+if not TG_BOT_TOKEN or not WEBHOOK_TOKEN:
+    print("⚠️ Defina TG_BOT_TOKEN e WEBHOOK_TOKEN.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
@@ -213,8 +213,10 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
         )
 
 async def tg_broadcast(text: str, parse: str="HTML"):
-    if PUBLIC_CHANNEL:
-        await tg_send_text(PUBLIC_CHANNEL, text, parse)
+    """
+    Envia 100% das mensagens APENAS para o canal de réplica.
+    Ignora PUBLIC_CHANNEL para manter o canal-fonte limpo.
+    """
     if REPL_ENABLED and REPL_CHANNEL:
         await tg_send_text(REPL_CHANNEL, text, parse)
 
