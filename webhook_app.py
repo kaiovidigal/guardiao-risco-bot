@@ -18,12 +18,24 @@
 #   INTEL_SIGNAL_INTERVAL (default: 20)
 #   INTEL_ANALYZE_INTERVAL (default: 2)
 #
-#   AUTO_FIRE=1                 -> habilita “Tiro seco por IA”
-#   SELF_TH_G0=0.90             -> confiança mínima G0 para IA
-#   SELF_REQUIRE_G1=1           -> exigir G1 100% no lookback
-#   SELF_G1_LOOKBACK=50         -> amostras mínimas p/ considerar G1 100%
-#   SELF_COOLDOWN_S=6           -> cooldown de auto-disparo
-#   SELF_LABEL_IA="Tiro seco por IA" -> rótulo do auto-sinal
+#   AUTO_FIRE=1                       -> habilita “Tiro seco por IA”
+#   SELF_TH_G0=0.90                   -> (LEGADO) confiança mínima G0 para IA (será sobrescrita pelo auto-ramp)
+#   SELF_REQUIRE_G1=1                 -> (LEGADO) exigir G1 100% no lookback (substituído por taxa mínima)
+#   SELF_G1_LOOKBACK=50               -> (LEGADO) lookback (mantido p/ compatibilidade interna)
+#   SELF_COOLDOWN_S=6                 -> cooldown de auto-disparo
+#   SELF_LABEL_IA="Tiro seco por IA"  -> rótulo do auto-sinal
+#
+#   --- NOVO (Auto-Ramp & Debug) ---
+#   IA_TH_G0_START=0.55               -> threshold inicial de G0 (55%)
+#   IA_TH_G0_MAX=0.80                 -> teto de G0
+#   IA_G1_REQ_START=0.75              -> taxa mínima de G1 exigida (75%)
+#   IA_G1_REQ_MAX=0.90                -> teto para G1 exigida
+#   IA_G1_MIN_EVENTS=20               -> mínimo de eventos de G1 para considerar taxa
+#   IA_RAMP_STEP=0.01                 -> passo por ajuste
+#   IA_RAMP_MIN_EVENTS=20             -> mínimo de sinais IA no dia para permitir ramp
+#   IA_RAMP_UP_AT=0.62                -> se acc IA >= 62% e total>=min, sobe thresholds
+#   IA_RAMP_DOWN_AT=0.52              -> se acc IA <= 52% e total>=min, desce thresholds
+#   IA_DEBUG=0                        -> 1 para logar ajustes/quase-disparos no canal de réplica
 
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
@@ -109,16 +121,28 @@ INTEL_SIGNAL_INTERVAL = float(os.getenv("INTEL_SIGNAL_INTERVAL", "20"))  # beat 
 INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "2"))  # analisador
 
 # =========================
-# Auto Sinal (G0 >= 90% + G1 = 100% lookback)
+# Auto Sinal (com Auto-Ramp)
 # =========================
 AUTO_FIRE          = (os.getenv("AUTO_FIRE", "1").strip() == "1")
-SELF_TH_G0         = float(os.getenv("SELF_TH_G0", "0.90"))   # 90%
-SELF_REQUIRE_G1    = (os.getenv("SELF_REQUIRE_G1", "1").strip() == "1")
-SELF_G1_LOOKBACK   = int(os.getenv("SELF_G1_LOOKBACK", "50"))
+SELF_TH_G0         = float(os.getenv("SELF_TH_G0", "0.90"))   # legado (não usado diretamente)
+SELF_REQUIRE_G1    = (os.getenv("SELF_REQUIRE_G1", "1").strip() == "1")  # legado
+SELF_G1_LOOKBACK   = int(os.getenv("SELF_G1_LOOKBACK", "50"))            # legado
 SELF_COOLDOWN_S    = float(os.getenv("SELF_COOLDOWN_S", "6"))
 SELF_LABEL_IA      = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.3.0")
+# --- NOVOS parâmetros de auto-ramp/limiares dinâmicos ---
+IA_TH_G0_START     = float(os.getenv("IA_TH_G0_START", "0.55"))
+IA_TH_G0_MAX       = float(os.getenv("IA_TH_G0_MAX", "0.80"))
+IA_G1_REQ_START    = float(os.getenv("IA_G1_REQ_START", "0.75"))
+IA_G1_REQ_MAX      = float(os.getenv("IA_G1_REQ_MAX", "0.90"))
+IA_G1_MIN_EVENTS   = int(os.getenv("IA_G1_MIN_EVENTS", "20"))
+IA_RAMP_STEP       = float(os.getenv("IA_RAMP_STEP", "0.01"))
+IA_RAMP_MIN_EVENTS = int(os.getenv("IA_RAMP_MIN_EVENTS", "20"))
+IA_RAMP_UP_AT      = float(os.getenv("IA_RAMP_UP_AT", "0.62"))
+IA_RAMP_DOWN_AT    = float(os.getenv("IA_RAMP_DOWN_AT", "0.52"))
+IA_DEBUG           = (os.getenv("IA_DEBUG", "0").strip() == "1")
+
+app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.4.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -208,7 +232,7 @@ def init_db():
         announced INTEGER NOT NULL DEFAULT 0,
         source TEXT NOT NULL DEFAULT 'CHAN'
     )""")
-    # Novo placar exclusivo para IA (G0/Loss + streak)
+    # Placar exclusivo IA (G0/Loss + streak)
     cur.execute("""CREATE TABLE IF NOT EXISTS daily_score_ia (
         yyyymmdd TEXT PRIMARY KEY,
         g0 INTEGER NOT NULL DEFAULT 0,
@@ -221,17 +245,47 @@ def init_db():
         wins INTEGER NOT NULL DEFAULT 0,
         losses INTEGER NOT NULL DEFAULT 0
     )""")
+    # --- NOVO: parâmetros dinâmicos da IA (auto-ramp) ---
+    cur.execute("""CREATE TABLE IF NOT EXISTS ia_params (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )""")
     con.commit()
-    # Migrações de colunas em pending_outcome (idempotentes)
+    # Migrações idempotentes
     try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''"); con.commit()
     except sqlite3.OperationalError: pass
     try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN announced INTEGER NOT NULL DEFAULT 0"); con.commit()
     except sqlite3.OperationalError: pass
     try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN source TEXT NOT NULL DEFAULT 'CHAN'"); con.commit()
     except sqlite3.OperationalError: pass
+
+    # Seed dos parâmetros dinâmicos (se não existirem)
+    def _seed_param(k,v):
+        cur.execute("INSERT OR IGNORE INTO ia_params (key,value) VALUES (?,?)", (k, str(v)))
+    _seed_param("th_g0", IA_TH_G0_START)
+    _seed_param("g1_req", IA_G1_REQ_START)
+    _seed_param("ramp_step", IA_RAMP_STEP)
+    _seed_param("g0_max", IA_TH_G0_MAX)
+    _seed_param("g1_max", IA_G1_REQ_MAX)
+    _seed_param("g1_min_events", IA_G1_MIN_EVENTS)
+    _seed_param("ramp_min_events", IA_RAMP_MIN_EVENTS)
+    _seed_param("ramp_up_at", IA_RAMP_UP_AT)
+    _seed_param("ramp_down_at", IA_RAMP_DOWN_AT)
+    con.commit()
     con.close()
 
 init_db()
+
+# Helpers para ia_params
+def ia_get(key: str, default: Optional[float]=None) -> float:
+    row = query_one("SELECT value FROM ia_params WHERE key=?", (key,))
+    try:
+        return float(row["value"]) if row else (default if default is not None else 0.0)
+    except Exception:
+        return default if default is not None else 0.0
+
+def ia_set(key: str, value: float):
+    exec_write("INSERT OR REPLACE INTO ia_params (key,value) VALUES (?,?)", (key, str(float(value))))
 
 # =========================
 # Utils / Telegram
@@ -255,10 +309,6 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
         )
 
 async def tg_broadcast(text: str, parse: str="HTML"):
-    """
-    Envia 100% das mensagens APENAS para o canal de réplica.
-    Ignora PUBLIC_CHANNEL para manter o canal-fonte limpo.
-    """
     if REPL_ENABLED and REPL_CHANNEL:
         await tg_send_text(REPL_CHANNEL, text, parse)
 
@@ -503,7 +553,6 @@ async def send_scoreboard():
 
 # ======== Placar exclusivo IA ========
 def update_daily_score_ia(stage: Optional[int], won: bool):
-    # IA só conta G0/Loss no placar (mesmo conceito do geral limpo)
     y = today_key_local()
     row = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
     if not row: g0=loss=streak=0
@@ -571,17 +620,14 @@ def bump_recov_g1(number:int, won:bool):
       ON CONFLICT(number) DO UPDATE SET wins=excluded.wins, losses=excluded.losses
     """, (int(number), w, l))
 
-def recov_g1_is_perfect(number:int, lookback:int=50) -> bool:
-    """
-    '100%' conservador: zero falhas registradas e pelo menos 1 (ou N) sucessos.
-    Para exigir N sucessos, ajuste o critério abaixo.
-    """
+def recov_g1_rate(number:int) -> Tuple[float,int]:
     row = query_one("SELECT wins, losses FROM recov_g1_stats WHERE number=?", (int(number),))
-    if not row:
-        return False
+    if not row: return 0.0, 0
     wins = row["wins"] or 0
     losses = row["losses"] or 0
-    return losses == 0 and wins >= max(1, min(lookback, 999999))
+    total = wins + losses
+    rate = wins / total if total > 0 else 0.0
+    return rate, total
 
 # =========================
 # Health (30 min) + Reset diário 00:00 UTC
@@ -619,6 +665,15 @@ def _daily_score_snapshot():
     acc = (g0/total*100.0) if total else 0.0
     return g0, loss, streak, total, acc
 
+def _daily_score_snapshot_ia():
+    y = today_key_local()
+    row = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
+    g0 = row["g0"] if row else 0
+    loss = row["loss"] if row else 0
+    total = g0 + loss
+    acc = (g0/total*100.0) if total else 0.0
+    return g0, loss, total, acc
+
 def _last_snapshot_info():
     try:
         latest_path = os.path.join(INTEL_DIR, "snapshots", "latest_top.json")
@@ -642,6 +697,11 @@ def _health_text() -> str:
     last_snap_ts   = _last_snapshot_info()
     g0, loss, streak, total, acc = _daily_score_snapshot()
 
+    # IA snapshot + thresholds dinâmicos
+    ia_g0, ia_loss, ia_total, ia_acc = _daily_score_snapshot_ia()
+    th_g0   = ia_get("th_g0", IA_TH_G0_START)
+    g1_req  = ia_get("g1_req", IA_G1_REQ_START)
+
     return (
         "🩺 <b>Saúde do Guardião</b>\n"
         f"⏱️ UTC: <code>{utc_iso()}</code>\n"
@@ -655,6 +715,10 @@ def _health_text() -> str:
         "—\n"
         f"📊 Placar (hoje - G0 only): G0=<b>{g0}</b> | Loss=<b>{loss}</b> | Total=<b>{total}</b>\n"
         f"✅ Acerto: <b>{acc:.2f}%</b> | 🔥 Streak: <b>{streak}</b>\n"
+        "—\n"
+        f"🤖 <b>IA</b> G0=<b>{ia_g0}</b> | Loss=<b>{ia_loss}</b> | Total=<b>{ia_total}</b>\n"
+        f"✅ <b>IA Acerto (dia):</b> <b>{ia_acc:.2f}%</b>\n"
+        f"⚙️ <b>IA thresholds:</b> G0≥<b>{th_g0*100:.1f}%</b> | G1≥<b>{g1_req*100:.1f}%</b>\n"
     )
 
 async def _health_reporter_task():
@@ -721,6 +785,50 @@ def _convert_last_loss_to_green():
           VALUES (?,?,?,?,?,?)
         """, (y, g0, row["g1"] or 0, row["g2"] or 0, loss, streak))
 
+# Ajuste automático dos thresholds da IA (ramp up/down)
+def _ia_auto_ramp_if_needed():
+    # Usa o desempenho do dia (g0/loss) para ajustar
+    y = today_key_local()
+    row = query_one("SELECT g0,loss FROM daily_score_ia WHERE yyyymmdd=?", (y,))
+    g0 = row["g0"] if row else 0
+    loss = row["loss"] if row else 0
+    total = (g0 or 0) + (loss or 0)
+
+    th_g0  = ia_get("th_g0", IA_TH_G0_START)
+    g1_req = ia_get("g1_req", IA_G1_REQ_START)
+    step   = ia_get("ramp_step", IA_RAMP_STEP)
+    g0_max = ia_get("g0_max", IA_TH_G0_MAX)
+    g1_max = ia_get("g1_max", IA_G1_REQ_MAX)
+    min_ev = int(ia_get("ramp_min_events", IA_RAMP_MIN_EVENTS))
+    up_at  = ia_get("ramp_up_at", IA_RAMP_UP_AT)
+    dn_at  = ia_get("ramp_down_at", IA_RAMP_DOWN_AT)
+
+    if total < min_ev or total <= 0:
+        return  # ainda não ajusta
+
+    acc = g0/total
+    changed = False
+
+    if acc >= up_at:
+        new_th = min(g0_max, th_g0 + step)
+        new_g1 = min(g1_max, g1_req + step/2.0)  # G1 sobe mais devagar
+        if abs(new_th - th_g0) > 1e-9:
+            ia_set("th_g0", new_th); th_g0 = new_th; changed = True
+        if abs(new_g1 - g1_req) > 1e-9:
+            ia_set("g1_req", new_g1); g1_req = new_g1; changed = True
+
+    elif acc <= dn_at:
+        new_th = max(IA_TH_G0_START, th_g0 - step)
+        # G1 exigida não desce automaticamente para não “afrouxar” demais
+        if abs(new_th - th_g0) > 1e-9:
+            ia_set("th_g0", new_th); th_g0 = new_th; changed = True
+
+    if IA_DEBUG and changed:
+        asyncio.create_task(tg_broadcast(
+            f"🛠️ <b>IA Auto-Ramp</b>\n"
+            f"G0≥<b>{th_g0*100:.1f}%</b> | G1≥<b>{g1_req*100:.1f}%</b> (baseando-se em {total} sinais IA do dia)"
+        ))
+
 async def close_pending_with_result(n_real: int, event_kind: str):
     rows = query_all("""
         SELECT id,strategy,suggested,stage,open,window_left,seen_numbers,announced,source
@@ -744,7 +852,7 @@ async def close_pending_with_result(n_real: int, event_kind: str):
         hit = (n_real == sug)
 
         if announced == 0:
-            # Primeira janela (G0) — anunciar e atualizar placares
+            # Primeira janela (G0)
             if hit:
                 bump_pattern("PEND", sug, True)
                 if strat: bump_strategy(strat, sug, True)
@@ -753,10 +861,10 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                     update_daily_score_ia(0, True)
                 await send_green_imediato(sug, "G0")
                 exec_write("UPDATE pending_outcome SET announced=1, open=0 WHERE id=?", (pid,))
-                # Placar geral e (se IA) o placar IA
                 await send_scoreboard()
                 if source == "IA":
                     await send_scoreboard_ia()
+                    _ia_auto_ramp_if_needed()
             else:
                 bump_pattern("PEND", sug, False)
                 if strat: bump_strategy(strat, sug, False)
@@ -768,6 +876,7 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                 await send_scoreboard()
                 if source == "IA":
                     await send_scoreboard_ia()
+                    _ia_auto_ramp_if_needed()
 
                 left -= 1
                 if left <= 0 or MAX_STAGE <= 1:
@@ -776,13 +885,13 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                     next_stage = min(stage+1, MAX_STAGE-1)
                     exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
         else:
-            # announced == 1: já anunciamos G0; agora estamos em recuperação G1/G2
+            # Recuperação (G1/G2)
             left -= 1
             if hit:
                 stxt = f"G{stage}"
                 await send_recovery(stxt)
 
-                # >>> aumenta taxa: ao recuperar, converte 1 LOSS -> 1 GREEN
+                # converte último LOSS -> GREEN (geral e, se IA, no placar IA)
                 try:
                     _convert_last_loss_to_green()
                     if source == "IA":
@@ -790,6 +899,7 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                     await send_scoreboard()
                     if source == "IA":
                         await send_scoreboard_ia()
+                        _ia_auto_ramp_if_needed()
                 except Exception as _e:
                     print(f"[SCORE] convert loss->green erro: {_e}")
 
@@ -804,9 +914,7 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                 if strat: bump_strategy(strat, sug, True)
                 exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
             else:
-                # Não bateu neste tick de recuperação
                 if left <= 0:
-                    # Falhou toda a janela de recuperação
                     if stage >= 1:
                         try:
                             bump_recov_g1(sug, False)
@@ -1111,7 +1219,7 @@ class IntelManager:
                 with open(latest_path, "w", encoding="utf-8") as fp:
                     json.dump(snap, fp, ensure_ascii=False, indent=2)
                 hist_path = os.path.join(INTEL_DIR, "snapshots", "top_history.jsonl")
-                with open(hist_path, "a", encoding="utf-8") as fp:
+                with open(hist_path, "a", encoding="utf-8") as fp):
                     fp.write(json.dumps(snap, ensure_ascii=False) + "\n")
                 _rotate_if_needed()
                 await asyncio.sleep(max(0.2, INTEL_ANALYZE_INTERVAL))
@@ -1123,7 +1231,7 @@ class IntelManager:
 INTEL = IntelManager()
 
 # =========================
-# Auto-fire (IA)
+# Auto-fire (IA) — usa thresholds dinâmicos + G1 mínima
 # =========================
 _last_auto_fire_ts: float = 0.0
 
@@ -1139,15 +1247,26 @@ async def _auto_fire_task():
             if open_cnt > 0:
                 await asyncio.sleep(1.0); continue
 
+            # Thresholds dinâmicos atuais
+            th_g0  = ia_get("th_g0", IA_TH_G0_START)
+            g1_req = ia_get("g1_req", IA_G1_REQ_START)
+            g1_min = int(ia_get("g1_min_events", IA_G1_MIN_EVENTS))
+
             # Usa mesmo motor de sugestão (NGRAM/backoff + stats)
             base, pattern_key = [1,2,3,4], "GEN"
             number, conf, samples, post = suggest_number(base, pattern_key, strategy=None, after_num=None)
 
+            if IA_DEBUG and number is not None:
+                # log leve de quase-disparo
+                await tg_broadcast(
+                    f"🤖 <i>debug</i> conf={conf*100:.2f}% | th_g0={th_g0*100:.1f}% | amostras≈{samples}"
+                )
+
             nowt = time.time()
-            if number is not None and conf >= SELF_TH_G0 and samples >= MIN_SAMPLES:
-                g1_ok = True
-                if SELF_REQUIRE_G1:
-                    g1_ok = recov_g1_is_perfect(number, lookback=SELF_G1_LOOKBACK)
+            if number is not None and conf >= th_g0 and samples >= MIN_SAMPLES:
+                # Verifica taxa de recuperação histórica do G1 para este número
+                rate, events = recov_g1_rate(number)
+                g1_ok = (events >= g1_min and rate >= g1_req)
 
                 if g1_ok and (nowt - _last_auto_fire_ts) >= SELF_COOLDOWN_S:
                     open_pending(strategy=None, suggested=int(number), source="IA")
