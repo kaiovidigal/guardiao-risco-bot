@@ -1,6 +1,25 @@
 # -*- coding: utf-8 -*-
+# Fan Tan — Guardião (G0 + Recuperação) com:
+# - Inteligência em disco: /var/data/ai_intel (teto 1 GB + rotação)
+# - Batidas do sinal a cada 20s enquanto houver pendência aberta
+# - Analisador periódico a cada 2s com top combos recentes da cauda
+#
+# Rotas:
+#   POST /webhook/<WEBHOOK_TOKEN>   (recebe mensagens do Telegram)
+#   GET  /                          (ping)
+#
+# ENV obrigatórias:
+#   TG_BOT_TOKEN, PUBLIC_CHANNEL, WEBHOOK_TOKEN
+#
+# ENV opcionais:
+#   DB_PATH (default: /data/data.db)
+#   INTEL_DIR (default: /var/data/ai_intel)
+#   INTEL_MAX_BYTES (default: 1000000000 -> 1 GB)
+#   INTEL_SIGNAL_INTERVAL (default: 20)
+#   INTEL_ANALYZE_INTERVAL (default: 2)
+
 import os, re, json, time, sqlite3, asyncio, shutil
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timezone
 
 import httpx
@@ -66,7 +85,15 @@ W4, W3, W2, W1 = 0.45, 0.30, 0.17, 0.08
 ALPHA, BETA, GAMMA = 1.10, 0.65, 0.35
 GAP_MIN = 0.08
 
-app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.1.0")
+# =========================
+# Inteligência em disco (/var/data) — ENV
+# =========================
+INTEL_DIR = os.getenv("INTEL_DIR", "/var/data/ai_intel").rstrip("/")
+INTEL_MAX_BYTES = int(os.getenv("INTEL_MAX_BYTES", "1000000000"))  # 1 GB
+INTEL_SIGNAL_INTERVAL = float(os.getenv("INTEL_SIGNAL_INTERVAL", "20"))  # beat do sinal
+INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "2"))  # analisador
+
+app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.2.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -153,10 +180,9 @@ def init_db():
         strategy TEXT, suggested INTEGER NOT NULL, stage INTEGER NOT NULL,
         open INTEGER NOT NULL, window_left INTEGER NOT NULL,
         seen_numbers TEXT DEFAULT '',
-        announced INTEGER NOT NULL DEFAULT 0  -- 0=não anunciou resultado público, 1=já anunciou (G0)
+        announced INTEGER NOT NULL DEFAULT 0
     )""")
     con.commit()
-    # migrações idempotentes
     try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''"); con.commit()
     except sqlite3.OperationalError: pass
     try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN announced INTEGER NOT NULL DEFAULT 0"); con.commit()
@@ -170,6 +196,9 @@ init_db()
 # =========================
 def now_ts() -> int:
     return int(time.time())
+
+def utc_iso() -> str:
+    return datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
 
 def today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -197,7 +226,6 @@ async def send_loss_imediato(sugerido:int, stage_txt:str="G0"):
     await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b> (em {stage_txt})")
 
 async def send_recovery(stage_txt:str):
-    # mensagem curtíssima de recuperação
     await tg_broadcast(f"♻️ Recuperou em <b>{stage_txt}</b> (GREEN)")
 
 # =========================
@@ -343,12 +371,15 @@ def bump_strategy(strategy: str, number: int, won: bool):
       DO UPDATE SET wins=excluded.wins, losses=excluded.losses
     """, (strategy, number, w, l))
 
+def today_key_local() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
 def update_daily_score(stage: Optional[int], won: bool):
     """
     Se SCORE_G0_ONLY=True: só conta G0 e Loss.
     Caso contrário, conta G0/G1/G2 separadamente.
     """
-    y = today_key()
+    y = today_key_local()
     row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
     if not row: g0=g1=g2=loss=streak=0
     else:       g0,g1,g2,loss,streak = row["g0"],row["g1"],row["g2"],row["loss"],row["streak"]
@@ -387,7 +418,7 @@ def update_daily_score(stage: Optional[int], won: bool):
         return g0, g1, g2, loss, acc, streak
 
 async def send_scoreboard():
-    y = today_key()
+    y = today_key_local()
     row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
     g0=row["g0"] if row else 0
     g1=row["g1"] if row else 0
@@ -412,6 +443,164 @@ async def send_scoreboard():
     await tg_broadcast(txt)
 
 # =========================
+# Inteligência em disco — Manager
+# =========================
+def _intel_ensure_dir():
+    os.makedirs(INTEL_DIR, exist_ok=True)
+    os.makedirs(os.path.join(INTEL_DIR, "signals"), exist_ok=True)
+    os.makedirs(os.path.join(INTEL_DIR, "snapshots"), exist_ok=True)
+
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except Exception:
+                pass
+    return total
+
+def _rotate_if_needed():
+    try:
+        total = _dir_size_bytes(INTEL_DIR)
+        if total <= INTEL_MAX_BYTES:
+            return
+        # remove os mais antigos primeiro
+        all_files = []
+        for root, _, files in os.walk(INTEL_DIR):
+            for f in files:
+                p = os.path.join(root, f)
+                try:
+                    all_files.append((p, os.path.getmtime(p)))
+                except Exception:
+                    pass
+        all_files.sort(key=lambda x: x[1])  # antigos primeiro
+        idx = 0
+        while total > INTEL_MAX_BYTES and idx < len(all_files):
+            p, _ = all_files[idx]
+            try:
+                sz = os.path.getsize(p)
+                os.remove(p)
+                total -= sz
+            except Exception:
+                pass
+            idx += 1
+    except Exception as e:
+        print(f"[INTEL] rotate error: {e}")
+
+class IntelManager:
+    def __init__(self):
+        self._active = False
+        self._last_suggested: Optional[int] = None
+        self._last_strategy: Optional[str] = None
+        self._signal_task: Optional[asyncio.Task] = None
+        self._analyze_task: Optional[asyncio.Task] = None
+        _intel_ensure_dir()
+
+    def has_open_signal(self) -> bool:
+        return self._active
+
+    def start_signal(self, suggested: int, strategy: Optional[str]):
+        self._active = True
+        self._last_suggested = int(suggested)
+        self._last_strategy = (strategy or "")
+        if self._signal_task is None or self._signal_task.done():
+            self._signal_task = asyncio.create_task(self._signal_beats())
+        if self._analyze_task is None or self._analyze_task.done():
+            self._analyze_task = asyncio.create_task(self._periodic_analyzer())
+
+    def stop_signal(self):
+        self._active = False
+        if self._signal_task and not self._signal_task.done():
+            self._signal_task.cancel()
+            self._signal_task = None
+
+    async def _signal_beats(self):
+        """Grava heartbeat do sinal a cada INTEL_SIGNAL_INTERVAL segundos enquanto ativo."""
+        try:
+            while self._active:
+                payload = {
+                    "ts": now_ts(),
+                    "utc": utc_iso(),
+                    "active": True,
+                    "suggested": self._last_suggested,
+                    "strategy": self._last_strategy,
+                    "tail_sample": get_recent_tail(40),
+                }
+                day = today_key()
+                fpath = os.path.join(INTEL_DIR, "signals", f"sinal_{day}.jsonl")
+                with open(fpath, "a", encoding="utf-8") as fp:
+                    fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                _rotate_if_needed()
+                await asyncio.sleep(max(0.2, INTEL_SIGNAL_INTERVAL))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[INTEL] signal_beats error: {e}")
+
+    def _best_combos_from_tail(self) -> Dict[str, Any]:
+        """Calcula melhores combinações recentes baseado na cauda (ngrams + stats)."""
+        tail = get_recent_tail(WINDOW)
+        if not tail:
+            return {"ts": now_ts(), "utc": utc_iso(), "tail_len": 0, "top": []}
+
+        candidates = [1, 2, 3, 4]
+        ctx4 = tail[-4:] if len(tail) >= 4 else tail[:]
+        ctx3 = tail[-3:] if len(tail) >= 3 else tail[:]
+        ctx2 = tail[-2:] if len(tail) >= 2 else tail[:]
+        ctx1 = tail[-1:] if len(tail) >= 1 else tail[:]
+
+        scores: Dict[int, float] = {}
+        for c in candidates:
+            p = 0.0
+            if len(ctx4) >= 1: p += W4 * prob_from_ngrams(ctx4[:-1], c)
+            if len(ctx3) >= 1: p += W3 * prob_from_ngrams(ctx3[:-1], c)
+            if len(ctx2) >= 1: p += W2 * prob_from_ngrams(ctx2[:-1], c)
+            if len(ctx1) >= 1: p += W1 * prob_from_ngrams(ctx1[:-1], c)
+
+            hour_block = int(datetime.now(timezone.utc).hour // 2)
+            pat_key = f"GEN|h{hour_block}"
+            rowp = query_one("SELECT wins, losses FROM stats_pattern WHERE pattern_key=? AND number=?", (pat_key, c))
+            pw = rowp["wins"] if rowp else 0
+            pl = rowp["losses"] if rowp else 0
+            p_pat = laplace_ratio(pw, pl)
+
+            prior = 0.25
+            score = (prior) * ((max(p, 1e-9)) ** ALPHA) * (p_pat ** BETA)
+            scores[c] = score
+
+        tot = sum(scores.values()) or 1e-9
+        post = {k: v / tot for k, v in scores.items()}
+        top_sorted = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+        top_list = [{"number": n, "prob": float(p)} for n, p in top_sorted]
+        return {
+            "ts": now_ts(),
+            "utc": utc_iso(),
+            "tail_len": len(tail),
+            "top": top_list,
+        }
+
+    async def _periodic_analyzer(self):
+        """A cada INTEL_ANALYZE_INTERVAL grava snapshot dos 'melhores números' recentes."""
+        try:
+            while True:
+                snap = self._best_combos_from_tail()
+                latest_path = os.path.join(INTEL_DIR, "snapshots", "latest_top.json")
+                with open(latest_path, "w", encoding="utf-8") as fp:
+                    json.dump(snap, fp, ensure_ascii=False, indent=2)
+                hist_path = os.path.join(INTEL_DIR, "snapshots", "top_history.jsonl")
+                with open(hist_path, "a", encoding="utf-8") as fp:
+                    fp.write(json.dumps(snap, ensure_ascii=False) + "\n")
+                _rotate_if_needed()
+                await asyncio.sleep(max(0.2, INTEL_ANALYZE_INTERVAL))
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[INTEL] analyzer error: {e}")
+
+INTEL = IntelManager()
+
+# =========================
 # Pendências (FastResult: G0 imediato + recuperação G1/G2)
 # =========================
 def open_pending(strategy: Optional[str], suggested: int):
@@ -420,14 +609,17 @@ def open_pending(strategy: Optional[str], suggested: int):
         (created_at,strategy,suggested,stage,open,window_left,seen_numbers,announced)
         VALUES (?,?,?,?,1,?, '', 0)
     """, (now_ts(), strategy or "", int(suggested), 0, MAX_STAGE))
+    # >>> Hook de inteligência: inicia batidas do sinal
+    try:
+        INTEL.start_signal(suggested=int(suggested), strategy=strategy)
+    except Exception as e:
+        print(f"[INTEL] start_signal error: {e}")
 
 async def close_pending_with_result(n_real: int, event_kind: str):
     """
     FastResult:
       - No primeiro resultado (G0): publica GREEN/LOSS imediatamente (announced=1).
-      - Mantém pendência aberta até G1/G2 (se MAX_STAGE>1):
-          * Se bater depois: envia "♻️ Recuperou em G1/G2" (não mexe no placar quando SCORE_G0_ONLY=True).
-          * Se não bater: pendência fecha ao fim da janela (sem poluir).
+      - Mantém pendência aberta até G1/G2 (se MAX_STAGE>1).
     """
     rows = query_all("""
         SELECT id,strategy,suggested,stage,open,window_left,seen_numbers,announced
@@ -457,14 +649,12 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                 if strat: bump_strategy(strat, sug, True)
                 update_daily_score(0, True)
                 await send_green_imediato(sug, "G0")
-                exec_write("UPDATE pending_outcome SET announced=1 WHERE id=?", (pid,))
-                # mantém aberta se quiser observar G1/G2? não precisa: já acertou; fechamos:
-                exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
+                exec_write("UPDATE pending_outcome SET announced=1, open=0 WHERE id=?", (pid,))
                 await send_scoreboard()
             else:
                 # LOSS imediato público (em G0)
-                bump_pattern("PEND", sug, False if SCORE_G0_ONLY else False)
-                if strat: bump_strategy(strat, sug, False if SCORE_G0_ONLY else False)
+                bump_pattern("PEND", sug, False)
+                if strat: bump_strategy(strat, sug, False)
                 update_daily_score(None, False)  # conta LOSS no placar (G0-only)
                 await send_loss_imediato(sug, "G0")
                 exec_write("UPDATE pending_outcome SET announced=1 WHERE id=?", (pid,))
@@ -478,23 +668,28 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                     next_stage = min(stage+1, MAX_STAGE-1)
                     exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
         else:
-            # Já anunciamos G0; agora só cuidamos de RECUPERAÇÃO (silenciosa)
+            # Já anunciamos G0; agora somente RECUPERAÇÃO (silenciosa)
             left -= 1
             if hit:
-                # Recuperou (GREEN) em G1/G2 — só avisar
                 stxt = f"G{stage}"
                 await send_recovery(stxt)
-                # (placar: se SCORE_G0_ONLY=True, não muda; só aprendizado extra)
                 bump_pattern("RECOV", sug, True)
                 if strat: bump_strategy(strat, sug, True)
                 exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
             else:
                 if left <= 0:
-                    # Não recuperou, só fechar
                     exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
                 else:
                     next_stage = min(stage+1, MAX_STAGE-1)
                     exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
+
+    # >>> Hook de inteligência: para batidas se não houver mais pendências
+    try:
+        still_open = query_one("SELECT 1 FROM pending_outcome WHERE open=1")
+        if not still_open:
+            INTEL.stop_signal()
+    except Exception as e:
+        print(f"[INTEL] stop_signal check error: {e}")
 
 # =========================
 # Predição (número seco)
@@ -600,6 +795,15 @@ class Update(BaseModel):
 async def root():
     return {"ok": True, "detail": "Use POST /webhook/<WEBHOOK_TOKEN>"}
 
+# Inicia o analisador mesmo sem sinal ativo (útil para snapshots contínuos)
+@app.on_event("startup")
+async def _boot_analyzer():
+    try:
+        if INTEL._analyze_task is None or INTEL._analyze_task.done():
+            INTEL._analyze_task = asyncio.create_task(INTEL._periodic_analyzer())
+    except Exception as e:
+        print(f"[INTEL] startup analyzer error: {e}")
+
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
@@ -678,7 +882,7 @@ async def webhook(token: str, request: Request):
       VALUES (?,?,?,?,?,?,?)
     """, (strategy, source_msg_id, int(number), "CTX", pattern_key, "G0", now_ts()))
 
-    open_pending(strategy, int(number))
+    open_pending(strategy, int(number))  # (hook INTEL chamado dentro)
 
     # ENTRADA — formato completo
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
