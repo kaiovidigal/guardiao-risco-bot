@@ -1219,7 +1219,8 @@ class IntelManager:
                 with open(latest_path, "w", encoding="utf-8") as fp:
                     json.dump(snap, fp, ensure_ascii=False, indent=2)
                 hist_path = os.path.join(INTEL_DIR, "snapshots", "top_history.jsonl")
-                with open(hist_path, "a", encoding="utf-8") as fp):
+                # >>> CORRIGIDO: removido ')' extra após 'as fp'
+                with open(hist_path, "a", encoding="utf-8") as fp:
                     fp.write(json.dumps(snap, ensure_ascii=False) + "\n")
                 _rotate_if_needed()
                 await asyncio.sleep(max(0.2, INTEL_ANALYZE_INTERVAL))
