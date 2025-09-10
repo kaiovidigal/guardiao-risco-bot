@@ -17,6 +17,13 @@
 #   INTEL_MAX_BYTES (default: 1000000000 -> 1 GB)
 #   INTEL_SIGNAL_INTERVAL (default: 20)
 #   INTEL_ANALYZE_INTERVAL (default: 2)
+#
+#   AUTO_FIRE=1                 -> habilita “Tiro seco por IA”
+#   SELF_TH_G0=0.90             -> confiança mínima G0 para IA
+#   SELF_REQUIRE_G1=1           -> exigir G1 100% no lookback
+#   SELF_G1_LOOKBACK=50         -> amostras mínimas p/ considerar G1 100%
+#   SELF_COOLDOWN_S=6           -> cooldown de auto-disparo
+#   SELF_LABEL_IA="Tiro seco por IA" -> rótulo do auto-sinal
 
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
@@ -101,7 +108,17 @@ INTEL_MAX_BYTES = int(os.getenv("INTEL_MAX_BYTES", "1000000000"))  # 1 GB
 INTEL_SIGNAL_INTERVAL = float(os.getenv("INTEL_SIGNAL_INTERVAL", "20"))  # beat do sinal
 INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "2"))  # analisador
 
-app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.2.0")
+# =========================
+# Auto Sinal (G0 >= 90% + G1 = 100% lookback)
+# =========================
+AUTO_FIRE          = (os.getenv("AUTO_FIRE", "1").strip() == "1")
+SELF_TH_G0         = float(os.getenv("SELF_TH_G0", "0.90"))   # 90%
+SELF_REQUIRE_G1    = (os.getenv("SELF_REQUIRE_G1", "1").strip() == "1")
+SELF_G1_LOOKBACK   = int(os.getenv("SELF_G1_LOOKBACK", "50"))
+SELF_COOLDOWN_S    = float(os.getenv("SELF_COOLDOWN_S", "6"))
+SELF_LABEL_IA      = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
+
+app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.3.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -188,12 +205,29 @@ def init_db():
         strategy TEXT, suggested INTEGER NOT NULL, stage INTEGER NOT NULL,
         open INTEGER NOT NULL, window_left INTEGER NOT NULL,
         seen_numbers TEXT DEFAULT '',
-        announced INTEGER NOT NULL DEFAULT 0
+        announced INTEGER NOT NULL DEFAULT 0,
+        source TEXT NOT NULL DEFAULT 'CHAN'
+    )""")
+    # Novo placar exclusivo para IA (G0/Loss + streak)
+    cur.execute("""CREATE TABLE IF NOT EXISTS daily_score_ia (
+        yyyymmdd TEXT PRIMARY KEY,
+        g0 INTEGER NOT NULL DEFAULT 0,
+        loss INTEGER NOT NULL DEFAULT 0,
+        streak INTEGER NOT NULL DEFAULT 0
+    )""")
+    # Estatística de recuperação em G1
+    cur.execute("""CREATE TABLE IF NOT EXISTS recov_g1_stats (
+        number INTEGER PRIMARY KEY,
+        wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0
     )""")
     con.commit()
+    # Migrações de colunas em pending_outcome (idempotentes)
     try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''"); con.commit()
     except sqlite3.OperationalError: pass
     try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN announced INTEGER NOT NULL DEFAULT 0"); con.commit()
+    except sqlite3.OperationalError: pass
+    try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN source TEXT NOT NULL DEFAULT 'CHAN'"); con.commit()
     except sqlite3.OperationalError: pass
     con.close()
 
@@ -402,6 +436,7 @@ def bump_strategy(strategy: str, number: int, won: bool):
 def today_key_local() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
 
+# Placar geral (já existente)
 def update_daily_score(stage: Optional[int], won: bool):
     y = today_key_local()
     row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
@@ -466,8 +501,475 @@ async def send_scoreboard():
                f"🔥 Streak: {streak} GREEN(s)")
     await tg_broadcast(txt)
 
+# ======== Placar exclusivo IA ========
+def update_daily_score_ia(stage: Optional[int], won: bool):
+    # IA só conta G0/Loss no placar (mesmo conceito do geral limpo)
+    y = today_key_local()
+    row = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
+    if not row: g0=loss=streak=0
+    else:       g0,loss,streak = row["g0"],row["loss"],row["streak"]
+
+    if won and stage == 0:
+        g0 += 1
+        streak += 1
+    elif not won:
+        loss += 1
+        streak = 0
+
+    exec_write("""
+      INSERT INTO daily_score_ia (yyyymmdd,g0,loss,streak)
+      VALUES (?,?,?,?)
+      ON CONFLICT(yyyymmdd) DO UPDATE SET
+        g0=excluded.g0, loss=excluded.loss, streak=excluded.streak
+    """, (y,g0,loss,streak))
+
+    total = g0 + loss
+    acc = (g0/total) if total else 0.0
+    return g0, loss, acc, streak
+
+def _convert_last_loss_to_green_ia():
+    y = today_key_local()
+    row = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
+    if not row:
+        exec_write("""INSERT OR REPLACE INTO daily_score_ia (yyyymmdd,g0,loss,streak)
+                      VALUES (?,0,0,0)""", (y,))
+        return
+    g0 = row["g0"] or 0
+    loss = row["loss"] or 0
+    streak = row["streak"] or 0
+    if loss > 0:
+        loss -= 1
+        g0   += 1
+        streak += 1
+        exec_write("""
+          INSERT OR REPLACE INTO daily_score_ia (yyyymmdd,g0,loss,streak)
+          VALUES (?,?,?,?)
+        """, (y, g0, loss, streak))
+
+async def send_scoreboard_ia():
+    y = today_key_local()
+    row = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
+    g0=row["g0"] if row else 0
+    loss=row["loss"] if row else 0
+    streak=row["streak"] if row else 0
+    total = g0 + loss
+    acc = (g0/total*100) if total else 0.0
+    txt = (f"🤖 <b>Placar IA (dia)</b>\n"
+           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
+           f"✅ Acerto: {acc:.2f}%\n"
+           f"🔥 Streak: {streak} GREEN(s)")
+    await tg_broadcast(txt)
+
+# ======== Estatística de recuperação G1 ========
+def bump_recov_g1(number:int, won:bool):
+    row = query_one("SELECT wins, losses FROM recov_g1_stats WHERE number=?", (int(number),))
+    w = (row["wins"] if row else 0) + (1 if won else 0)
+    l = (row["losses"] if row else 0) + (0 if won else 1)
+    exec_write("""
+      INSERT INTO recov_g1_stats (number, wins, losses)
+      VALUES (?,?,?)
+      ON CONFLICT(number) DO UPDATE SET wins=excluded.wins, losses=excluded.losses
+    """, (int(number), w, l))
+
+def recov_g1_is_perfect(number:int, lookback:int=50) -> bool:
+    """
+    '100%' conservador: zero falhas registradas e pelo menos 1 (ou N) sucessos.
+    Para exigir N sucessos, ajuste o critério abaixo.
+    """
+    row = query_one("SELECT wins, losses FROM recov_g1_stats WHERE number=?", (int(number),))
+    if not row:
+        return False
+    wins = row["wins"] or 0
+    losses = row["losses"] or 0
+    return losses == 0 and wins >= max(1, min(lookback, 999999))
+
 # =========================
-# Inteligência em disco — Manager
+# Health (30 min) + Reset diário 00:00 UTC
+# =========================
+def _fmt_bytes(n: int) -> str:
+    try:
+        n = float(n)
+    except Exception:
+        return "—"
+    for unit in ["B","KB","MB","GB","TB","PB"]:
+        if n < 1024.0:
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} EB"
+
+def _get_scalar(sql: str, params: tuple = (), default: int|float = 0):
+    row = query_one(sql, params)
+    if not row:
+        return default
+    try:
+        return row[0] if row[0] is not None else default
+    except Exception:
+        keys = row.keys()
+        return row[keys[0]] if keys and row[keys[0]] is not None else default
+
+def _daily_score_snapshot():
+    y = today_key_local()
+    row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+    if not row:
+        return 0,0,0,0,0.0
+    g0 = row["g0"] or 0
+    loss = row["loss"] or 0
+    streak = row["streak"] or 0
+    total = g0 + loss
+    acc = (g0/total*100.0) if total else 0.0
+    return g0, loss, streak, total, acc
+
+def _last_snapshot_info():
+    try:
+        latest_path = os.path.join(INTEL_DIR, "snapshots", "latest_top.json")
+        if not os.path.exists(latest_path):
+            return "—"
+        ts = os.path.getmtime(latest_path)
+        return datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc).isoformat()
+    except Exception:
+        return "—"
+
+def _health_text() -> str:
+    timeline_cnt   = _get_scalar("SELECT COUNT(*) FROM timeline")
+    ngram_rows     = _get_scalar("SELECT COUNT(*) FROM ngram_stats")
+    ngram_samples  = _get_scalar("SELECT SUM(weight) FROM ngram_stats")
+    pat_rows       = _get_scalar("SELECT COUNT(*) FROM stats_pattern")
+    pat_events     = _get_scalar("SELECT SUM(wins+losses) FROM stats_pattern")
+    strat_rows     = _get_scalar("SELECT COUNT(*) FROM stats_strategy")
+    strat_events   = _get_scalar("SELECT SUM(wins+losses) FROM stats_strategy")
+    pend_open      = _get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1")
+    intel_size     = _dir_size_bytes(INTEL_DIR)
+    last_snap_ts   = _last_snapshot_info()
+    g0, loss, streak, total, acc = _daily_score_snapshot()
+
+    return (
+        "🩺 <b>Saúde do Guardião</b>\n"
+        f"⏱️ UTC: <code>{utc_iso()}</code>\n"
+        "—\n"
+        f"🗄️ timeline: <b>{timeline_cnt}</b>\n"
+        f"📚 ngram_stats: <b>{ngram_rows}</b> | amostras≈<b>{int(ngram_samples or 0)}</b>\n"
+        f"🧩 stats_pattern: chaves=<b>{pat_rows}</b> | eventos=<b>{int(pat_events or 0)}</b>\n"
+        f"🧠 stats_strategy: chaves=<b>{strat_rows}</b> | eventos=<b>{int(strat_events or 0)}</b>\n"
+        f"⏳ pendências abertas: <b>{pend_open}</b>\n"
+        f"💾 INTEL dir: <b>{_fmt_bytes(intel_size)}</b> | último snapshot: <code>{last_snap_ts}</code>\n"
+        "—\n"
+        f"📊 Placar (hoje - G0 only): G0=<b>{g0}</b> | Loss=<b>{loss}</b> | Total=<b>{total}</b>\n"
+        f"✅ Acerto: <b>{acc:.2f}%</b> | 🔥 Streak: <b>{streak}</b>\n"
+    )
+
+async def _health_reporter_task():
+    while True:
+        try:
+            await tg_broadcast(_health_text())
+        except Exception as e:
+            print(f"[HEALTH] erro ao enviar relatório: {e}")
+        await asyncio.sleep(30 * 60)
+
+async def _daily_reset_task():
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            wait = max(1.0, (tomorrow - now).total_seconds())
+            await asyncio.sleep(wait)
+
+            y = today_key_local()
+            exec_write("""
+              INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
+              VALUES (?,0,0,0,0,0)
+            """, (y,))
+            exec_write("""
+              INSERT OR REPLACE INTO daily_score_ia (yyyymmdd,g0,loss,streak)
+              VALUES (?,0,0,0)
+            """, (y,))
+            await tg_broadcast("🕛 <b>Reset diário executado (00:00 UTC)</b>\n📊 Placar geral e IA zerados para o novo dia.")
+        except Exception as e:
+            print(f"[RESET] erro: {e}")
+            await asyncio.sleep(60)
+
+# =========================
+# Pendências (FastResult: G0 imediato + recuperação G1/G2)
+# =========================
+def open_pending(strategy: Optional[str], suggested: int, source: str = "CHAN"):
+    exec_write("""
+        INSERT INTO pending_outcome
+        (created_at,strategy,suggested,stage,open,window_left,seen_numbers,announced,source)
+        VALUES (?,?,?,?,1,?, '', 0, ?)
+    """, (now_ts(), strategy or "", int(suggested), 0, MAX_STAGE, source))
+    try:
+        INTEL.start_signal(suggested=int(suggested), strategy=strategy)
+    except Exception as e:
+        print(f"[INTEL] start_signal error: {e}")
+
+# Conversão (geral) de 1 LOSS -> 1 GREEN ao recuperar
+def _convert_last_loss_to_green():
+    y = today_key_local()
+    row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+    if not row:
+        exec_write("""INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
+                      VALUES (?,0,0,0,0,0)""", (y,))
+        return
+    g0 = row["g0"] or 0
+    loss = row["loss"] or 0
+    streak = row["streak"] or 0
+    if loss > 0:
+        loss -= 1
+        g0   += 1
+        streak += 1
+        exec_write("""
+          INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
+          VALUES (?,?,?,?,?,?)
+        """, (y, g0, row["g1"] or 0, row["g2"] or 0, loss, streak))
+
+async def close_pending_with_result(n_real: int, event_kind: str):
+    rows = query_all("""
+        SELECT id,strategy,suggested,stage,open,window_left,seen_numbers,announced,source
+        FROM pending_outcome
+        WHERE open=1
+        ORDER BY id
+    """)
+    for r in rows:
+        pid   = int(r["id"])
+        strat = (r["strategy"] or "")
+        sug   = int(r["suggested"])
+        stage = int(r["stage"])
+        left  = int(r["window_left"])
+        announced = int(r["announced"])
+        source = (r["source"] or "CHAN").upper()
+
+        seen_txt = (r["seen_numbers"] or "")
+        seen_txt2 = (seen_txt + ("|" if seen_txt else "") + str(n_real))
+        exec_write("UPDATE pending_outcome SET seen_numbers=? WHERE id=?", (seen_txt2, pid))
+
+        hit = (n_real == sug)
+
+        if announced == 0:
+            # Primeira janela (G0) — anunciar e atualizar placares
+            if hit:
+                bump_pattern("PEND", sug, True)
+                if strat: bump_strategy(strat, sug, True)
+                update_daily_score(0, True)
+                if source == "IA":
+                    update_daily_score_ia(0, True)
+                await send_green_imediato(sug, "G0")
+                exec_write("UPDATE pending_outcome SET announced=1, open=0 WHERE id=?", (pid,))
+                # Placar geral e (se IA) o placar IA
+                await send_scoreboard()
+                if source == "IA":
+                    await send_scoreboard_ia()
+            else:
+                bump_pattern("PEND", sug, False)
+                if strat: bump_strategy(strat, sug, False)
+                update_daily_score(None, False)
+                if source == "IA":
+                    update_daily_score_ia(None, False)
+                await send_loss_imediato(sug, "G0")
+                exec_write("UPDATE pending_outcome SET announced=1 WHERE id=?", (pid,))
+                await send_scoreboard()
+                if source == "IA":
+                    await send_scoreboard_ia()
+
+                left -= 1
+                if left <= 0 or MAX_STAGE <= 1:
+                    exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
+                else:
+                    next_stage = min(stage+1, MAX_STAGE-1)
+                    exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
+        else:
+            # announced == 1: já anunciamos G0; agora estamos em recuperação G1/G2
+            left -= 1
+            if hit:
+                stxt = f"G{stage}"
+                await send_recovery(stxt)
+
+                # >>> aumenta taxa: ao recuperar, converte 1 LOSS -> 1 GREEN
+                try:
+                    _convert_last_loss_to_green()
+                    if source == "IA":
+                        _convert_last_loss_to_green_ia()
+                    await send_scoreboard()
+                    if source == "IA":
+                        await send_scoreboard_ia()
+                except Exception as _e:
+                    print(f"[SCORE] convert loss->green erro: {_e}")
+
+                # Marca estatística de recuperação por estágio
+                if stage == 1:
+                    try:
+                        bump_recov_g1(sug, True)
+                    except Exception as _e:
+                        print(f"[RECOV_G1] erro mark win: {_e}")
+
+                bump_pattern("RECOV", sug, True)
+                if strat: bump_strategy(strat, sug, True)
+                exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
+            else:
+                # Não bateu neste tick de recuperação
+                if left <= 0:
+                    # Falhou toda a janela de recuperação
+                    if stage >= 1:
+                        try:
+                            bump_recov_g1(sug, False)
+                        except Exception as _e:
+                            print(f"[RECOV_G1] erro mark loss: {_e}")
+                    exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
+                else:
+                    next_stage = min(stage+1, MAX_STAGE-1)
+                    exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
+
+    try:
+        still_open = query_one("SELECT 1 FROM pending_outcome WHERE open=1")
+        if not still_open:
+            INTEL.stop_signal()
+    except Exception as e:
+        print(f"[INTEL] stop_signal check error: {e}")
+
+# =========================
+# Predição (número seco)
+# =========================
+def ngram_backoff_score(tail: List[int], after_num: Optional[int], candidate: int) -> float:
+    score = 0.0
+    if not tail: return 0.0
+    if after_num is not None:
+        idxs = [i for i,v in enumerate(tail) if v == after_num]
+        if not idxs:
+            ctx4 = tail[-4:] if len(tail) >= 4 else []
+            ctx3 = tail[-3:] if len(tail) >= 3 else []
+            ctx2 = tail[-2:] if len(tail) >= 2 else []
+            ctx1 = tail[-1:] if len(tail) >= 1 else []
+        else:
+            i = idxs[-1]
+            ctx1 = tail[max(0,i):i+1]
+            ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
+            ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
+            ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
+    else:
+        ctx4 = tail[-4:] if len(tail) >= 4 else []
+        ctx3 = tail[-3:] if len(tail) >= 3 else []
+        ctx2 = tail[-2:] if len(tail) >= 2 else []
+        ctx1 = tail[-1:] if len(tail) >= 1 else []
+
+    parts = []
+    if len(ctx4)==4: parts.append((W4, prob_from_ngrams(ctx4[:-1], candidate)))
+    if len(ctx3)==3: parts.append((W3, prob_from_ngrams(ctx3[:-1], candidate)))
+    if len(ctx2)==2: parts.append((W2, prob_from_ngrams(ctx2[:-1], candidate)))
+    if len(ctx1)==1: parts.append((W1, prob_from_ngrams(ctx1[:-1], candidate)))
+    for w,p in parts: score += w*p
+    return score
+
+def confident_best(post: Dict[int,float], gap: float = GAP_MIN) -> Optional[int]:
+    a = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    if not a: return None
+    if len(a)==1: return a[0][0]
+    return a[0][0] if (a[0][1]-a[1][1]) >= gap else None
+
+def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], after_num: Optional[int]) -> Tuple[Optional[int],float,int,Dict[int,float]]:
+    if not base: base = [1,2,3,4]
+    hour_block = int(datetime.now(timezone.utc).hour // 2)
+    pat_key = f"{pattern_key}|h{hour_block}"
+
+    tail = get_recent_tail(WINDOW)
+    scores: Dict[int, float] = {}
+
+    # Regras “após X”: ignora se não tem lastro na cauda
+    if after_num is not None:
+        try:
+            last_idx = max([i for i, v in enumerate(tail) if v == after_num])
+        except ValueError:
+            return None, 0.0, len(tail), {k: 1/len(base) for k in base}
+        if (len(tail)-1 - last_idx) > 60:
+            return None, 0.0, len(tail), {k: 1/len(base) for k in base}
+
+    for c in base:
+        ng = ngram_backoff_score(tail, after_num, c)
+
+        rowp = query_one("SELECT wins, losses FROM stats_pattern WHERE pattern_key=? AND number=?", (pat_key, c))
+        pw = rowp["wins"] if rowp else 0
+        pl = rowp["losses"] if rowp else 0
+        p_pat = laplace_ratio(pw, pl)
+
+        p_str = 1/len(base)
+        if strategy:
+            rows = query_one("SELECT wins, losses FROM stats_strategy WHERE strategy=? AND number=?", (strategy, c))
+            sw = rows["wins"] if rows else 0
+            sl = rows["losses"] if rows else 0
+            p_str = laplace_ratio(sw, sl)
+
+        # leve boost por horário
+        boost = 1.0
+        if p_pat >= 0.60: boost = 1.05
+        elif p_pat <= 0.40: boost = 0.97
+
+        prior = 1.0/len(base)
+        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost
+        scores[c] = score
+
+    total = sum(scores.values()) or 1e-9
+    post = {k: v/total for k,v in scores.items()}
+
+    number = confident_best(post, gap=GAP_MIN)
+    conf = post.get(number, 0.0) if number is not None else 0.0
+
+    roww = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
+    samples = int((roww["s"] or 0) if roww else 0)
+
+    # Anti-repique: se último anunciado fechou LOSS com mesmo número, exija mais confiança
+    last = query_one("SELECT suggested, announced FROM pending_outcome ORDER BY id DESC LIMIT 1")
+    if last and number is not None and last["suggested"] == number and (last["announced"] or 0) == 1:
+        if post.get(number, 0.0) < (MIN_CONF_G0 + 0.08):
+            return None, 0.0, samples, post
+
+    # Filtro de qualidade (modo equilibrado)
+    top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
+    gap = (top2[0][1] - (top2[1][1] if len(top2) > 1 else 0.0)) if top2 else 0.0
+    enough_samples = samples >= MIN_SAMPLES
+    should_abstain = (
+        enough_samples and (
+            (number is None) or
+            (post.get(number, 0.0) < MIN_CONF_G0) or
+            (gap < MIN_GAP_G0)
+        )
+    )
+    if should_abstain:
+        return None, 0.0, samples, post
+
+    return number, conf, samples, post
+
+def build_suggestion_msg(number:int, base:List[int], pattern_key:str,
+                         after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
+    base_txt = ", ".join(str(x) for x in base) if base else "—"
+    aft_txt = f" após {after_num}" if after_num else ""
+    return (
+        f"🎯 <b>Número seco ({stage}):</b> <b>{number}</b>\n"
+        f"🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n"
+        f"🧮 <b>Base:</b> [{base_txt}]\n"
+        f"📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
+    )
+
+def build_suggestion_msg_ia(number:int, base:List[int], pattern_key:str,
+                            after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
+    base_txt = ", ".join(str(x) for x in base) if base else "—"
+    aft_txt = f" após {after_num}" if after_num else ""
+    label = SELF_LABEL_IA or "Tiro seco por IA"
+    return (
+        f"🎯 <b>{label} ({stage}):</b> <b>{number}</b>\n"
+        f"🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n"
+        f"🧮 <b>Base:</b> [{base_txt}]\n"
+        f"📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
+    )
+
+# =========================
+# Webhook models
+# =========================
+class Update(BaseModel):
+    update_id: int
+    channel_post: Optional[dict] = None
+    message: Optional[dict] = None
+    edited_channel_post: Optional[dict] = None
+    edited_message: Optional[dict] = None
+
+# =========================
+# Tasks auxiliares (INTEL)
 # =========================
 def _intel_ensure_dir():
     os.makedirs(INTEL_DIR, exist_ok=True)
@@ -621,343 +1123,45 @@ class IntelManager:
 INTEL = IntelManager()
 
 # =========================
-# Health (30 min) + Reset diário 00:00 UTC
+# Auto-fire (IA)
 # =========================
-def _fmt_bytes(n: int) -> str:
-    try:
-        n = float(n)
-    except Exception:
-        return "—"
-    for unit in ["B","KB","MB","GB","TB","PB"]:
-        if n < 1024.0:
-            return f"{n:.1f} {unit}"
-        n /= 1024.0
-    return f"{n:.1f} EB"
+_last_auto_fire_ts: float = 0.0
 
-def _get_scalar(sql: str, params: tuple = (), default: int|float = 0):
-    row = query_one(sql, params)
-    if not row:
-        return default
-    try:
-        return row[0] if row[0] is not None else default
-    except Exception:
-        keys = row.keys()
-        return row[keys[0]] if keys and row[keys[0]] is not None else default
-
-def _daily_score_snapshot():
-    y = today_key_local()
-    row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
-    if not row:
-        return 0,0,0,0,0.0
-    g0 = row["g0"] or 0
-    loss = row["loss"] or 0
-    streak = row["streak"] or 0
-    total = g0 + loss
-    acc = (g0/total*100.0) if total else 0.0
-    return g0, loss, streak, total, acc
-
-def _last_snapshot_info():
-    try:
-        latest_path = os.path.join(INTEL_DIR, "snapshots", "latest_top.json")
-        if not os.path.exists(latest_path):
-            return "—"
-        ts = os.path.getmtime(latest_path)
-        return datetime.utcfromtimestamp(ts).replace(tzinfo=timezone.utc).isoformat()
-    except Exception:
-        return "—"
-
-def _health_text() -> str:
-    timeline_cnt   = _get_scalar("SELECT COUNT(*) FROM timeline")
-    ngram_rows     = _get_scalar("SELECT COUNT(*) FROM ngram_stats")
-    ngram_samples  = _get_scalar("SELECT SUM(weight) FROM ngram_stats")
-    pat_rows       = _get_scalar("SELECT COUNT(*) FROM stats_pattern")
-    pat_events     = _get_scalar("SELECT SUM(wins+losses) FROM stats_pattern")
-    strat_rows     = _get_scalar("SELECT COUNT(*) FROM stats_strategy")
-    strat_events   = _get_scalar("SELECT SUM(wins+losses) FROM stats_strategy")
-    pend_open      = _get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1")
-    intel_size     = _dir_size_bytes(INTEL_DIR)
-    last_snap_ts   = _last_snapshot_info()
-    g0, loss, streak, total, acc = _daily_score_snapshot()
-
-    return (
-        "🩺 <b>Saúde do Guardião</b>\n"
-        f"⏱️ UTC: <code>{utc_iso()}</code>\n"
-        "—\n"
-        f"🗄️ timeline: <b>{timeline_cnt}</b>\n"
-        f"📚 ngram_stats: <b>{ngram_rows}</b> | amostras≈<b>{int(ngram_samples or 0)}</b>\n"
-        f"🧩 stats_pattern: chaves=<b>{pat_rows}</b> | eventos=<b>{int(pat_events or 0)}</b>\n"
-        f"🧠 stats_strategy: chaves=<b>{strat_rows}</b> | eventos=<b>{int(strat_events or 0)}</b>\n"
-        f"⏳ pendências abertas: <b>{pend_open}</b>\n"
-        f"💾 INTEL dir: <b>{_fmt_bytes(intel_size)}</b> | último snapshot: <code>{last_snap_ts}</code>\n"
-        "—\n"
-        f"📊 Placar (hoje - G0 only): G0=<b>{g0}</b> | Loss=<b>{loss}</b> | Total=<b>{total}</b>\n"
-        f"✅ Acerto: <b>{acc:.2f}%</b> | 🔥 Streak: <b>{streak}</b>\n"
-    )
-
-async def _health_reporter_task():
+async def _auto_fire_task():
+    global _last_auto_fire_ts
     while True:
         try:
-            await tg_broadcast(_health_text())
+            if not AUTO_FIRE:
+                await asyncio.sleep(2.0); continue
+
+            # Não dispara se houver pendência aberta
+            open_cnt = _get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1")
+            if open_cnt > 0:
+                await asyncio.sleep(1.0); continue
+
+            # Usa mesmo motor de sugestão (NGRAM/backoff + stats)
+            base, pattern_key = [1,2,3,4], "GEN"
+            number, conf, samples, post = suggest_number(base, pattern_key, strategy=None, after_num=None)
+
+            nowt = time.time()
+            if number is not None and conf >= SELF_TH_G0 and samples >= MIN_SAMPLES:
+                g1_ok = True
+                if SELF_REQUIRE_G1:
+                    g1_ok = recov_g1_is_perfect(number, lookback=SELF_G1_LOOKBACK)
+
+                if g1_ok and (nowt - _last_auto_fire_ts) >= SELF_COOLDOWN_S:
+                    open_pending(strategy=None, suggested=int(number), source="IA")
+                    out = build_suggestion_msg_ia(int(number), base, pattern_key, None, conf, samples, stage="G0")
+                    out = "🤖 [AUTO]\n" + out
+                    await tg_broadcast(out)
+                    _last_auto_fire_ts = nowt
+
+            await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            print(f"[HEALTH] erro ao enviar relatório: {e}")
-        await asyncio.sleep(30 * 60)
-
-async def _daily_reset_task():
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            wait = max(1.0, (tomorrow - now).total_seconds())
-            await asyncio.sleep(wait)
-
-            y = today_key_local()
-            exec_write("""
-              INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
-              VALUES (?,0,0,0,0,0)
-            """, (y,))
-            await tg_broadcast("🕛 <b>Reset diário executado (00:00 UTC)</b>\n📊 Placar zerado para o novo dia.")
-        except Exception as e:
-            print(f"[RESET] erro: {e}")
-            await asyncio.sleep(60)
-
-# =========================
-# Pendências (FastResult: G0 imediato + recuperação G1/G2)
-# =========================
-def open_pending(strategy: Optional[str], suggested: int):
-    exec_write("""
-        INSERT INTO pending_outcome
-        (created_at,strategy,suggested,stage,open,window_left,seen_numbers,announced)
-        VALUES (?,?,?,?,1,?, '', 0)
-    """, (now_ts(), strategy or "", int(suggested), 0, MAX_STAGE))
-    try:
-        INTEL.start_signal(suggested=int(suggested), strategy=strategy)
-    except Exception as e:
-        print(f"[INTEL] start_signal error: {e}")
-
-# Conversão de 1 LOSS -> 1 GREEN ao recuperar (aumenta a taxa)
-def _convert_last_loss_to_green():
-    y = today_key_local()
-    row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
-    if not row:
-        exec_write("""INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
-                      VALUES (?,0,0,0,0,0)""", (y,))
-        return
-    g0 = row["g0"] or 0
-    loss = row["loss"] or 0
-    streak = row["streak"] or 0
-    if loss > 0:
-        loss -= 1
-        g0   += 1
-        streak += 1
-        exec_write("""
-          INSERT OR REPLACE INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
-          VALUES (?,?,?,?,?,?)
-        """, (y, g0, row["g1"] or 0, row["g2"] or 0, loss, streak))
-
-async def close_pending_with_result(n_real: int, event_kind: str):
-    rows = query_all("""
-        SELECT id,strategy,suggested,stage,open,window_left,seen_numbers,announced
-        FROM pending_outcome
-        WHERE open=1
-        ORDER BY id
-    """)
-    for r in rows:
-        pid   = int(r["id"])
-        strat = (r["strategy"] or "")
-        sug   = int(r["suggested"])
-        stage = int(r["stage"])
-        left  = int(r["window_left"])
-        announced = int(r["announced"])
-
-        seen_txt = (r["seen_numbers"] or "")
-        seen_txt2 = (seen_txt + ("|" if seen_txt else "") + str(n_real))
-        exec_write("UPDATE pending_outcome SET seen_numbers=? WHERE id=?", (seen_txt2, pid))
-
-        hit = (n_real == sug)
-
-        if announced == 0:
-            if hit:
-                bump_pattern("PEND", sug, True)
-                if strat: bump_strategy(strat, sug, True)
-                update_daily_score(0, True)
-                await send_green_imediato(sug, "G0")
-                exec_write("UPDATE pending_outcome SET announced=1, open=0 WHERE id=?", (pid,))
-                await send_scoreboard()
-            else:
-                bump_pattern("PEND", sug, False)
-                if strat: bump_strategy(strat, sug, False)
-                update_daily_score(None, False)
-                await send_loss_imediato(sug, "G0")
-                exec_write("UPDATE pending_outcome SET announced=1 WHERE id=?", (pid,))
-                await send_scoreboard()
-
-                left -= 1
-                if left <= 0 or MAX_STAGE <= 1:
-                    exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-                else:
-                    next_stage = min(stage+1, MAX_STAGE-1)
-                    exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
-        else:
-            left -= 1
-            if hit:
-                stxt = f"G{stage}"
-                await send_recovery(stxt)
-
-                # >>> aumenta taxa: ao recuperar, converte 1 LOSS -> 1 GREEN
-                try:
-                    _convert_last_loss_to_green()
-                    await send_scoreboard()
-                except Exception as _e:
-                    print(f"[SCORE] convert loss->green erro: {_e}")
-
-                bump_pattern("RECOV", sug, True)
-                if strat: bump_strategy(strat, sug, True)
-                exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-            else:
-                if left <= 0:
-                    exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-                else:
-                    next_stage = min(stage+1, MAX_STAGE-1)
-                    exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
-
-    try:
-        still_open = query_one("SELECT 1 FROM pending_outcome WHERE open=1")
-        if not still_open:
-            INTEL.stop_signal()
-    except Exception as e:
-        print(f"[INTEL] stop_signal check error: {e}")
-
-# =========================
-# Predição (número seco)
-# =========================
-def ngram_backoff_score(tail: List[int], after_num: Optional[int], candidate: int) -> float:
-    score = 0.0
-    if not tail: return 0.0
-    if after_num is not None:
-        idxs = [i for i,v in enumerate(tail) if v == after_num]
-        if not idxs:
-            ctx4 = tail[-4:] if len(tail) >= 4 else []
-            ctx3 = tail[-3:] if len(tail) >= 3 else []
-            ctx2 = tail[-2:] if len(tail) >= 2 else []
-            ctx1 = tail[-1:] if len(tail) >= 1 else []
-        else:
-            i = idxs[-1]
-            ctx1 = tail[max(0,i):i+1]
-            ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
-            ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
-            ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
-    else:
-        ctx4 = tail[-4:] if len(tail) >= 4 else []
-        ctx3 = tail[-3:] if len(tail) >= 3 else []
-        ctx2 = tail[-2:] if len(tail) >= 2 else []
-        ctx1 = tail[-1:] if len(tail) >= 1 else []
-
-    parts = []
-    if len(ctx4)==4: parts.append((W4, prob_from_ngrams(ctx4[:-1], candidate)))
-    if len(ctx3)==3: parts.append((W3, prob_from_ngrams(ctx3[:-1], candidate)))
-    if len(ctx2)==2: parts.append((W2, prob_from_ngrams(ctx2[:-1], candidate)))
-    if len(ctx1)==1: parts.append((W1, prob_from_ngrams(ctx1[:-1], candidate)))
-    for w,p in parts: score += w*p
-    return score
-
-def confident_best(post: Dict[int,float], gap: float = GAP_MIN) -> Optional[int]:
-    a = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    if not a: return None
-    if len(a)==1: return a[0][0]
-    return a[0][0] if (a[0][1]-a[1][1]) >= gap else None
-
-def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], after_num: Optional[int]) -> Tuple[Optional[int],float,int,Dict[int,float]]:
-    if not base: base = [1,2,3,4]
-    hour_block = int(datetime.now(timezone.utc).hour // 2)
-    pat_key = f"{pattern_key}|h{hour_block}"
-
-    tail = get_recent_tail(WINDOW)
-    scores: Dict[int, float] = {}
-
-    # Regras “após X”: ignora se não tem lastro na cauda
-    if after_num is not None:
-        try:
-            last_idx = max([i for i, v in enumerate(tail) if v == after_num])
-        except ValueError:
-            return None, 0.0, len(tail), {k: 1/len(base) for k in base}
-        if (len(tail)-1 - last_idx) > 60:
-            return None, 0.0, len(tail), {k: 1/len(base) for k in base}
-
-    for c in base:
-        ng = ngram_backoff_score(tail, after_num, c)
-
-        rowp = query_one("SELECT wins, losses FROM stats_pattern WHERE pattern_key=? AND number=?", (pat_key, c))
-        pw = rowp["wins"] if rowp else 0
-        pl = rowp["losses"] if rowp else 0
-        p_pat = laplace_ratio(pw, pl)
-
-        p_str = 1/len(base)
-        if strategy:
-            rows = query_one("SELECT wins, losses FROM stats_strategy WHERE strategy=? AND number=?", (strategy, c))
-            sw = rows["wins"] if rows else 0
-            sl = rows["losses"] if rows else 0
-            p_str = laplace_ratio(sw, sl)
-
-        # leve boost por horário
-        boost = 1.0
-        if p_pat >= 0.60: boost = 1.05
-        elif p_pat <= 0.40: boost = 0.97
-
-        prior = 1.0/len(base)
-        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost
-        scores[c] = score
-
-    total = sum(scores.values()) or 1e-9
-    post = {k: v/total for k,v in scores.items()}
-
-    number = confident_best(post, gap=GAP_MIN)
-    conf = post.get(number, 0.0) if number is not None else 0.0
-
-    roww = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
-    samples = int((roww["s"] or 0) if roww else 0)
-
-    # Anti-repique: se último anunciado fechou LOSS com mesmo número, exija mais confiança
-    last = query_one("SELECT suggested, announced FROM pending_outcome ORDER BY id DESC LIMIT 1")
-    if last and number is not None and last["suggested"] == number and (last["announced"] or 0) == 1:
-        if post.get(number, 0.0) < (MIN_CONF_G0 + 0.08):
-            return None, 0.0, samples, post
-
-    # Filtro de qualidade (modo equilibrado)
-    top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
-    gap = (top2[0][1] - (top2[1][1] if len(top2) > 1 else 0.0)) if top2 else 0.0
-    enough_samples = samples >= MIN_SAMPLES
-    should_abstain = (
-        enough_samples and (
-            (number is None) or
-            (post.get(number, 0.0) < MIN_CONF_G0) or
-            (gap < MIN_GAP_G0)
-        )
-    )
-    if should_abstain:
-        return None, 0.0, samples, post
-
-    return number, conf, samples, post
-
-def build_suggestion_msg(number:int, base:List[int], pattern_key:str,
-                         after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
-    base_txt = ", ".join(str(x) for x in base) if base else "—"
-    aft_txt = f" após {after_num}" if after_num else ""
-    return (
-        f"🎯 <b>Número seco ({stage}):</b> <b>{number}</b>\n"
-        f"🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n"
-        f"🧮 <b>Base:</b> [{base_txt}]\n"
-        f"📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
-    )
-
-# =========================
-# Webhook models
-# =========================
-class Update(BaseModel):
-    update_id: int
-    channel_post: Optional[dict] = None
-    message: Optional[dict] = None
-    edited_channel_post: Optional[dict] = None
-    edited_message: Optional[dict] = None
+            print(f"[AUTO] erro: {e}")
+            await asyncio.sleep(2.0)
 
 # =========================
 # Routes
@@ -982,6 +1186,10 @@ async def _boot_analyzer():
         asyncio.create_task(_daily_reset_task())
     except Exception as e:
         print(f"[RESET] startup error: {e}")
+    try:
+        asyncio.create_task(_auto_fire_task())
+    except Exception as e:
+        print(f"[AUTO] startup error: {e}")
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -1060,7 +1268,8 @@ async def webhook(token: str, request: Request):
       VALUES (?,?,?,?,?,?,?)
     """, (strategy, source_msg_id, int(number), "CTX", pattern_key, "G0", now_ts()))
 
-    open_pending(strategy, int(number))
+    # Origem: CHAN (sinal do canal). IA é aberta no _auto_fire_task
+    open_pending(strategy, int(number), source="CHAN")
 
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_broadcast(out)
