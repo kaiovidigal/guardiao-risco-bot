@@ -17,6 +17,7 @@
 #   INTEL_MAX_BYTES (default: 1_000_000_000 -> 1 GB)
 #   INTEL_SIGNAL_INTERVAL (default: 20)
 #   INTEL_ANALYZE_INTERVAL (default: 2)
+#   FLUSH_KEY (default: meusegredo123)  # chave simples p/ /debug/flush
 
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
@@ -62,6 +63,9 @@ TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()   # -100... ou @canal (apenas leitura)
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 
+# ===== Chave simples para endpoints /debug =====
+FLUSH_KEY = os.getenv("FLUSH_KEY", "meusegredo123").strip()
+
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN:
     print("⚠️ Defina TG_BOT_TOKEN e WEBHOOK_TOKEN.")
 
@@ -91,7 +95,7 @@ GAP_MIN = 0.08
 # Filtros de qualidade para G0 (modo equilibrado)
 MIN_CONF_G0 = 0.55      # confiança mínima do top1 (filtro base)
 MIN_GAP_G0  = 0.04      # distância top1 - top2
-MIN_SAMPLES = 20000     # só aplica filtros rígidos quando já há amostra suficiente
+MIN_SAMPLES = 1000      # começa a liberar FIRE com ~1k amostras (fixo, sem ENV)
 
 # =========================
 # Inteligência em disco (/var/data) — ENV
@@ -106,7 +110,7 @@ INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "2"))  # anal
 # =========================
 SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.7.0")
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.8.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -635,6 +639,15 @@ def _last_snapshot_info():
     except Exception:
         return "—"
 
+# ===== Debug de decisão IA2 (motivo do último NÃO-FIRE/FIRE) =====
+_ia2_last_reason: str = "—"
+_ia2_last_reason_ts: int = 0
+def _mark_reason(r: str):
+    """Grava, em memória, o motivo do último NÃO-FIRE (ou FIRE) com timestamp."""
+    global _ia2_last_reason, _ia2_last_reason_ts
+    _ia2_last_reason = r
+    _ia2_last_reason_ts = now_ts()
+
 def _health_text() -> str:
     timeline_cnt   = _get_scalar("SELECT COUNT(*) FROM timeline")
     ngram_rows     = _get_scalar("SELECT COUNT(*) FROM ngram_stats")
@@ -650,6 +663,13 @@ def _health_text() -> str:
 
     # IA snapshot
     ia_g0, ia_loss, ia_total, ia_acc = _daily_score_snapshot_ia()
+
+    # NOVO: motivo do último NÃO-FIRE/FIRE
+    try:
+        last_reason_age = max(0, now_ts() - (_ia2_last_reason_ts or now_ts()))
+        last_reason_line = f"🤖 Motivo último NÃO-FIRE/FIRE: {_ia2_last_reason} (há {last_reason_age}s)"
+    except Exception:
+        last_reason_line = "🤖 Motivo último NÃO-FIRE/FIRE: —"
 
     return (
         "🩺 <b>Saúde do Guardião</b>\n"
@@ -667,15 +687,26 @@ def _health_text() -> str:
         "—\n"
         f"🤖 <b>IA</b> G0=<b>{ia_g0}</b> | Loss=<b>{ia_loss}</b> | Total=<b>{ia_total}</b>\n"
         f"✅ <b>IA Acerto (dia):</b> <b>{ia_acc:.2f}%</b>\n"
+        f"{last_reason_line}\n"
     )
 
 async def _health_reporter_task():
     while True:
         try:
+            # 1) Saúde do Guardião
             await tg_broadcast(_health_text())
+
+            # 2) Relatório Canal x IA (integrado no mesmo ciclo)
+            try:
+                txt = _mk_relatorio_text(days=7)  # janela padrão fixa no código
+                await tg_broadcast(txt)
+            except Exception as e:
+                print(f"[RELATORIO] erro ao gerar/enviar: {e}")
+
         except Exception as e:
             print(f"[HEALTH] erro ao enviar relatório: {e}")
-        await asyncio.sleep(30 * 60)
+
+        await asyncio.sleep(30 * 60)  # 30 minutos
 
 async def _daily_reset_task():
     while True:
@@ -1030,7 +1061,13 @@ async def ia2_process_once():
     base, pattern_key, strategy, after_num = [], "GEN", None, None
     tail = get_recent_tail(WINDOW)
     best, conf_raw, tail_len, post = suggest_number(base, pattern_key, strategy, after_num)
+
     if best is None:
+        # Não chegou a um número confiável
+        if tail_len < MIN_SAMPLES:
+            _mark_reason(f"amostra_insuficiente({tail_len}<{MIN_SAMPLES})")
+        else:
+            _mark_reason("sem_numero_confiavel(conf/gap)")
         return
 
     # gap top1-top2
@@ -1040,17 +1077,31 @@ async def ia2_process_once():
         if len(top) >= 2:
             gap = top[0][1] - top[1][1]
 
-    # Fila única: se tiver pendência aberta (G0→G1→G2), não dispara
+    # Fila única: se tiver pendência aberta (G0→G2), não dispara
     if _has_open_pending():
+        _mark_reason("pendencia_aberta(aguardando G1/G2)")
         return
 
-    # Só FIRE, com checagens anti-spam/cooldown
+    # Bloqueios de antispam/cooldown
+    if _ia2_blocked_now():
+        _mark_reason("cooldown_pos_loss")
+        return
+    if not _ia2_antispam_ok():
+        _mark_reason("limite_hora_atingido")
+        return
+    if now_ts() - _ia2_last_fire_ts < IA2_MIN_SECONDS_BETWEEN_FIRE:
+        _mark_reason("espacamento_minimo")
+        return
+
+    # Regra de relevância (confiança/gap + base suficiente)
     if _relevance_ok(conf_raw, gap, tail_len) and _ia2_can_fire_now():
         open_pending(strategy, best, source="IA")     # abre pendência como G0
         await ia2_send_signal(best, conf_raw, tail_len, "FIRE")
         _ia2_mark_fire_sent()
+        _mark_reason(f"FIRE(best={best}, conf={conf_raw:.3f}, gap={gap:.3f}, tail={tail_len})")
         return
-    # Sem SOFT/INFO — silenciado
+
+    _mark_reason(f"reprovado_relevancia(conf={conf_raw:.3f}, gap={gap:.3f}, tail={tail_len})")
 
 # =========================
 # INTEL (stub simples p/ snapshots de atividade)
@@ -1077,6 +1128,67 @@ class _IntelStub:
         self._last_num = None
 
 INTEL = _IntelStub(INTEL_DIR)
+
+# =========================
+# Helpers de relatório Canal x IA (integrado)
+# =========================
+def _read_daily_score_days(limit_days:int=7):
+    rows = query_all("""
+        SELECT yyyymmdd, g0, g1, g2, loss, streak
+        FROM daily_score
+        ORDER BY yyyymmdd DESC
+        LIMIT ?
+    """, (limit_days,))
+    return rows
+
+def _read_daily_score_ia_days(limit_days:int=7):
+    rows = query_all("""
+        SELECT yyyymmdd, g0, loss, streak
+        FROM daily_score_ia
+        ORDER BY yyyymmdd DESC
+        LIMIT ?
+    """, (limit_days,))
+    return rows
+
+def _fmt_pct(num:int, den:int) -> float:
+    return (num/den*100.0) if den else 0.0
+
+def _mk_relatorio_text(days:int=7) -> str:
+    days = max(1, min(int(days), 30))
+
+    # Hoje (canal)
+    y = today_key_local()
+    r = query_one("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+    g0 = (r["g0"] if r else 0); loss = (r["loss"] if r else 0)
+    acc_today = _fmt_pct(g0, g0+loss)
+
+    # Hoje (IA)
+    ria = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
+    ia_g0 = (ria["g0"] if ria else 0); ia_loss = (ria["loss"] if ria else 0)
+    ia_acc_today = _fmt_pct(ia_g0, ia_g0+ia_loss)
+
+    # Janela N dias
+    chan_rows = _read_daily_score_days(days)
+    ia_rows   = _read_daily_score_ia_days(days)
+
+    sum_g0 = sum((rr["g0"] or 0) for rr in chan_rows)
+    sum_loss = sum((rr["loss"] or 0) for rr in chan_rows)
+    acc_ndays = _fmt_pct(sum_g0, sum_g0+sum_loss)
+
+    sum_ia_g0 = sum((rr["g0"] or 0) for rr in ia_rows)
+    sum_ia_loss = sum((rr["loss"] or 0) for rr in ia_rows)
+    ia_acc_ndays = _fmt_pct(sum_ia_g0, sum_ia_g0+sum_ia_loss)
+
+    return (
+        "📈 <b>Relatório de Desempenho</b>\n"
+        f"🗓️ Janela: <b>hoje</b> e últimos <b>{days}</b> dias\n"
+        "—\n"
+        f"📣 <b>Canal (hoje)</b>: G0=<b>{g0}</b> | Loss=<b>{loss}</b> | Acerto=<b>{acc_today:.2f}%</b>\n"
+        f"🤖 <b>IA (hoje)</b>: G0=<b>{ia_g0}</b> | Loss=<b>{ia_loss}</b> | Acerto=<b>{ia_acc_today:.2f}%</b>\n"
+        "—\n"
+        f"📣 <b>Canal ({days}d)</b>: G0=<b>{sum_g0}</b> | Loss=<b>{sum_loss}</b> | Acerto=<b>{acc_ndays:.2f}%</b>\n"
+        f"🤖 <b>IA ({days}d)</b>: G0=<b>{sum_ia_g0}</b> | Loss=<b>{sum_ia_loss}</b> | Acerto=<b>{ia_acc_ndays:.2f}%</b>\n"
+    )
 
 # =========================
 # Webhook models
@@ -1209,3 +1321,114 @@ async def webhook(token: str, request: Request):
     # roda IA após abrir janela do canal (não dispara nada pois há pendência)
     await ia2_process_once()
     return {"ok": True, "sent": True, "number": number, "conf": conf, "samples": samples}
+
+# =========================
+# ENDPOINTS DE DEBUG
+# =========================
+# Ver amostras atuais x mínimo (sem proteger por chave)
+@app.get("/debug/samples")
+async def debug_samples():
+    row = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
+    samples = int((row["s"] or 0) if row else 0)
+    return {"samples": samples, "MIN_SAMPLES": MIN_SAMPLES, "enough_samples": samples >= MIN_SAMPLES}
+
+# Motivo do último NÃO-FIRE/FIRE
+@app.get("/debug/reason")
+async def debug_reason():
+    try:
+        age = max(0, now_ts() - (_ia2_last_reason_ts or now_ts()))
+        return {"last_reason": _ia2_last_reason, "last_reason_age_seconds": age}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Estado agregado
+@app.get("/debug/state")
+async def debug_state():
+    try:
+        row_ng = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
+        samples = int((row_ng["s"] or 0) if row_ng else 0)
+
+        pend_open = _get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1")
+
+        reason_age = max(0, now_ts() - (_ia2_last_reason_ts or now_ts()))
+        last_reason = _ia2_last_reason
+
+        y = today_key_local()
+        r = query_one("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+        g0 = (r["g0"] if r else 0); loss = (r["loss"] if r else 0)
+        acc = (g0/(g0+loss)) if (g0+loss)>0 else 0.0
+
+        ria = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
+        ia_g0 = (ria["g0"] if ria else 0); ia_loss = (ria["loss"] if ria else 0)
+        ia_acc = (ia_g0/(ia_g0+ia_loss)) if (ia_g0+ia_loss)>0 else 0.0
+
+        hb = _ia2_hour_key()
+        cooldown_remaining = max(0, (_ia2_blocked_until_ts or 0) - now_ts())
+        last_fire_age = max(0, now_ts() - (_ia2_last_fire_ts or 0))
+
+        cfg = {
+            "MIN_SAMPLES": MIN_SAMPLES,
+            "IA2_TIER_STRICT": IA2_TIER_STRICT,
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
+            "IA2_DELTA_GAP": IA2_DELTA_GAP,
+            "IA2_MAX_PER_HOUR": IA2_MAX_PER_HOUR,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": IA2_MIN_SECONDS_BETWEEN_FIRE,
+            "IA2_COOLDOWN_AFTER_LOSS": IA2_COOLDOWN_AFTER_LOSS,
+            "INTEL_ANALYZE_INTERVAL": INTEL_ANALYZE_INTERVAL,
+        }
+
+        return {
+            "samples": samples,
+            "enough_samples": samples >= MIN_SAMPLES,
+            "pendencias_abertas": int(pend_open),
+            "last_reason": last_reason,
+            "last_reason_age_seconds": int(reason_age),
+            "hour_bucket": hb,
+            "fires_enviados_nesta_hora": _ia2_sent_this_hour,
+            "cooldown_pos_loss_seconds": int(cooldown_remaining),
+            "ultimo_fire_ha_seconds": int(last_fire_age),
+            "placar_canal_hoje": {"g0": int(g0), "loss": int(loss), "acc_pct": round(acc*100, 2)},
+            "placar_ia_hoje": {"g0": int(ia_g0), "loss": int(ia_loss), "acc_pct": round(ia_acc*100, 2)},
+            "config": cfg,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ===== Flush manual (antispam) =====
+_last_flush_ts: int = 0
+
+# Dispara imediatamente: Saúde do Guardião + Relatório Canal x IA (com chave)
+@app.get("/debug/flush")
+async def debug_flush(request: Request, days: int = 7, key: str = ""):
+    global _last_flush_ts
+    try:
+        # Checagem de chave
+        if not key or key != FLUSH_KEY:
+            return {"ok": False, "error": "unauthorized"}
+
+        # Antispam: 60s
+        now = now_ts()
+        if now - (_last_flush_ts or 0) < 60:
+            return {
+                "ok": False,
+                "error": "flush_cooldown",
+                "retry_after_seconds": 60 - (now - (_last_flush_ts or 0))
+            }
+
+        # 1) Saúde do Guardião
+        try:
+            await tg_broadcast(_health_text())
+        except Exception as e:
+            print(f"[FLUSH] erro ao enviar saúde: {e}")
+
+        # 2) Relatório Canal x IA
+        try:
+            txt = _mk_relatorio_text(days=max(1, min(days, 30)))
+            await tg_broadcast(txt)
+        except Exception as e:
+            print(f"[FLUSH] erro ao enviar relatório: {e}")
+
+        _last_flush_ts = now
+        return {"ok": True, "flushed": True, "days": max(1, min(days, 30))}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
