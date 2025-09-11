@@ -155,10 +155,22 @@ IA2_DELTA_GAP            = 0.03   # tolerancia no FIRE quando gap for grande
 IA2_MAX_PER_HOUR         = 10     # antispam/hora (so FIRE)
 IA2_COOLDOWN_AFTER_LOSS  = 20     # segundos de respiro apos 1 loss (so FIRE)
 
+# >>> NOVO: Antispam para SOFT/INFO <<<
+IA2_SOFT_MIN_INTERVAL    = 25     # seg entre mensagens SOFT
+IA2_INFO_MIN_INTERVAL    = 25     # seg entre mensagens INFO
+IA2_MAX_SOFT_PER_MIN     = 4      # SOFT por minuto
+IA2_MAX_INFO_PER_MIN     = 2      # INFO por minuto
+
 # Estado volatil (memoria)
 _ia2_blocked_until_ts: int = 0
 _ia2_sent_this_hour: int = 0
 _ia2_hour_bucket: Optional[int] = None
+
+_soft_last_ts: int = 0
+_info_last_ts: int = 0
+_minute_bucket: Optional[int] = None
+_soft_this_min: int = 0
+_info_this_min: int = 0
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -856,6 +868,43 @@ def _ia_set_post_loss_block():
     global _ia2_blocked_until_ts
     _ia2_blocked_until_ts = now_ts() + int(IA2_COOLDOWN_AFTER_LOSS)
 
+# ---- NOVO: antispam para SOFT/INFO (intervalo + por minuto) ----
+def _minute_key() -> int:
+    # chave por minuto UTC
+    return int(datetime.now(timezone.utc).strftime("%Y%m%d%H%M"))
+
+def _reset_minute_bucket_if_needed():
+    global _minute_bucket, _soft_this_min, _info_this_min
+    mb = _minute_key()
+    if _minute_bucket != mb:
+        _minute_bucket = mb
+        _soft_this_min = 0
+        _info_this_min = 0
+
+def _soft_allowed_now() -> bool:
+    global _soft_last_ts, _soft_this_min
+    _reset_minute_bucket_if_needed()
+    now = now_ts()
+    if (now - _soft_last_ts) < IA2_SOFT_MIN_INTERVAL:
+        return False
+    if _soft_this_min >= IA2_MAX_SOFT_PER_MIN:
+        return False
+    _soft_last_ts = now
+    _soft_this_min += 1
+    return True
+
+def _info_allowed_now() -> bool:
+    global _info_last_ts, _info_this_min
+    _reset_minute_bucket_if_needed()
+    now = now_ts()
+    if (now - _info_last_ts) < IA2_INFO_MIN_INTERVAL:
+        return False
+    if _info_this_min >= IA2_MAX_INFO_PER_MIN:
+        return False
+    _info_last_ts = now
+    _info_this_min += 1
+    return True
+
 async def close_pending_with_result(n_real: int, event_kind: str):
     rows = query_all("""
         SELECT id,strategy,suggested,stage,open,window_left,seen_numbers,announced,source
@@ -1103,20 +1152,23 @@ async def ia2_process_once():
         _ia2_mark_sent()
         return
 
+    # SOFT/INFO com antispam dedicado
     if soft:
-        await tg_broadcast(
-            f"🤖 <b>{SELF_LABEL_IA} [SOFT]</b>\n"
-            f"• Sugestao: <b>{best}</b>\n"
-            f"• Conf: <b>{conf_raw*100:.2f}%</b> | Gap: <b>{gap:.3f}</b> | Amostra≈<b>{tail_len}</b>\n"
-            "ℹ️ Exploratória — sem janela."
-        )
+        if _soft_allowed_now():
+            await tg_broadcast(
+                f"🤖 <b>{SELF_LABEL_IA} [SOFT]</b>\n"
+                f"• Sugestao: <b>{best}</b>\n"
+                f"• Conf: <b>{conf_raw*100:.2f}%</b> | Gap: <b>{gap:.3f}</b> | Amostra≈<b>{tail_len}</b>\n"
+                "ℹ️ Exploratória — sem janela."
+            )
     else:
-        await tg_broadcast(
-            f"🤖 <b>{SELF_LABEL_IA} [INFO]</b>\n"
-            f"• Candidato atual: <b>{best}</b>\n"
-            f"• Conf: <b>{conf_raw*100:.2f}%</b> | Gap: <b>{gap:.3f}</b> | Amostra≈<b>{tail_len}</b>\n"
-            "ℹ️ Coletando base — sem janela."
-        )
+        if _info_allowed_now():
+            await tg_broadcast(
+                f"🤖 <b>{SELF_LABEL_IA} [INFO]</b>\n"
+                f"• Candidato atual: <b>{best}</b>\n"
+                f"• Conf: <b>{conf_raw*100:.2f}%</b> | Gap: <b>{gap:.3f}</b> | Amostra≈<b>{tail_len}</b>\n"
+                "ℹ️ Coletando base — sem janela."
+            )
 
 async def _ia2_analyzer_task():
     while True:
