@@ -22,6 +22,7 @@
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timezone, timedelta
+from collections import Counter  # <<< ADICIONADO (para top2 da cauda)
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -110,7 +111,7 @@ INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "2"))  # anal
 # =========================
 SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.9.0")
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.9.1")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -1003,6 +1004,11 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
     tail = get_recent_tail(WINDOW)
     scores: Dict[int, float] = {}
 
+    # Frequência recente: top-2 números na cauda de 40 (para boost leve)
+    tail40 = tail[-40:] if len(tail) >= 40 else tail[:]
+    freq40 = Counter(tail40)
+    top2_tail40 = {n for n, _ in freq40.most_common(2)}
+
     # Regras “após X”: ignora se não tem lastro na cauda
     if after_num is not None:
         try:
@@ -1033,6 +1039,11 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
 
         prior = 1.0/len(base)
         score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost
+
+        # >>> BOOST LEVE — TENDÊNCIA RECENTE (Top2 cauda 40)
+        if c in top2_tail40:
+            score *= 1.05  # +5% para privilegiar o que mais sai recentemente
+
         scores[c] = score
 
     total = sum(scores.values()) or 1e-9
