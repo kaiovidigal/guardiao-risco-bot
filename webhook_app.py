@@ -1,5 +1,3 @@
-Guardião — Código completo (Webhook + IA G0-only sem
-travamento)
 # -*- coding: utf-8 -*-
 # Fan Tan — Guardião (G0 + Recuperação) com:
 # - Inteligência em disco: /var/data/ai_intel (teto 1 GB + rotação)
