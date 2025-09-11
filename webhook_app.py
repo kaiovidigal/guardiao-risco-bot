@@ -40,6 +40,14 @@
 #   --- NOVO (Off-base Prior) ---
 #   ALLOW_OFFBASE=1                   -> avalia candidatos 1..4 mesmo fora da base do padrão
 #   OFFBASE_PRIOR_FRACTION=0.25       -> fração do prior reservada ao off-base (0.0–0.9)
+#
+#   --- NOVO (Explore / Risco / Rotulagem) ---
+#   EXPLORE_SIGNALS=5                 -> no começo do dia, emitir até N sinais “explicativos”
+#   MIN_SAMPLES_FOR_SIGNAL=30         -> amostra mínima de padrão p/ EXPLORE
+#   MAX_SIGNALS_PER_HOUR=6            -> antispam (IA)
+#   DAILY_STOP_LOSS=5                 -> parar IA após N losses no dia (G0 only)
+#   COOLDOWN_AFTER_LOSS=60            -> segurar IA por N segundos após um loss
+#   SHOW_MODE_TAG=1                   -> exibe [EXPLORE]/[STRICT] no texto do auto-sinal
 
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
@@ -146,11 +154,19 @@ IA_RAMP_UP_AT      = float(os.getenv("IA_RAMP_UP_AT", "0.62"))
 IA_RAMP_DOWN_AT    = float(os.getenv("IA_RAMP_DOWN_AT", "0.52"))
 IA_DEBUG           = (os.getenv("IA_DEBUG", "0").strip() == "1")
 
+# --- NOVO: Explore / Risco / Rotulagem ---
+EXPLORE_SIGNALS        = int(os.getenv("EXPLORE_SIGNALS", "5"))
+MIN_SAMPLES_FOR_SIGNAL = int(os.getenv("MIN_SAMPLES_FOR_SIGNAL", "30"))
+MAX_SIGNALS_PER_HOUR   = int(os.getenv("MAX_SIGNALS_PER_HOUR", "6"))
+DAILY_STOP_LOSS        = int(os.getenv("DAILY_STOP_LOSS", "5"))
+COOLDOWN_AFTER_LOSS    = float(os.getenv("COOLDOWN_AFTER_LOSS", "60"))  # segundos
+SHOW_MODE_TAG          = (os.getenv("SHOW_MODE_TAG", "1").strip() == "1")
+
 # --- NOVO: Off-base Prior ---
 ALLOW_OFFBASE = (os.getenv("ALLOW_OFFBASE", "1").strip() == "1")
 OFFBASE_PRIOR_FRACTION = float(os.getenv("OFFBASE_PRIOR_FRACTION", "0.25"))
 
-app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.4.0")
+app = FastAPI(title="Fantan Guardião — FastResult (G0 + Recuperação G1/G2)", version="3.5.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -880,6 +896,11 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                 if source == "IA":
                     update_daily_score_ia(None, False)
                 await send_loss_imediato(sug, "G0")
+
+                # >>> BLOQUEIO pós-loss (IA)
+                if source == "IA":
+                    _ia_set_post_loss_block()
+
                 exec_write("UPDATE pending_outcome SET announced=1 WHERE id=?", (pid,))
                 await send_scoreboard()
                 if source == "IA":
@@ -1005,434 +1026,4 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
 
     # --- candidatos e prior com off-base ---
     base_set = set(base)
-    candidates = [1,2,3,4] if ALLOW_OFFBASE else list(base)
-
-    nb = max(1, len(base_set))
-    no = max(1, len([c for c in candidates if c not in base_set]))
-
-    for c in candidates:
-        # Probabilidade por n-gram/backoff (cauda)
-        ng = ngram_backoff_score(tail, after_num, c)
-
-        # Estatística por padrão (com janela horária)
-        rowp = query_one("SELECT wins, losses FROM stats_pattern WHERE pattern_key=? AND number=?", (pat_key, c))
-        pw = rowp["wins"] if rowp else 0
-        pl = rowp["losses"] if rowp else 0
-        p_pat = laplace_ratio(pw, pl)
-
-        # Estatística por estratégia (se houver)
-        p_str = 1/nb
-        if strategy:
-            rows = query_one("SELECT wins, losses FROM stats_strategy WHERE strategy=? AND number=?", (strategy, c))
-            sw = rows["wins"] if rows else 0
-            sl = rows["losses"] if rows else 0
-            p_str = laplace_ratio(sw, sl)
-
-        # prior com fração reservada ao off-base
-        if ALLOW_OFFBASE:
-            mass_off = max(0.0, min(0.9, OFFBASE_PRIOR_FRACTION))
-            mass_in  = 1.0 - mass_off
-            if c in base_set:
-                prior = mass_in / nb
-            else:
-                prior = mass_off / no
-        else:
-            prior = 1.0 / nb
-
-        # Boost leve por “força do padrão”
-        boost = 1.0
-        if p_pat >= 0.60:
-            boost = 1.05
-        elif p_pat <= 0.40:
-            boost = 0.97
-
-        # Score final (mesmos expoentes globais ALPHA/BETA/GAMMA)
-        score = prior * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost
-        scores[c] = score
-
-    # Normalização -> posterior
-    total = sum(scores.values()) or 1e-9
-    post = {k: v/total for k,v in scores.items()}
-
-    # Escolha do top-1 com “gap” mínimo
-    number = confident_best(post, gap=GAP_MIN)
-    conf = post.get(number, 0.0) if number is not None else 0.0
-
-    # Amostra total de n-grams (para filtros de qualidade)
-    roww = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
-    samples = int((roww["s"] or 0) if roww else 0)
-
-    # Anti-repique: se último anunciado foi LOSS com o mesmo número, exige mais confiança
-    last = query_one("SELECT suggested, announced FROM pending_outcome ORDER BY id DESC LIMIT 1")
-    if last and number is not None and last["suggested"] == number and (last["announced"] or 0) == 1:
-        if post.get(number, 0.0) < (MIN_CONF_G0 + 0.08):
-            return None, 0.0, samples, post
-
-    # Filtro de qualidade (modo equilibrado)
-    top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
-    gap = (top2[0][1] - (top2[1][1] if len(top2) > 1 else 0.0)) if top2 else 0.0
-    enough_samples = samples >= MIN_SAMPLES
-    should_abstain = (
-        enough_samples and (
-            (number is None) or
-            (post.get(number, 0.0) < MIN_CONF_G0) or
-            (gap < MIN_GAP_G0)
-        )
-    )
-    if should_abstain:
-        return None, 0.0, samples, post
-
-    return number, conf, samples, post
-# ======= FIM da substituição =======
-
-def build_suggestion_msg(number:int, base:List[int], pattern_key:str,
-                         after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
-    base_txt = ", ".join(str(x) for x in base) if base else "—"
-    aft_txt = f" após {after_num}" if after_num else ""
-    return (
-        f"🎯 <b>Número seco ({stage}):</b> <b>{number}</b>\n"
-        f"🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n"
-        f"🧮 <b>Base:</b> [{base_txt}]\n"
-        f"📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
-    )
-
-def build_suggestion_msg_ia(number:int, base:List[int], pattern_key:str,
-                            after_num:Optional[int], conf:float, samples:int, stage:str="G0") -> str:
-    base_txt = ", ".join(str(x) for x in base) if base else "—"
-    aft_txt = f" após {after_num}" if after_num else ""
-    label = SELF_LABEL_IA or "Tiro seco por IA"
-    return (
-        f"🎯 <b>{label} ({stage}):</b> <b>{number}</b>\n"
-        f"🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n"
-        f"🧮 <b>Base:</b> [{base_txt}]\n"
-        f"📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
-    )
-
-# =========================
-# Webhook models
-# =========================
-class Update(BaseModel):
-    update_id: int
-    channel_post: Optional[dict] = None
-    message: Optional[dict] = None
-    edited_channel_post: Optional[dict] = None
-    edited_message: Optional[dict] = None
-
-# =========================
-# Tasks auxiliares (INTEL)
-# =========================
-def _intel_ensure_dir():
-    os.makedirs(INTEL_DIR, exist_ok=True)
-    os.makedirs(os.path.join(INTEL_DIR, "signals"), exist_ok=True)
-    os.makedirs(os.path.join(INTEL_DIR, "snapshots"), exist_ok=True)
-
-def _dir_size_bytes(path: str) -> int:
-    total = 0
-    for root, _, files in os.walk(path):
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except Exception:
-                pass
-    return total
-
-def _rotate_if_needed():
-    try:
-        total = _dir_size_bytes(INTEL_DIR)
-        if total <= INTEL_MAX_BYTES:
-            return
-        all_files = []
-        for root, _, files in os.walk(INTEL_DIR):
-            for f in files:
-                p = os.path.join(root, f)
-                try:
-                    all_files.append((p, os.path.getmtime(p)))
-                except Exception:
-                    pass
-        all_files.sort(key=lambda x: x[1])
-        idx = 0
-        while total > INTEL_MAX_BYTES and idx < len(all_files):
-            p, _ = all_files[idx]
-            try:
-                sz = os.path.getsize(p)
-                os.remove(p)
-                total -= sz
-            except Exception:
-                pass
-            idx += 1
-    except Exception as e:
-        print(f"[INTEL] rotate error: {e}")
-
-class IntelManager:
-    def __init__(self):
-        self._active = False
-        self._last_suggested: Optional[int] = None
-        self._last_strategy: Optional[str] = None
-        self._signal_task: Optional[asyncio.Task] = None
-        self._analyze_task: Optional[asyncio.Task] = None
-        _intel_ensure_dir()
-
-    def has_open_signal(self) -> bool:
-        return self._active
-
-    def start_signal(self, suggested: int, strategy: Optional[str]):
-        self._active = True
-        self._last_suggested = int(suggested)
-        self._last_strategy = (strategy or "")
-        if self._signal_task is None or self._signal_task.done():
-            self._signal_task = asyncio.create_task(self._signal_beats())
-        if self._analyze_task is None or self._analyze_task.done():
-            self._analyze_task = asyncio.create_task(self._periodic_analyzer())
-
-    def stop_signal(self):
-        self._active = False
-        if self._signal_task and not self._signal_task.done():
-            self._signal_task.cancel()
-            self._signal_task = None
-
-    async def _signal_beats(self):
-        try:
-            while self._active:
-                payload = {
-                    "ts": now_ts(),
-                    "utc": utc_iso(),
-                    "active": True,
-                    "suggested": self._last_suggested,
-                    "strategy": self._last_strategy,
-                    "tail_sample": get_recent_tail(40),
-                }
-                day = today_key()
-                fpath = os.path.join(INTEL_DIR, "signals", f"sinal_{day}.jsonl")
-                with open(fpath, "a", encoding="utf-8") as fp:
-                    fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                _rotate_if_needed()
-                await asyncio.sleep(max(0.2, INTEL_SIGNAL_INTERVAL))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[INTEL] signal_beats error: {e}")
-
-    def _best_combos_from_tail(self) -> Dict[str, Any]:
-        tail = get_recent_tail(WINDOW)
-        if not tail:
-            return {"ts": now_ts(), "utc": utc_iso(), "tail_len": 0, "top": []}
-
-        candidates = [1, 2, 3, 4]
-        ctx4 = tail[-4:] if len(tail) >= 4 else tail[:]
-        ctx3 = tail[-3:] if len(tail) >= 3 else tail[:]
-        ctx2 = tail[-2:] if len(tail) >= 2 else tail[:]
-        ctx1 = tail[-1:] if len(tail) >= 1 else tail[:]
-
-        scores: Dict[int, float] = {}
-        for c in candidates:
-            p = 0.0
-            if len(ctx4) >= 1: p += W4 * prob_from_ngrams(ctx4[:-1], c)
-            if len(ctx3) >= 1: p += W3 * prob_from_ngrams(ctx3[:-1], c)
-            if len(ctx2) >= 1: p += W2 * prob_from_ngrams(ctx2[:-1], c)
-            if len(ctx1) >= 1: p += W1 * prob_from_ngrams(ctx1[:-1], c)
-
-            hour_block = int(datetime.now(timezone.utc).hour // 2)
-            pat_key = f"GEN|h{hour_block}"
-            rowp = query_one("SELECT wins, losses FROM stats_pattern WHERE pattern_key=? AND number=?", (pat_key, c))
-            pw = rowp["wins"] if rowp else 0
-            pl = rowp["losses"] if rowp else 0
-            p_pat = laplace_ratio(pw, pl)
-
-            prior = 0.25
-            score = (prior) * ((max(p, 1e-9)) ** ALPHA) * (p_pat ** BETA)
-            scores[c] = score
-
-        tot = sum(scores.values()) or 1e-9
-        post = {k: v / tot for k, v in scores.items()}
-        top_sorted = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-        top_list = [{"number": n, "prob": float(p)} for n, p in top_sorted]
-        return {
-            "ts": now_ts(),
-            "utc": utc_iso(),
-            "tail_len": len(tail),
-            "top": top_list,
-        }
-
-    async def _periodic_analyzer(self):
-        try:
-            while True:
-                snap = self._best_combos_from_tail()
-                latest_path = os.path.join(INTEL_DIR, "snapshots", "latest_top.json")
-                with open(latest_path, "w", encoding="utf-8") as fp:
-                    json.dump(snap, fp, ensure_ascii=False, indent=2)
-                hist_path = os.path.join(INTEL_DIR, "snapshots", "top_history.jsonl")
-                # >>> CORRIGIDO: removido ')' extra após 'as fp'
-                with open(hist_path, "a", encoding="utf-8") as fp:
-                    fp.write(json.dumps(snap, ensure_ascii=False) + "\n")
-                _rotate_if_needed()
-                await asyncio.sleep(max(0.2, INTEL_ANALYZE_INTERVAL))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"[INTEL] analyzer error: {e}")
-
-INTEL = IntelManager()
-
-# =========================
-# Auto-fire (IA) — usa thresholds dinâmicos + G1 mínima
-# =========================
-_last_auto_fire_ts: float = 0.0
-
-async def _auto_fire_task():
-    global _last_auto_fire_ts
-    while True:
-        try:
-            if not AUTO_FIRE:
-                await asyncio.sleep(2.0); continue
-
-            # Não dispara se houver pendência aberta
-            open_cnt = _get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1")
-            if open_cnt > 0:
-                await asyncio.sleep(1.0); continue
-
-            # Thresholds dinâmicos atuais
-            th_g0  = ia_get("th_g0", IA_TH_G0_START)
-            g1_req = ia_get("g1_req", IA_G1_REQ_START)
-            g1_min = int(ia_get("g1_min_events", IA_G1_MIN_EVENTS))
-
-            # Usa mesmo motor de sugestão (NGRAM/backoff + stats)
-            base, pattern_key = [1,2,3,4], "GEN"
-            number, conf, samples, post = suggest_number(base, pattern_key, strategy=None, after_num=None)
-
-            if IA_DEBUG and number is not None:
-                # log leve de quase-disparo
-                await tg_broadcast(
-                    f"🤖 <i>debug</i> conf={conf*100:.2f}% | th_g0={th_g0*100:.1f}% | amostras≈{samples}"
-                )
-
-            nowt = time.time()
-            if number is not None and conf >= th_g0 and samples >= MIN_SAMPLES:
-                # Verifica taxa de recuperação histórica do G1 para este número
-                rate, events = recov_g1_rate(number)
-                g1_ok = (events >= g1_min and rate >= g1_req)
-
-                if g1_ok and (nowt - _last_auto_fire_ts) >= SELF_COOLDOWN_S:
-                    open_pending(strategy=None, suggested=int(number), source="IA")
-                    out = build_suggestion_msg_ia(int(number), base, pattern_key, None, conf, samples, stage="G0")
-                    out = "🤖 [AUTO]\n" + out
-                    await tg_broadcast(out)
-                    _last_auto_fire_ts = nowt
-
-            await asyncio.sleep(2.0)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"[AUTO] erro: {e}")
-            await asyncio.sleep(2.0)
-
-# =========================
-# Routes
-# =========================
-@app.get("/")
-async def root():
-    return {"ok": True, "detail": "Use POST /webhook/<WEBHOOK_TOKEN>"}
-
-# Inicia o analisador/health/reset
-@app.on_event("startup")
-async def _boot_analyzer():
-    try:
-        if INTEL._analyze_task is None or INTEL._analyze_task.done():
-            INTEL._analyze_task = asyncio.create_task(INTEL._periodic_analyzer())
-    except Exception as e:
-        print(f"[INTEL] startup analyzer error: {e}")
-    try:
-        asyncio.create_task(_health_reporter_task())
-    except Exception as e:
-        print(f"[HEALTH] startup error: {e}")
-    try:
-        asyncio.create_task(_daily_reset_task())
-    except Exception as e:
-        print(f"[RESET] startup error: {e}")
-    try:
-        asyncio.create_task(_auto_fire_task())
-    except Exception as e:
-        print(f"[AUTO] startup error: {e}")
-
-@app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-    if token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    data = await request.json()
-    upd = Update(**data)
-    msg = upd.channel_post or upd.message or upd.edited_channel_post or upd.edited_message
-    if not msg:
-        return {"ok": True}
-
-    text = (msg.get("text") or msg.get("caption") or "").strip()
-    t = re.sub(r"\s+", " ", text)
-
-    # 1) GREEN / RED — registra número real e fecha/atualiza pendências
-    gnum = extract_green_number(t)
-    redn = extract_red_last_left(t)
-    if gnum is not None or redn is not None:
-        n_observed = gnum if gnum is not None else redn
-        event_kind = "GREEN" if gnum is not None else "RED"
-        append_timeline(n_observed)
-        update_ngrams()
-        await close_pending_with_result(n_observed, event_kind)
-
-        strat = extract_strategy(t) or ""
-        row = query_one("SELECT suggested_number, pattern_key FROM last_by_strategy WHERE strategy=?", (strat,))
-        if row and gnum is not None:
-            suggested = int(row["suggested_number"])
-            pat_key   = row["pattern_key"] or "GEN"
-            won = (suggested == int(gnum))
-            bump_pattern(pat_key, suggested, won)
-            if strat: bump_strategy(strat, suggested, won)
-
-        return {"ok": True, "observed": n_observed, "kind": event_kind}
-
-    # 2) ANALISANDO — só alimenta timeline
-    if is_analise(t):
-        seq_raw = extract_seq_raw(t)
-        if seq_raw:
-            parts = re.findall(r"[1-4]", seq_raw)
-            seq_left_recent = [int(x) for x in parts]
-            seq_old_to_new  = seq_left_recent[::-1]
-            for n in seq_old_to_new:
-                append_timeline(n)
-            update_ngrams()
-        return {"ok": True, "analise": True}
-
-    # 3) ENTRADA CONFIRMADA — processa G0 da nova janela (pode abster por qualidade)
-    if not is_real_entry(t):
-        return {"ok": True, "skipped": True}
-
-    source_msg_id = msg.get("message_id")
-    if query_one("SELECT 1 FROM suggestions WHERE source_msg_id=?", (source_msg_id,)):
-        return {"ok": True, "dup": True}
-
-    strategy  = extract_strategy(t) or ""
-    seq_raw   = extract_seq_raw(t) or ""
-    after_num = extract_after_num(t)
-    base, pattern_key = parse_bases_and_pattern(t)
-    if not base: base=[1,2,3,4]; pattern_key="GEN"
-
-    number, conf, samples, post = suggest_number(base, pattern_key, strategy, after_num)
-    if number is None:
-        # Sinal fraco: NÃO abre pendência nem polui o canal réplica
-        return {"ok": True, "skipped_low_conf": True}
-
-    exec_write("""
-      INSERT OR REPLACE INTO suggestions
-      (source_msg_id, strategy, seq_raw, context_key, pattern_key, base, suggested_number, stage, sent_at)
-      VALUES (?,?,?,?,?,?,?,?,?)
-    """, (source_msg_id, strategy, seq_raw, "CTX", pattern_key, json.dumps(base), int(number), "G0", now_ts()))
-    exec_write("""
-      INSERT OR REPLACE INTO last_by_strategy
-      (strategy, source_msg_id, suggested_number, context_key, pattern_key, stage, created_at)
-      VALUES (?,?,?,?,?,?,?)
-    """, (strategy, source_msg_id, int(number), "CTX", pattern_key, "G0", now_ts()))
-
-    # Origem: CHAN (sinal do canal). IA é aberta no _auto_fire_task
-    open_pending(strategy, int(number), source="CHAN")
-
-    out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
-    await tg_broadcast(out)
-    return {"ok": True, "sent": True, "number": number, "conf": conf, "samples": samples}
+    candidates = [1,2,3
