@@ -22,7 +22,7 @@
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timezone, timedelta
-from collections import Counter  # <<< ADICIONADO (para top2 da cauda)
+from collections import Counter
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -111,7 +111,7 @@ INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "2"))  # anal
 # =========================
 SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.9.1")
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.10.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -544,7 +544,7 @@ async def send_scoreboard_ia():
     total = g0 + loss
     acc = (g0/total*100) if total else 0.0
     txt = (f"🤖 <b>Placar IA (dia)</b>\n"
-           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
+           f"🟢 G0:{g0}</b>  🔴 Loss:{loss}\n"
            f"✅ Acerto: {acc:.2f}%\n"
            f"🔥 Streak: {streak} GREEN(s)")
     await tg_broadcast(txt)
@@ -958,6 +958,102 @@ def _convert_last_loss_to_green():
         """, (y, g0, row["g1"] or 0, row["g2"] or 0, loss, streak))
 
 # =========================
+# Fechamento de pendências (GREEN/RED observado)
+# =========================
+async def close_pending_with_result(n_observed: int, event_kind: str):
+    try:
+        rows = query_all("""
+            SELECT id, created_at, strategy, suggested, stage, open, window_left,
+                   seen_numbers, announced, source
+            FROM pending_outcome
+            WHERE open=1
+            ORDER BY id ASC
+        """)
+        if not rows:
+            return {"ok": True, "no_open": True}
+
+        for r in rows:
+            pid        = r["id"]
+            suggested  = int(r["suggested"])
+            stage      = int(r["stage"])
+            left       = int(r["window_left"])
+            src        = (r["source"] or "CHAN").upper()
+            seen       = (r["seen_numbers"] or "").strip()
+            seen_new   = (seen + ("," if seen else "") + str(int(n_observed)))
+
+            if int(n_observed) == suggested:
+                # GREEN
+                exec_write("UPDATE pending_outcome SET open=0, window_left=0, seen_numbers=? WHERE id=?",
+                           (seen_new, pid))
+
+                if stage == 0:
+                    # GREEN direto no G0
+                    update_daily_score(0, True)
+                    if src == "IA":
+                        update_daily_score_ia(0, True)
+                    await send_green_imediato(suggested, "G0")
+                else:
+                    # Recuperação oculta: converte o último LOSS em GREEN
+                    _convert_last_loss_to_green()
+                    if src == "IA":
+                        _convert_last_loss_to_green_ia()
+                    # Estatística de recuperação
+                    bump_recov_g1(suggested, True)
+
+                try:
+                    INTEL.stop_signal()
+                except Exception:
+                    pass
+
+            else:
+                # Não bateu
+                if left > 1:
+                    # avança estágio (G1->G2) mantendo pendência aberta
+                    exec_write("""
+                        UPDATE pending_outcome
+                           SET stage = stage + 1, window_left = window_left - 1, seen_numbers=?
+                         WHERE id=?
+                    """, (seen_new, pid))
+                    if stage == 0:
+                        # PRIMEIRO erro (G0): conta LOSS e anuncia
+                        update_daily_score(0, False)
+                        if src == "IA":
+                            update_daily_score_ia(0, False)
+                        await send_loss_imediato(suggested, "G0")
+                        _ia_set_post_loss_block()
+                        bump_recov_g1(suggested, False)
+                else:
+                    # pendência esgotada (já contabilizado loss no G0)
+                    exec_write("UPDATE pending_outcome SET open=0, window_left=0, seen_numbers=? WHERE id=?",
+                               (seen_new, pid))
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# =========================
+# Heurística extra: top-2 da cauda (40) — leve boost
+# =========================
+def tail_top2_boost(tail: List[int], k:int=40) -> Dict[int, float]:
+    """
+    Retorna multiplicadores discretos para {1,2,3,4} a partir dos 40 últimos números.
+    Top1 recebe x1.04; Top2 recebe x1.02; demais x1.00.
+    Esse efeito é *leve* e não sobrepõe as demais fontes (ngrams/padrões/estratégia).
+    """
+    boosts = {1:1.00, 2:1.00, 3:1.00, 4:1.00}
+    if not tail:
+        return boosts
+    tail_k = tail[-k:] if len(tail) >= k else tail[:]
+    c = Counter(tail_k)
+    if not c:
+        return boosts
+    freq = c.most_common()
+    if len(freq) >= 1:
+        boosts[freq[0][0]] = 1.04
+    if len(freq) >= 2:
+        boosts[freq[1][0]] = 1.02
+    return boosts
+
+# =========================
 # Predição (número seco)
 # =========================
 def ngram_backoff_score(tail: List[int], after_num: Optional[int], candidate: int) -> float:
@@ -1004,11 +1100,6 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
     tail = get_recent_tail(WINDOW)
     scores: Dict[int, float] = {}
 
-    # Frequência recente: top-2 números na cauda de 40 (para boost leve)
-    tail40 = tail[-40:] if len(tail) >= 40 else tail[:]
-    freq40 = Counter(tail40)
-    top2_tail40 = {n for n, _ in freq40.most_common(2)}
-
     # Regras “após X”: ignora se não tem lastro na cauda
     if after_num is not None:
         try:
@@ -1017,6 +1108,9 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
             return None, 0.0, len(tail), {k: 1/len(base) for k in base}
         if (len(tail)-1 - last_idx) > 60:
             return None, 0.0, len(tail), {k: 1/len(base) for k in base}
+
+    # Boost leve do top-2 da cauda(40)
+    boost_tail = tail_top2_boost(tail, k=40)
 
     for c in base:
         ng = ngram_backoff_score(tail, after_num, c)
@@ -1033,17 +1127,14 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
             sl = rows["losses"] if rows else 0
             p_str = laplace_ratio(sw, sl)
 
-        boost = 1.0
-        if p_pat >= 0.60: boost = 1.05
-        elif p_pat <= 0.40: boost = 0.97
+        # leve bias por horário do padrão
+        boost_pat = 1.05 if p_pat >= 0.60 else (0.97 if p_pat <= 0.40 else 1.00)
+
+        # multiplicador do top-2 da cauda
+        boost_hist = boost_tail.get(c, 1.00)
 
         prior = 1.0/len(base)
-        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost
-
-        # >>> BOOST LEVE — TENDÊNCIA RECENTE (Top2 cauda 40)
-        if c in top2_tail40:
-            score *= 1.05  # +5% para privilegiar o que mais sai recentemente
-
+        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost_pat * boost_hist
         scores[c] = score
 
     total = sum(scores.values()) or 1e-9
@@ -1224,7 +1315,7 @@ def _mk_relatorio_text(days:int=7) -> str:
 
     sum_ia_g0 = sum((rr["g0"] or 0) for rr in ia_rows)
     sum_ia_loss = sum((rr["loss"] or 0) for rr in ia_rows)
-    ia_acc_ndays = _fmt_pct(sum_ia_g0, sum_ia_g0+sum_ia_loss)
+    ia_acc_ndays = _fmt_pct(sum_ia_g0, sum_ia_loss + sum_ia_g0)
 
     return (
         "📈 <b>Relatório de Desempenho</b>\n"
