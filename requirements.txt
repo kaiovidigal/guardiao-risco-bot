@@ -1,4 +1,8 @@
 fastapi==0.95.2
 pydantic==1.10.13
-httpx==0.24.1
+starlette==0.27.0
 uvicorn==0.22.0
+httpx==0.24.1
+python-multipart==0.0.6
+anyio==3.7.1
+typing-extensions==4.7.1
