@@ -1,10 +1,27 @@
 # -*- coding: utf-8 -*-
-# Fan Tan — Guardião (G0 + Recuperação oculta) com hotfix de latência:
-# - HTTPX global (keep-alive) + fire-and-forget no sendMessage
-# - Broadcast ANTES das gravações pesadas (na ENTRADA)
-# - Ajustes finos de espaçamento/concorrência nas fases A/B/C
-# - Mantém sua lógica e estruturas originais
-
+# Fan Tan — Guardião (G0 + Recuperação oculta) — LATÊNCIA+FILA LIVRE EDITION
+# - Envio imediato (broadcast antes do caminho pesado/DB)
+# - HTTPX global (keep-alive) + fire-and-forget no Telegram
+# - Fases com espaçamento menor entre tiros
+# - Toggle ALWAYS_FREE_FIRE=1 (default) -> ignora travas por pendência aberta (G1/G2 ocultas)
+# - INTEL_ANALYZE_INTERVAL padrão 0.2s (mais “nervoso”)
+#
+# Rotas:
+#   POST /webhook/<WEBHOOK_TOKEN>   (recebe mensagens do Telegram)
+#   GET  /                          (ping)
+#
+# ENV obrigatórias:
+#   TG_BOT_TOKEN, PUBLIC_CHANNEL, WEBHOOK_TOKEN
+#
+# ENV opcionais:
+#   DB_PATH (default: /data/data.db)
+#   INTEL_DIR (default: /var/data/ai_intel)
+#   INTEL_MAX_BYTES (default: 1_000_000_000 -> 1 GB)
+#   INTEL_SIGNAL_INTERVAL (default: 20)
+#   INTEL_ANALYZE_INTERVAL (default: 0.2)
+#   FLUSH_KEY (default: meusegredo123)
+#   ALWAYS_FREE_FIRE (default: 1 -> ignora pendências abertas)
+#
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timezone, timedelta
@@ -63,6 +80,11 @@ REPL_ENABLED  = True
 REPL_CHANNEL  = "-1003052132833"  # @fantanautomatico2
 
 # =========================
+# Toggle: liberar múltiplos G0 simultâneos (sem travar por pendência)
+# =========================
+ALWAYS_FREE_FIRE = os.getenv("ALWAYS_FREE_FIRE", "1").strip().lower() in ("1","true","yes","on")
+
+# =========================
 # MODO: Resultado rápido com recuperação oculta
 # =========================
 MAX_STAGE     = 3         # 3 = G0, G1, G2 (recuperação silenciosa)
@@ -88,15 +110,15 @@ MIN_SAMPLES = 1000
 # =========================
 INTEL_DIR = os.getenv("INTEL_DIR", "/var/data/ai_intel").rstrip("/")
 INTEL_MAX_BYTES = int(os.getenv("INTEL_MAX_BYTES", "1000000000"))  # 1 GB
-INTEL_SIGNAL_INTERVAL = float(os.getenv("INTEL_SIGNAL_INTERVAL", "20"))  # beat do sinal (não crítico p/ latência)
-INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "0.2"))  # 🔥 mais nervoso
+INTEL_SIGNAL_INTERVAL = float(os.getenv("INTEL_SIGNAL_INTERVAL", "20"))
+INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "0.2"))  # 🔥 padrão agressivo
 
 # =========================
 # Auto Sinal (rótulo)
 # =========================
 SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.10.0-hotfix")
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta) [FAST+FREE]", version="3.11.0-freefire")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -197,7 +219,6 @@ def init_db():
         losses INTEGER NOT NULL DEFAULT 0
     )""")
     con.commit()
-    # Migrações idempotentes
     for alter in [
         "ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''",
         "ALTER TABLE pending_outcome ADD COLUMN announced INTEGER NOT NULL DEFAULT 0",
@@ -209,7 +230,7 @@ def init_db():
 init_db()
 
 # =========================
-# Utils / Telegram (HOTFIX: client global + fire-and-forget)
+# Utils / Telegram (client global + fire-and-forget)
 # =========================
 def now_ts() -> int:
     return int(time.time())
@@ -228,12 +249,20 @@ async def get_httpx() -> httpx.AsyncClient:
         _httpx_client = httpx.AsyncClient(timeout=10)
     return _httpx_client
 
+@app.on_event("shutdown")
+async def _shutdown():
+    global _httpx_client
+    try:
+        if _httpx_client:
+            await _httpx_client.aclose()
+    except Exception as e:
+        print(f"[HTTPX] close error: {e}")
+
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     if not TG_BOT_TOKEN or not chat_id:
         return
     try:
         client = await get_httpx()
-        # fire-and-forget (não bloqueia o pipeline de decisão)
         asyncio.create_task(
             client.post(
                 f"{TELEGRAM_API}/sendMessage",
@@ -363,7 +392,7 @@ def parse_bases_and_pattern(text: str) -> Tuple[List[int], str]:
 
 GREEN_PATTERNS = [
     re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\((\d)\)", re.I | re.S),
-    re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | re.S),
+    re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | reS),
     re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
 ]
 RED_PATTERNS = [
@@ -658,7 +687,8 @@ def _health_text() -> str:
             f"Conc.: {eff['MAX_CONCURRENT_PENDINGS']} | "
             f"Conf≥{eff['IA2_TIER_STRICT']:.2f} (flex −{eff['IA2_DELTA_GAP']:.2f} c/gap≥{eff['IA2_GAP_SAFETY']:.2f}) | "
             f"G0 conf/gap≥{eff['MIN_CONF_G0']:.2f}/{eff['MIN_GAP_G0']:.3f} | "
-            f"IA 7d: {(_g7+_l7)} ops • {acc7*100:.2f}%"
+            f"IA 7d: {(_g7+_l7)} ops • {acc7*100:.2f}% | "
+            f"ALWAYS_FREE_FIRE={'ON' if ALWAYS_FREE_FIRE else 'OFF'}"
         )
     except Exception:
         phase_line = "🧭 Fase: —"
@@ -720,9 +750,9 @@ async def _daily_reset_task():
 IA2_TIER_STRICT             = 0.62
 IA2_GAP_SAFETY              = 0.08
 IA2_DELTA_GAP               = 0.03
-IA2_MAX_PER_HOUR            = 10
-IA2_COOLDOWN_AFTER_LOSS     = 20
-IA2_MIN_SECONDS_BETWEEN_FIRE= 15
+IA2_MAX_PER_HOUR            = 30
+IA2_COOLDOWN_AFTER_LOSS     = 8
+IA2_MIN_SECONDS_BETWEEN_FIRE= 2  # espaçamento curto para "simultâneos"
 
 _S_A_MAX = 20_000
 _S_B_MAX = 100_000
@@ -771,13 +801,14 @@ def _adaptive_phase() -> str:
 
 def _eff() -> dict:
     p = _adaptive_phase()
+    # Mantemos min 2s em todas as fases para permitir simultâneos sem flood
     if p == "A":
         return {
             "PHASE": "A",
-            "MAX_CONCURRENT_PENDINGS": 3,   # ↑ permite novo G0 mesmo com G1/G2 oculto
+            "MAX_CONCURRENT_PENDINGS": 3,
             "IA2_MAX_PER_HOUR": 30,
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": 5,   # 7 -> 5
-            "IA2_COOLDOWN_AFTER_LOSS": 8,        # 10 -> 8
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 2,
+            "IA2_COOLDOWN_AFTER_LOSS": 8,
             "IA2_TIER_STRICT": 0.59,
             "IA2_DELTA_GAP": 0.04,
             "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
@@ -787,10 +818,10 @@ def _eff() -> dict:
     elif p == "B":
         return {
             "PHASE": "B",
-            "MAX_CONCURRENT_PENDINGS": 2,
-            "IA2_MAX_PER_HOUR": 24,              # 20 -> 24
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": 7,   # 10 -> 7
-            "IA2_COOLDOWN_AFTER_LOSS": 10,       # 12 -> 10
+            "MAX_CONCURRENT_PENDINGS": 3,
+            "IA2_MAX_PER_HOUR": 30,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 2,
+            "IA2_COOLDOWN_AFTER_LOSS": 8,
             "IA2_TIER_STRICT": 0.60,
             "IA2_DELTA_GAP": 0.04,
             "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
@@ -800,10 +831,10 @@ def _eff() -> dict:
     else:
         return {
             "PHASE": "C",
-            "MAX_CONCURRENT_PENDINGS": 1,
-            "IA2_MAX_PER_HOUR": 14,              # 12 -> 14
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": 9,   # 12 -> 9
-            "IA2_COOLDOWN_AFTER_LOSS": 12,       # 15 -> 12
+            "MAX_CONCURRENT_PENDINGS": 3,
+            "IA2_MAX_PER_HOUR": 30,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 2,
+            "IA2_COOLDOWN_AFTER_LOSS": 10,
             "IA2_TIER_STRICT": 0.62,
             "IA2_DELTA_GAP": 0.03,
             "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
@@ -844,6 +875,8 @@ def _ia_set_post_loss_block():
     _ia2_blocked_until_ts = now_ts() + int(eff["IA2_COOLDOWN_AFTER_LOSS"])
 
 def _has_open_pending() -> bool:
+    if ALWAYS_FREE_FIRE:
+        return False  # ✅ ignora pendências abertas
     eff = _eff()
     open_cnt = int(_get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1"))
     return open_cnt >= eff["MAX_CONCURRENT_PENDINGS"]
@@ -1129,6 +1162,7 @@ async def ia2_process_once():
         if len(top) >= 2:
             gap = top[0][1] - top[1][1]
 
+    # ⚠️ Se ALWAYS_FREE_FIRE=1, _has_open_pending() retorna False → não bloqueia
     if _has_open_pending():
         _mark_reason("pendencia_aberta(aguardando G1/G2)")
         return
@@ -1309,7 +1343,7 @@ async def webhook(token: str, request: Request):
         await ia2_process_once()
         return {"ok": True, "skipped_low_conf": True}
 
-    # 🔥 HOT PATH DE LATÊNCIA: envia primeiro (fire-and-forget) e persiste depois
+    # 🔥 HOT PATH: envia primeiro e persiste depois
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_broadcast(out)
 
@@ -1375,6 +1409,7 @@ async def debug_state():
             "IA2_COOLDOWN_AFTER_LOSS": eff["IA2_COOLDOWN_AFTER_LOSS"],
             "MAX_CONCURRENT_PENDINGS": eff["MAX_CONCURRENT_PENDINGS"],
             "INTEL_ANALYZE_INTERVAL": INTEL_ANALYZE_INTERVAL,
+            "ALWAYS_FREE_FIRE": ALWAYS_FREE_FIRE,
         }
         _g7, _l7, acc7 = _ia_acc_days(7)
         return {
