@@ -312,9 +312,28 @@ async def send_recovery(_stage_txt:str):
     return
 
 async def ia2_send_signal(best:int, conf:float, tail_len:int, mode:str, after_num: int | None = None):
-async def ia_result_post(number:int, stage_txt:str, result:str, after_num: int | None = None):
-    # result: 'GREEN' or 'LOSS'
     aft = f"\n       Após número {after_num}" if after_num else ""
+
+async def ia_result_post(number: int, stage_txt: str, result: str, after_num: int | None = None, conf: float | None = None, samples: int | None = None):
+    """Publica o resultado no canal da IA APENAS quando sair GREEN/LOSS.
+    result: 'GREEN' ou 'LOSS'
+    stage_txt: 'G0' | 'G1' | 'G2'
+    """
+    head = "🤖 Tiro seco por IA"
+    aft = f"\n       Após número {after_num}" if after_num else ""
+    conf_line = f"\n📈 Conf: <b>{conf*100:.2f}%</b>" if conf is not None else ""
+    samples_line = f" | Amostra≈<b>{samples}</b>" if samples is not None else ""
+    status = "✅ <b>GREEN</b>" if result.upper() == "GREEN" else "❌ <b>LOSS</b>"
+    msg = (
+        f"{head}\n"
+        f"🎯 Número seco ({stage_txt}): <b>{number}</b>" + aft + 
+        conf_line + samples_line + "\n" +
+        f"{status} — Número: <b>{number}</b> (em {stage_txt})"
+    )
+    try:
+        await ia_send_text(msg)
+    except Exception as e:
+        print(f"[IA_POST] send error: {e}")
     head = "🤖 Tiro seco por IA"
     body = (
         f"{head}\n"
