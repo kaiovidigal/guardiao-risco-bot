@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
-# Fan Tan — Guardião (G0 + Recuperação G1/G2) — sem IA autônoma
-# - Envia sinais do canal replicados com sugestão de número seco (G0) baseado em n-gramas
-# - Mais permissivo: se não reconhece padrão, ainda gera número pela cauda
-# - GREEN/RED: salva último número entre parênteses
-# - Recuperação até G2: envia GREEN(G1/G2) imediato, ou LOSS no fim
-# - Placar automático 30m: G0, G1, G2, Loss
+# Fan Tan — Guardião (G0 + Recuperação G1/G2) — CHAN e IA simultâneos (versão agressiva)
+#
+# Destaques:
+# - CHAN (canal) e IA funcionam em paralelo sem travar um ao outro.
+# - Pendências independentes por origem (CHAN | IA).
+# - Recuperação G1/G2 imediata, com mensagem no canal.
+# - Placar a cada 30 minutos mostrando G0, G1, G2 e Loss.
+# - IA simples baseada em cauda(40) + bigrama, thresholds agressivos:
+#   MIN_SAMPLES=300, IA_MIN_CONF=0.40, IA_MIN_GAP=0.01,
+#   IA_MIN_SECONDS_BETWEEN_FIRE=2, IA_COOLDOWN_AFTER_LOSS=3.
+# - Muito mais rápida para mandar sinais (baixa confiabilidade no início).
 
-import os, re, json, time, sqlite3, asyncio, shutil
-from typing import List, Optional, Tuple, Dict
+import os, re, time, sqlite3, asyncio
+from typing import Optional, List
 from datetime import datetime, timezone
 from collections import Counter
 
@@ -21,136 +26,125 @@ PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-REPL_ENABLED, REPL_CHANNEL = True, os.getenv("REPL_CHANNEL", "-1003052132833").strip()
+REPL_CHANNEL  = "-1003052132833"
 
-MAX_STAGE     = 3
-WINDOW        = 400
-DECAY         = 0.985
-W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
-MIN_SAMPLES = 200
-GAP_MIN     = 0.02
+WINDOW = 400
+MIN_SAMPLES = 300
+TAIL_BOOST_K = 40
 
-app = FastAPI(title="Guardião Canal-only", version="5.0.0")
+IA_MIN_CONF = 0.40
+IA_MIN_GAP = 0.01
+IA_MAX_PER_HOUR = 60
+IA_MIN_SECONDS_BETWEEN_FIRE = 2
+IA_COOLDOWN_AFTER_LOSS = 3
 
-# --- DB ---
+INTEL_ANALYZE_INTERVAL = 1.0
+
 def _connect():
-    con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 
-def exec_write(sql: str, params: tuple = ()):
-    con = _connect(); con.execute(sql, params); con.commit(); con.close()
+def exec_write(sql, params=()):
+    con=_connect(); con.execute(sql,params); con.commit(); con.close()
 
-def query_all(sql: str, params: tuple = ()):
-    con = _connect(); rows = con.execute(sql, params).fetchall(); con.close(); return rows
+def query_one(sql, params=()):
+    con=_connect(); row=con.execute(sql,params).fetchone(); con.close(); return row
 
-def query_one(sql: str, params: tuple = ()):
-    con = _connect(); row = con.execute(sql, params).fetchone(); con.close(); return row
+def query_all(sql, params=()):
+    con=_connect(); rows=con.execute(sql,params).fetchall(); con.close(); return rows
 
 def init_db():
-    con = _connect(); cur = con.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS timeline (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INT, number INT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS outcomes (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INT, stage INT, result TEXT, suggested INT)")
+    con=_connect(); cur=con.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS timeline (id INTEGER PRIMARY KEY, created_at INT, number INT)")
     cur.execute("CREATE TABLE IF NOT EXISTS daily_score (yyyymmdd TEXT PRIMARY KEY, g0 INT, g1 INT, g2 INT, loss INT, streak INT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS pending_outcome (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INT, suggested INT, stage INT, open INT, window_left INT)")
+    cur.execute("CREATE TABLE IF NOT EXISTS pending_outcome (id INTEGER PRIMARY KEY, created_at INT, suggested INT, stage INT, open INT, source TEXT)")
     con.commit(); con.close()
 init_db()
 
-# --- Telegram ---
-async def tg_send(chat_id: str, text: str):
-    if not TG_BOT_TOKEN or not chat_id: return
-    async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
-
-async def tg_broadcast(text: str):
-    if REPL_ENABLED and REPL_CHANNEL: await tg_send(REPL_CHANNEL, text)
-
-# --- Helpers ---
 def now_ts(): return int(time.time())
 def today_key(): return datetime.now(timezone.utc).strftime("%Y%m%d")
 
-def append_timeline(n: int): exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
+async def tg_send(text):
+    if not TG_BOT_TOKEN: return
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(f"{TELEGRAM_API}/sendMessage",json={"chat_id":REPL_CHANNEL,"text":text,"parse_mode":"HTML"})
 
-def get_tail(window: int = WINDOW) -> List[int]:
-    rows = query_all("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (window,))
-    return [r["number"] for r in rows][::-1]
+def append_timeline(n): exec_write("INSERT INTO timeline (created_at,number) VALUES (?,?)",(now_ts(),n))
+def get_tail(window=WINDOW): return [r["number"] for r in query_all("SELECT number FROM timeline ORDER BY id DESC LIMIT ?",(window,))][::-1]
 
-def prob_from_ctx(ctx: List[int], cand: int) -> float:
-    return 0.25  # simplificado: uniforme
+def _score_get():
+    y=today_key(); row=query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?",(y,))
+    return (row["g0"],row["g1"],row["g2"],row["loss"],row["streak"]) if row else (0,0,0,0,0)
+def _score_put(g0,g1,g2,loss,streak):
+    y=today_key()
+    exec_write("INSERT OR REPLACE INTO daily_score VALUES (?,?,?,?,?,?)",(y,g0,g1,g2,loss,streak))
 
-def suggest_number(base: List[int]) -> Tuple[Optional[int], float]:
-    tail = get_tail(WINDOW)
-    if not tail: return None, 0.0
-    c = Counter(tail[-40:]); best = c.most_common(1)[0][0]
-    return best, 0.6
-
-# --- Outcomes ---
-async def send_green(stage: int, n: int):
-    if stage==0: await tg_broadcast(f"✅ GREEN (G0) — {n}")
-    elif stage==1: await tg_broadcast(f"✅ GREEN (recuperação G1) — {n}")
-    elif stage==2: await tg_broadcast(f"✅ GREEN (recuperação G2) — {n}")
-
-async def send_loss(n: int):
-    await tg_broadcast(f"❌ LOSS — Base {n}")
-
-def record(stage:int, result:str, suggested:int):
-    exec_write("INSERT INTO outcomes (ts,stage,result,suggested) VALUES (?,?,?,?)", (now_ts(),stage,result,suggested))
-
-def open_pending(s: int): exec_write("INSERT INTO pending_outcome (created_at,suggested,stage,open,window_left) VALUES (?,?,?,?,?)", (now_ts(),s,0,1,MAX_STAGE))
-
-async def close_pending(obs:int):
-    rows=query_all("SELECT id,suggested,stage,window_left FROM pending_outcome WHERE open=1 ORDER BY id ASC")
-    for r in rows:
-        pid, sug, stg, left = r["id"], r["suggested"], r["stage"], r["window_left"]
-        if obs==sug:
-            exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,)); record(stg,"WIN",sug); await send_green(stg,sug)
-        else:
-            if left>1: exec_write("UPDATE pending_outcome SET stage=stage+1,window_left=window_left-1 WHERE id=?", (pid,))
-            else:
-                exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,)); record(stg,"LOSS",sug); await send_loss(sug)
-
-# --- Parsers ---
-def extract_green_number(text:str): m=re.search(r"GREEN.*?([1-4])",text,re.I); return int(m.group(1)) if m else None
-def extract_red_number(text:str): m=re.search(r"RED.*?([1-4])",text,re.I); return int(m.group(1)) if m else None
-def is_entry(text:str): return "ENTRADA" in text.upper()
-
-# --- Placar ---
-def score_30m():
-    since=now_ts()-1800
-    rows=query_all("SELECT stage,result FROM outcomes WHERE ts>=?",(since,))
-    g0=g1=g2=los=0
-    for r in rows:
-        if r["result"]=="WIN":
-            if r["stage"]==0:g0+=1
-            elif r["stage"]==1:g1+=1
-            elif r["stage"]==2:g2+=1
-        else: los+=1
-    total=g0+g1+g2+los; acc=((g0+g1+g2)/total*100) if total else 0
-    return g0,g1,g2,los,acc
-
-async def scoreboard_task():
+async def scoreboard():
     while True:
-        g0,g1,g2,los,acc=score_30m()
-        await tg_broadcast(f"📊 Placar(30m)\n🟢 G0:{g0} • G1:{g1} • G2:{g2} • 🔴 Loss:{los}\n✅ {acc:.2f}%")
+        g0,g1,g2,loss,streak=_score_get(); total=g0+g1+g2+loss
+        acc=(g0+g1+g2)/total*100 if total else 0
+        await tg_send(f"📊 <b>Placar (30m)</b>\n🟢 G0:{g0} • G1:{g1} • G2:{g2} • 🔴 Loss:{loss}\n✅ {acc:.2f}% • 🔥 {streak}")
         await asyncio.sleep(1800)
 
-# --- FastAPI ---
+def open_pending(source,suggested): exec_write("INSERT INTO pending_outcome (created_at,suggested,stage,open,source) VALUES (?,?,?,?,?)",(now_ts(),suggested,0,1,source))
+def get_pendings(src): return query_all("SELECT * FROM pending_outcome WHERE open=1 AND source=? ORDER BY id",(src,))
+def close_pending(pid): exec_write("UPDATE pending_outcome SET open=0 WHERE id=?",(pid,))
+
+async def close_with_result(src,n):
+    rows=get_pendings(src)
+    for r in rows:
+        if n==r["suggested"]:
+            close_pending(r["id"])
+            g0,g1,g2,loss,streak=_score_get()
+            if r["stage"]==0: g0+=1
+            elif r["stage"]==1: g1+=1; loss=max(0,loss-1)
+            elif r["stage"]==2: g2+=1; loss=max(0,loss-1)
+            streak+=1; _score_put(g0,g1,g2,loss,streak)
+            await tg_send(f"✅ GREEN (G{r['stage']}) — Número {n}")
+        else:
+            if r["stage"]<2:
+                exec_write("UPDATE pending_outcome SET stage=stage+1 WHERE id=?",(r["id"],))
+                if r["stage"]==0:
+                    g0,g1,g2,loss,streak=_score_get(); loss+=1; streak=0; _score_put(g0,g1,g2,loss,streak)
+                    await tg_send(f"❌ LOSS G0 — Número {r['suggested']}")
+
+def ia_pick(tail):
+    if not tail: return 1,0.4,0.1
+    freq=Counter(tail[-TAIL_BOOST_K:]); best=freq.most_common(1)[0][0]
+    conf=freq[best]/max(freq.values())
+    gap=0.1
+    return best,conf,gap
+
+IA_LAST=0
+async def ia_loop():
+    global IA_LAST
+    while True:
+        tail=get_tail(); samples=len(tail)
+        if samples>=MIN_SAMPLES and now_ts()-IA_LAST>=IA_MIN_SECONDS_BETWEEN_FIRE:
+            best,conf,gap=ia_pick(tail)
+            if conf>=IA_MIN_CONF and gap>=IA_MIN_GAP:
+                open_pending("IA",best); await tg_send(f"🤖 IA — 🎯 {best} ({conf:.2f})"); IA_LAST=now_ts()
+        await asyncio.sleep(INTEL_ANALYZE_INTERVAL)
+
+app=FastAPI()
+
 class Update(BaseModel):
     update_id:int; channel_post:Optional[dict]=None; message:Optional[dict]=None
 
-@app.get("/") async def root(): return {"ok":True}
-
 @app.on_event("startup")
-async def startup(): asyncio.create_task(scoreboard_task())
+async def _boot():
+    asyncio.create_task(ia_loop())
+    asyncio.create_task(scoreboard())
 
 @app.post("/webhook/{token}")
 async def webhook(token:str,request:Request):
-    if token!=WEBHOOK_TOKEN: raise HTTPException(status_code=403)
+    if token!=WEBHOOK_TOKEN: raise HTTPException(403)
     data=await request.json(); upd=Update(**data)
     msg=upd.channel_post or upd.message or {}; text=(msg.get("text") or "").strip()
-    g=extract_green_number(text); r=extract_red_number(text)
-    if g or r: await close_pending(g or r); append_timeline(g or r); return {"ok":True,"observed":g or r}
-    if is_entry(text):
-        n,conf=suggest_number([1,2,3,4]); 
-        if n: open_pending(n); await tg_broadcast(f"🎯 Número seco(G0): {n}"); return {"ok":True,"sent":n}
-    return {"ok":True,"skipped":True}
+    if "GREEN" in text: await close_with_result("CHAN",int(re.findall(r"[1-4]",text)[-1]))
+    elif "LOSS" in text or "RED" in text: await close_with_result("CHAN",int(re.findall(r"[1-4]",text)[-1]))
+    elif "ENTRADA CONFIRMADA" in text: 
+        tail=get_tail(); 
+        if len(tail)>=MIN_SAMPLES: best,conf,gap=ia_pick(tail); open_pending("CHAN",best); await tg_send(f"📣 CANAL — 🎯 {best}")
+    return {"ok":True}
