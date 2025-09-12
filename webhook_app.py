@@ -1,23 +1,21 @@
 # -*- coding: utf-8 -*-
-# Fantan Guardião — FIRE-only (G0 + Recuperação oculta) — enxuto
-# (versão ajustada para: remover cabeçalhos/relatórios IA, acelerar envio
-#  e corrigir f-strings não terminadas)
+# Fantan Guardião — FIRE-only (G0 + Recuperação oculta) — AJUSTADO
+# Requisitos atendidos:
+#   • Só dispara a mensagem curta (sem cabeçalho de IA, sem relatórios extras):
+#       🎯 Número seco (G0): X
+#       🧩 Padrão: <pattern> [após N]
+#       🧮 Base: [ ... ]
+#       📊 Conf: YY.YY% | Amostra≈Z
+#   • Thresholds dinâmicos com warm-up iniciando em 0% e subindo conforme amostra e acc(7d).
+#   • Mantém boost leve do top-2 da cauda (40).
+#   • GREEN/LOSS continuam funcionando normalmente.
 #
-# Rotas úteis:
+# Rotas úteis preservadas (mesma estrutura):
 #   POST /webhook/<WEBHOOK_TOKEN>
 #   GET  /debug/state
 #   GET  /debug/reason
 #   GET  /debug/samples
 #   GET  /debug/flush
-#
-# Observações do ajuste:
-# - Mensagens do tipo "🤖 Tiro seco por IA [FIRE] ..." foram removidas.
-# - Relatórios longos ("📈 Relatório de Desempenho ...") não são mais enviados.
-# - Texto de saúde que citava métricas de IA também foi suprimido.
-# - f-strings revisadas para evitar "unterminated string literal".
-# - Sinal principal continua: "🎯 Número seco (G0): X ... Conf: Y% | Amostra≈Z".
-# - Laço de IA mantém lógica interna, mas não publica headers; quando canal gera
-#   "ENTRADA CONFIRMADA" o sinal curto é enviado imediatamente.
 #
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict
@@ -41,7 +39,8 @@ if not TG_BOT_TOKEN or not WEBHOOK_TOKEN:
     print("⚠️ Defina TG_BOT_TOKEN e WEBHOOK_TOKEN.")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-REPL_ENABLED, REPL_CHANNEL = True, "-1003052132833"  # espelho
+# Espelho/replicador opcional (mantido, mas pode apontar para o seu canal principal)
+REPL_ENABLED, REPL_CHANNEL = True, (os.getenv("REPL_CHANNEL") or "-1003052132833")
 
 # =========================
 # MODO & Hiperparâmetros
@@ -56,12 +55,12 @@ W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
 ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
 GAP_MIN = 0.08
 
-# calibração mínima elevada (qualidade)
+# calibração base (mínimos — dinâmicos sobem com warm-up)
 MIN_CONF_G0 = 0.55
 MIN_GAP_G0  = 0.04
 MIN_SAMPLES = 1000
 
-# IA em disco
+# IA em disco (stub)
 INTEL_DIR = os.getenv("INTEL_DIR", "/var/data/ai_intel").rstrip("/")
 INTEL_MAX_BYTES = int(os.getenv("INTEL_MAX_BYTES", "1000000000"))
 INTEL_SIGNAL_INTERVAL = float(os.getenv("INTEL_SIGNAL_INTERVAL", "20"))
@@ -73,11 +72,7 @@ SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 CONF_CAP, GAP_CAP = 0.999, 1.0
 WARMUP_SAMPLES    = 5_000
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (ajustado)", version="3.11.1")
-
-# importa e registra o force_fire_router
-from force_fire_router import router as force_fire_router
-app.include_router(force_fire_router)
+app = FastAPI(title="Fantan Guardião — FIRE-only (ajustado)", version="3.11.2")
 
 # =========================
 # DB helpers
@@ -114,7 +109,7 @@ def exec_write(sql: str, params: tuple = (), retries: int = 8, wait: float = 0.2
             raise
     raise sqlite3.OperationalError("Banco bloqueado após várias tentativas.")
 
-def query_all(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+def query_all(sql: str, params: tuple = ()) -> List[sqlite3.Row]:
     con = _connect(); rows = con.execute(sql, params).fetchall(); con.close(); return rows
 
 def query_one(sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
@@ -176,7 +171,8 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
                           json={"chat_id": chat_id, "text": text, "parse_mode": parse, "disable_web_page_preview": True})
 
 async def tg_broadcast(text: str, parse: str="HTML"):
-    if REPL_ENABLED and REPL_CHANNEL: await tg_send_text(REPL_CHANNEL, text, parse)
+    channel = REPL_CHANNEL or PUBLIC_CHANNEL
+    if REPL_ENABLED and channel: await tg_send_text(channel, text, parse)
 
 async def send_green_imediato(sugerido:int, stage_txt:str="G0"):
     await tg_broadcast(f"✅ <b>GREEN</b> em <b>{stage_txt}</b> — Número: <b>{sugerido}</b>")
@@ -184,9 +180,8 @@ async def send_green_imediato(sugerido:int, stage_txt:str="G0"):
 async def send_loss_imediato(sugerido:int, stage_txt:str="G0"):
     await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b> (em {stage_txt})")
 
-# IA — sem cabeçalho; não publicar bloco adicional
-async def ia2_send_signal(best:int, conf:float, tail_len:int, mode:str):
-    # Atendido pedido: sem publicar textos de IA. Mantemos stub para compatibilidade.
+# IA — nunca publica cabeçalho; stub só mantém compatibilidade
+async def ia2_send_signal(_best:int, _conf:float, _tail_len:int, _mode:str):
     return
 
 # =========================
@@ -546,6 +541,7 @@ def _ia2_mark_fire_sent():
     global IA2_LAST_FIRE_TS; _ia2_mark_sent(); IA2_LAST_FIRE_TS=now_ts()
 
 def _dyn_thresholds() -> tuple[float, float]:
+    """ Thresholds dinâmicos: começam em 0%/0.0 no warm-up e sobem com acc(7d)+amostra. """
     g7,l7,acc7=_ia_acc_days(7)
     row = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
     samples=int((row["s"] or 0) if row else 0)
@@ -618,10 +614,9 @@ async def ia2_process_once():
     if now_ts() - (IA2_LAST_FIRE_TS or 0) < 10:
         _mark_reason("espacamento_minimo"); return
 
-    # Caso 1: temos best e passa nos thresholds dinâmicos
+    # Caso 1: temos best e passa nos thresholds dinâmicos — abre pendência (não publica cabeçalho)
     if best is not None and _relevance_ok(conf_raw, gap, tail_len) and _ia2_can_fire_now():
         open_pending(strategy, best, source="IA")
-        # atendido: não enviar cabeçalho IA; apenas marcação interna
         _ia2_mark_fire_sent()
         _mark_reason(f"FIRE(best={best}, conf={conf_raw:.3f}, gap={gap:.3f}, tail={tail_len})")
         return
@@ -720,7 +715,7 @@ async def webhook(token: str, request: Request):
             seq_old_to_new  = seq_left_recent[::-1]
             for n in seq_old_to_new: append_timeline(n)
             update_ngrams()
-        # aviso curto de análise (sem flood)
+        # status curto (opcional) — pode comentar se não quiser esse aviso
         await tg_broadcast("🟡 Analisando... possível entrada em breve.")
         await ia2_process_once()
         return {"ok": True, "analise": True}
@@ -765,11 +760,13 @@ async def webhook(token: str, request: Request):
 
     open_pending(strategy, int(number), source="CHAN")
     conf_capped = max(0.0, min(float(conf), CONF_CAP))
-    out = (f"🎯 <b>Número seco (G0):</b> <b>{int(number)}</b>\n"
-           f"🧩 <b>Padrão:</b> {pattern_key}{(' após '+str(after_num)) if after_num else ''}\n"
-           f"🧮 <b>Base:</b> [{', '.join(str(x) for x in base)}]\n"
-           f"📊 Conf: {conf_capped*100:.2f}% | Amostra≈{samples}")
-    await tg_broadcast(out)
+    out_lines = [
+        f"🎯 <b>Número seco (G0):</b> <b>{int(number)}</b>",
+        f"🧩 <b>Padrão:</b> {pattern_key}{(' após '+str(after_num)) if after_num else ''}",
+        f"🧮 <b>Base:</b> [{', '.join(str(x) for x in base)}]",
+        f"📊 Conf: {conf_capped*100:.2f}% | Amostra≈{samples}"
+    ]
+    await tg_broadcast("\\n".join(out_lines))
 
     await ia2_process_once()
     return {"ok": True, "sent": True, "number": int(number), "conf": float(conf_capped), "samples": int(samples)}
