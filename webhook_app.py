@@ -1,4 +1,4 @@
--*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # Fantan Guardião — FIRE-only (G0 + Recuperação oculta) — AJUSTADO
 # Requisitos atendidos:
 #   • Só dispara a mensagem curta (sem cabeçalho de IA, sem relatórios extras):
