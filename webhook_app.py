@@ -75,6 +75,10 @@ WARMUP_SAMPLES    = 5_000
 
 app = FastAPI(title="Fantan Guardião — FIRE-only (ajustado)", version="3.11.1")
 
+# importa e registra o force_fire_router
+from force_fire_router import router as force_fire_router
+app.include_router(force_fire_router)
+
 # =========================
 # DB helpers
 # =========================
