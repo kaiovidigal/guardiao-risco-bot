@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-# Fan Tan — Guardião (G0 + Recuperação oculta) — LATÊNCIA+FILA LIVRE EDITION (com guard rails)
+# Fan Tan — Guardião (G0 + Recuperação oculta) — LATÊNCIA+FILA LIVRE EDITION (RECOVERY+SILENT LOSS)
 # - Envio imediato (broadcast antes do caminho pesado/DB)
 # - HTTPX global (keep-alive) + fire-and-forget no Telegram
-# - Fases com espaçamento menor entre tiros (ajustado)
-# - Toggle ALWAYS_FREE_FIRE=0 (default) -> NÃO ignora travas por pendência aberta (mais seguro)
+# - Fases com espaçamento menor entre tiros
+# - Toggle ALWAYS_FREE_FIRE=1 (default) -> ignora travas por pendência aberta (G1/G2 ocultas)
 # - INTEL_ANALYZE_INTERVAL padrão 0.2s (mais “nervoso”)
-# - Guard rails:
-#     (A) Pattern Quality Guard: se o padrão estiver ruim, abster.
-#     (B) Anti-empate mais rígido: exige gap maior entre top1 e top2.
+# - **NOVO**: Recuperação G1/G2 ativa e **sem broadcast de LOSS**. GREEN de recuperação continua oculto.
 #
 # Rotas:
 #   POST /webhook/<WEBHOOK_TOKEN>   (recebe mensagens do Telegram)
@@ -23,7 +21,7 @@
 #   INTEL_SIGNAL_INTERVAL (default: 20)
 #   INTEL_ANALYZE_INTERVAL (default: 0.2)
 #   FLUSH_KEY (default: meusegredo123)
-#   ALWAYS_FREE_FIRE (default: 0 -> NÃO ignora pendências abertas)
+#   ALWAYS_FREE_FIRE (default: 1 -> ignora pendências abertas)
 #
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
@@ -82,32 +80,35 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 REPL_ENABLED  = True
 REPL_CHANNEL  = "-1003052132833"  # @fantanautomatico2
 
+# Canal dedicado de IA (secundário)
+IA_CHANNEL = os.getenv("IA_CHANNEL", "-1002796105884").strip()
+
 # =========================
 # Toggle: liberar múltiplos G0 simultâneos (sem travar por pendência)
 # =========================
-# 🔒 MAIS SEGURO por padrão (0): não ignorar pendências abertas
-ALWAYS_FREE_FIRE = os.getenv("ALWAYS_FREE_FIRE", "0").strip().lower() in ("1","true","yes","on")
+ALWAYS_FREE_FIRE = os.getenv("ALWAYS_FREE_FIRE", "1").strip().lower() in ("1","true","yes","on")
 
 # =========================
 # MODO: Resultado rápido com recuperação oculta
 # =========================
+# **Mantém a recuperação silenciosa**: G0 público; G1/G2 silenciosos.
 MAX_STAGE     = 3         # 3 = G0, G1, G2 (recuperação silenciosa)
 FAST_RESULT   = True      # publica G0 imediatamente
-SCORE_G0_ONLY = True      # placar do dia só conta G0 e Loss (limpo)
+SCORE_G0_ONLY = True      # placar do dia conta G0 e Loss (limpo)
 
 # =========================
-# Hiperparâmetros (ajuste G0 equilibrado)
+# Hiperparâmetros (ajuste G0 equilibrado; guard-rails ativos)
 # =========================
 WINDOW = 400
 DECAY  = 0.985
 W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
 ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
-GAP_MIN = 0.08
+GAP_MIN = 0.10  # exigimos gap maior (antes 0.08) — melhora tiro seco
 
-# Filtros de qualidade para G0 (mínimos globais – os efetivos vêm do _eff())
-MIN_CONF_G0 = 0.55
-MIN_GAP_G0  = 0.04
-MIN_SAMPLES = 1000
+# Filtros de qualidade para G0
+MIN_CONF_G0 = 0.60  # mais rígido
+MIN_GAP_G0  = 0.050
+MIN_SAMPLES = 1800  # pede mais histórico antes de operar
 
 # =========================
 # Inteligência em disco (/var/data) — ENV
@@ -122,8 +123,14 @@ INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "0.2"))  # �
 # =========================
 SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta) [FAST+FREE] + guard rails",
-              version="3.12.0-guardrails")
+# =========================
+# Sinalização (novos toggles)
+# =========================
+BROADCAST_LOSS = False           # ⛔ não enviar LOSS no G0
+BROADCAST_RECOVERY_GREEN = False # manter G1/G2 silenciosos
+
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta) [FAST+FREE+SILENT LOSS]",
+              version="3.12.0-recovery-silent")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -278,26 +285,55 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
         print(f"[TG] send error: {e}")
 
 async def tg_broadcast(text: str, parse: str="HTML"):
+    # broadcast padrão (canal réplica)
     if REPL_ENABLED and REPL_CHANNEL:
         await tg_send_text(REPL_CHANNEL, text, parse)
 
+async def ia_send_text(text: str, parse: str="HTML"):
+    # envio para o canal secundário de IA
+    if IA_CHANNEL:
+        await tg_send_text(IA_CHANNEL, text, parse)
+
 # === Mensagens (recuperação oculta NÃO emite broadcast) ===
 async def send_green_imediato(sugerido:int, stage_txt:str="G0"):
+    # público (réplica)
     await tg_broadcast(f"✅ <b>GREEN</b> em <b>{stage_txt}</b> — Número: <b>{sugerido}</b>")
+    # IA secundário
+    await ia_send_text(f"✅ <b>GREEN</b> em <b>{stage_txt}</b> — Número: <b>{sugerido}</b>")
 
 async def send_loss_imediato(sugerido:int, stage_txt:str="G0"):
-    await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b> (em {stage_txt})")
+    if BROADCAST_LOSS:
+        await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b> (em {stage_txt})")
+    # se estiver desativado, fica silencioso
 
 async def send_recovery(_stage_txt:str):
+    if BROADCAST_RECOVERY_GREEN:
+        await tg_broadcast(f"✅ <b>GREEN</b> — Recuperação {_stage_txt}")
     return
 
-async def ia2_send_signal(best:int, conf:float, tail_len:int, mode:str):
+async def ia2_send_signal(best:int, conf:float, tail_len:int, mode:str, after_num: int | None = None):
+async def ia_result_post(number:int, stage_txt:str, result:str, after_num: int | None = None):
+    # result: 'GREEN' or 'LOSS'
+    aft = f"\n       Após número {after_num}" if after_num else ""
+    head = "🤖 Tiro seco por IA"
+    body = (
+        f"{head}\n"
+        f"🎯 Número seco ({stage_txt}): <b>{number}</b>" + aft + "\n"
+        f"{'✅ <b>GREEN</b>' if result=='GREEN' else '❌ <b>LOSS</b>'} — Número: <b>{number}</b> (em {stage_txt})"
+    )
+    try:
+        await ia_send_text(body)
+    except Exception as e:
+        print(f"[IA_POST] send error: {e}")
+
+    # Template requisitado para o canal de IA
+    aft = f"\n       Após número {after_num}" if after_num else ""
     txt = (
-        f"🤖 <b>{SELF_LABEL_IA} [{mode}]</b>\n"
-        f"🎯 Número seco (G0): <b>{best}</b>\n"
+        f"🤖 Tiro seco por IA [FIRE]\n"
+        f"🎯 Número seco (G0): <b>{best}</b>" + aft + "\n"
         f"📈 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{tail_len}</b>"
     )
-    await tg_broadcast(txt)
+    await ia_send_text(txt)
 
 # =========================
 # Timeline & n-grams
@@ -752,12 +788,12 @@ async def _daily_reset_task():
 # =========================
 # IA2 — FIRE-only (sem SOFT/INFO) + fila única (adaptativa)
 # =========================
-IA2_TIER_STRICT             = 0.62
-IA2_GAP_SAFETY              = 0.08
-IA2_DELTA_GAP               = 0.03
-IA2_MAX_PER_HOUR            = 30
-IA2_COOLDOWN_AFTER_LOSS     = 8
-IA2_MIN_SECONDS_BETWEEN_FIRE= 2  # espaçamento curto para "simultâneos"
+IA2_TIER_STRICT             = 0.66
+IA2_GAP_SAFETY              = 0.06
+IA2_DELTA_GAP               = 0.02
+IA2_MAX_PER_HOUR            = 12
+IA2_COOLDOWN_AFTER_LOSS     = 15
+IA2_MIN_SECONDS_BETWEEN_FIRE= 5  # evita rajada
 
 _S_A_MAX = 20_000
 _S_B_MAX = 100_000
@@ -804,48 +840,46 @@ def _adaptive_phase() -> str:
     _phase_name, _phase_since_ts = target, now
     return _phase_name
 
-# ========= NOVO: thresholds mais conservadores nas fases =========
 def _eff() -> dict:
     p = _adaptive_phase()
-    # Mantemos min 4–5s para evitar flood; menos tiros/hora; thresholds mais altos
     if p == "A":
         return {
             "PHASE": "A",
-            "MAX_CONCURRENT_PENDINGS": 2,
-            "IA2_MAX_PER_HOUR": 12,
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": 4,
-            "IA2_COOLDOWN_AFTER_LOSS": 15,
-            "IA2_TIER_STRICT": 0.66,
+            "MAX_CONCURRENT_PENDINGS": 1,
+            "IA2_MAX_PER_HOUR": IA2_MAX_PER_HOUR,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": IA2_MIN_SECONDS_BETWEEN_FIRE,
+            "IA2_COOLDOWN_AFTER_LOSS": IA2_COOLDOWN_AFTER_LOSS,
+            "IA2_TIER_STRICT": 0.64,
             "IA2_DELTA_GAP": 0.02,
-            "IA2_GAP_SAFETY": 0.06,
-            "MIN_CONF_G0": 0.62,
-            "MIN_GAP_G0": 0.055,
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
+            "MIN_CONF_G0": MIN_CONF_G0,
+            "MIN_GAP_G0": MIN_GAP_G0,
         }
     elif p == "B":
         return {
             "PHASE": "B",
-            "MAX_CONCURRENT_PENDINGS": 2,
-            "IA2_MAX_PER_HOUR": 12,
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": 4,
-            "IA2_COOLDOWN_AFTER_LOSS": 18,
-            "IA2_TIER_STRICT": 0.68,
+            "MAX_CONCURRENT_PENDINGS": 1,
+            "IA2_MAX_PER_HOUR": IA2_MAX_PER_HOUR,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": IA2_MIN_SECONDS_BETWEEN_FIRE,
+            "IA2_COOLDOWN_AFTER_LOSS": IA2_COOLDOWN_AFTER_LOSS,
+            "IA2_TIER_STRICT": 0.66,
             "IA2_DELTA_GAP": 0.02,
-            "IA2_GAP_SAFETY": 0.06,
-            "MIN_CONF_G0": 0.64,
-            "MIN_GAP_G0": 0.058,
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
+            "MIN_CONF_G0": MIN_CONF_G0,
+            "MIN_GAP_G0": MIN_GAP_G0,
         }
     else:
         return {
             "PHASE": "C",
             "MAX_CONCURRENT_PENDINGS": 1,
-            "IA2_MAX_PER_HOUR": 10,
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": 5,
-            "IA2_COOLDOWN_AFTER_LOSS": 20,
-            "IA2_TIER_STRICT": 0.70,
+            "IA2_MAX_PER_HOUR": IA2_MAX_PER_HOUR,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": IA2_MIN_SECONDS_BETWEEN_FIRE,
+            "IA2_COOLDOWN_AFTER_LOSS": IA2_COOLDOWN_AFTER_LOSS,
+            "IA2_TIER_STRICT": 0.68,
             "IA2_DELTA_GAP": 0.02,
-            "IA2_GAP_SAFETY": 0.06,
-            "MIN_CONF_G0": 0.68,
-            "MIN_GAP_G0": 0.060,
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
+            "MIN_CONF_G0": MIN_CONF_G0,
+            "MIN_GAP_G0": MIN_GAP_G0,
         }
 
 _ia2_blocked_until_ts: int = 0
@@ -882,7 +916,7 @@ def _ia_set_post_loss_block():
 
 def _has_open_pending() -> bool:
     if ALWAYS_FREE_FIRE:
-        return False  # ⚠️ ignora pendências abertas (desaconselhado para alta acurácia)
+        return False  # ✅ ignora pendências abertas
     eff = _eff()
     open_cnt = int(_get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1"))
     return open_cnt >= eff["MAX_CONCURRENT_PENDINGS"]
@@ -900,7 +934,7 @@ def _ia2_mark_fire_sent():
     _ia2_last_fire_ts = now_ts()
 
 # =========================
-# Pendências (FastResult: G0 imediato + recuperação oculta)
+# Pendências (FastResult: G0 imediato + recuperação oculta G1/G2)
 # =========================
 class _IntelStub:
     def __init__(self, base_dir: str):
@@ -978,6 +1012,7 @@ async def close_pending_with_result(n_observed: int, event_kind: str):
                     _convert_last_loss_to_green()
                     if src == "IA": _convert_last_loss_to_green_ia()
                     bump_recov_g1(suggested, True)
+                    # recuperação GREEN permanece silenciosa
                 try: INTEL.stop_signal()
                 except Exception: pass
             else:
@@ -990,7 +1025,7 @@ async def close_pending_with_result(n_observed: int, event_kind: str):
                     if stage == 0:
                         update_daily_score(0, False)
                         if src == "IA": update_daily_score_ia(0, False)
-                        await send_loss_imediato(suggested, "G0")
+                        await send_loss_imediato(suggested, "G0")  # pode estar silencioso
                         _ia_set_post_loss_block()
                         bump_recov_g1(suggested, False)
                 else:
@@ -1015,7 +1050,7 @@ def tail_top2_boost(tail: List[int], k:int=40) -> Dict[int, float]:
     return boosts
 
 # =========================
-# Predição (número seco) + GUARD RAILS
+# Predição (número seco)
 # =========================
 def ngram_backoff_score(tail: List[int], after_num: Optional[int], candidate: int) -> float:
     score = 0.0
@@ -1077,14 +1112,6 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
         pw = rowp["wins"] if rowp else 0; pl = rowp["losses"] if rowp else 0
         p_pat = laplace_ratio(pw, pl)
 
-        # ---- (A) Pattern Quality Guard ----
-        total_pat = (pw + pl)
-        if total_pat >= 10:
-            pat_rate = (pw + 1.0) / (total_pat + 2.0)  # Laplace
-            if pat_rate < 0.52:
-                # padrão ruim nesta janela → aborta geral (abstenção)
-                return None, 0.0, len(tail), {k: 1/len(base) for k in base}
-
         p_str = 1/len(base)
         if strategy:
             rows = query_one("SELECT wins, losses FROM stats_strategy WHERE strategy=? AND number=?", (strategy, c))
@@ -1108,14 +1135,13 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
     last = query_one("SELECT suggested, announced FROM pending_outcome ORDER BY id DESC LIMIT 1")
     if last and number is not None and last["suggested"] == number and (last["announced"] or 0) == 1:
         effx = _eff()
-        if post.get(number, 0.0) < (effx["MIN_CONF_G0"] + 0.08):
+        if post.get(number, 0.0) < (effx["MIN_CONF_G0"] + 0.10):
             return None, 0.0, samples, post
 
-    # ---- (B) Anti-empate mais rígido: gap mínimo 0.020 ----
     top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
     if len(top) == 2:
         t1, t2 = top[0][1], top[1][1]
-        if (t1 - t2) < 0.020:
+        if (t1 - t2) < 0.030:
             return None, 0.0, samples, post
 
     eff = _eff()
@@ -1195,7 +1221,7 @@ async def ia2_process_once():
 
     if _relevance_ok(conf_raw, gap, tail_len) and _ia2_can_fire_now():
         open_pending(strategy, best, source="IA")
-        await ia2_send_signal(best, conf_raw, tail_len, "FIRE")
+        # 🔕 Não anunciar FIRE: só publicar quando sair GREEN/LOSS
         _ia2_mark_fire_sent()
         _mark_reason(f"FIRE(best={best}, conf={conf_raw:.3f}, gap={gap:.3f}, tail={tail_len})")
         return
@@ -1425,6 +1451,8 @@ async def debug_state():
             "MAX_CONCURRENT_PENDINGS": eff["MAX_CONCURRENT_PENDINGS"],
             "INTEL_ANALYZE_INTERVAL": INTEL_ANALYZE_INTERVAL,
             "ALWAYS_FREE_FIRE": ALWAYS_FREE_FIRE,
+            "BROADCAST_LOSS": BROADCAST_LOSS,
+            "BROADCAST_RECOVERY_GREEN": BROADCAST_RECOVERY_GREEN,
         }
         _g7, _l7, acc7 = _ia_acc_days(7)
         return {
