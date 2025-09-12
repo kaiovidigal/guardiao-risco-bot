@@ -1,16 +1,14 @@
+# -*- coding: utf-8 -*-
 # force_fire_router.py
-# Add-on para expor /debug/force_fire como GET e enviar FIRE imediato no canal
-
 import os
-from fastapi import Query
-from fastapi import APIRouter
 import httpx
-import json
+from fastapi import APIRouter, Query
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
-REPL_CHANNEL = os.getenv("REPL_CHANNEL", "").strip()
+# --- ENV / Telegram ---
+TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()
-FLUSH_KEY    = os.getenv("FLUSH_KEY", "meusegredo123").strip()
+REPL_CHANNEL   = os.getenv("REPL_CHANNEL", "").strip()  # opcional
+FLUSH_KEY      = os.getenv("FLUSH_KEY", "meusegredo123").strip()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
@@ -34,19 +32,22 @@ async def debug_force_fire(
     conf: float = Query(default=0.72),
     samples: int = Query(default=452122),
 ):
+    # segurança simples
     if not key or key != FLUSH_KEY:
         return {"ok": False, "error": "unauthorized"}
 
-    txt = (f"ð¤ <b>Tiro seco por IA [FIRE]</b>\n"
-           f"ð¯ NÃºmero seco (G0): <b>{number}</b>\n"
-           f"ð§© PadrÃ£o: {pattern}\n"
-           f"ð§® Base: {base}\n"
-           f"ð Conf: {conf*100:.2f}% | Amostraâ{samples}")
+    txt = (
+        f"🤖 <b>Tiro seco por IA [FIRE]</b>\n"
+        f"🎯 Número seco (G0): <b>{number}</b>\n"
+        f"🧩 Padrão: {pattern}\n"
+        f"🧮 Base: {base}\n"
+        f"📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
+    )
 
     channel = REPL_CHANNEL or PUBLIC_CHANNEL
     await _send_message(channel, txt)
-
     return {"ok": True, "fire": number, "conf": conf, "samples": samples}
 
 def attach_force_fire(app):
+    """Alternativa: app.include_router(router)"""
     app.include_router(router)
