@@ -1515,3 +1515,15 @@ async def debug_flush(request: Request, days: int = 7, key: str = ""):
         return {"ok": True, "flushed": True, "days": max(1, min(days, 30))}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.get("/debug/ping_ia")
+async def debug_ping_ia(request: Request, text: str = "ping", key: str = ""):
+    # Usa a mesma chave do /debug/flush
+    try:
+        if not key or key != FLUSH_KEY:
+            return {"ok": False, "error": "unauthorized"}
+        await ia_send_text(f"🔧 Teste IA: {text}")
+        return {"ok": True, "sent": True, "to": IA_CHANNEL}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
