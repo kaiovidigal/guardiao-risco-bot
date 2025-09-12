@@ -574,3 +574,34 @@ async def dbg_flush():
         return {"ok": False, "error": str(e)}
     _last_flush = now_ts()
     return {"ok": True}
+    # =========================
+# Dump do banco de dados
+# =========================
+from fastapi.responses import FileResponse, JSONResponse
+
+@app.get("/debug/dumpdb")
+async def dump_db():
+    try:
+        path = DB_PATH
+        if os.path.exists(path):
+            return FileResponse(path, filename="data.db")
+        return {"ok": False, "error": "Arquivo não encontrado"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+@app.get("/debug/dumpjson")
+async def dump_json():
+    try:
+        data = {
+            "timeline": [dict(r) for r in query_all("SELECT * FROM timeline")],
+            "ngrams": [dict(r) for r in query_all("SELECT * FROM ngram_stats")],
+            "patterns": [dict(r) for r in query_all("SELECT * FROM stats_pattern")],
+            "strategies": [dict(r) for r in query_all("SELECT * FROM stats_strategy")],
+            "suggestions": [dict(r) for r in query_all("SELECT * FROM suggestions")],
+            "daily_score": [dict(r) for r in query_all("SELECT * FROM daily_score")],
+            "daily_score_ia": [dict(r) for r in query_all("SELECT * FROM daily_score_ia")],
+        }
+        return JSONResponse(content=data)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    
