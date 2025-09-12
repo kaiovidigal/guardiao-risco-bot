@@ -392,7 +392,7 @@ def parse_bases_and_pattern(text: str) -> Tuple[List[int], str]:
 
 GREEN_PATTERNS = [
     re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\((\d)\)", re.I | re.S),
-    re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | reS),
+    re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | re.S),
     re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
 ]
 RED_PATTERNS = [
