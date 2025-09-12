@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-# Fan Tan — Guardião (G0 + Recuperação oculta) — LATÊNCIA+FILA LIVRE EDITION
+# Fan Tan — Guardião (G0 + Recuperação oculta) — LATÊNCIA+FILA LIVRE EDITION (com guard rails)
 # - Envio imediato (broadcast antes do caminho pesado/DB)
 # - HTTPX global (keep-alive) + fire-and-forget no Telegram
-# - Fases com espaçamento menor entre tiros
-# - Toggle ALWAYS_FREE_FIRE=1 (default) -> ignora travas por pendência aberta (G1/G2 ocultas)
+# - Fases com espaçamento menor entre tiros (ajustado)
+# - Toggle ALWAYS_FREE_FIRE=0 (default) -> NÃO ignora travas por pendência aberta (mais seguro)
 # - INTEL_ANALYZE_INTERVAL padrão 0.2s (mais “nervoso”)
+# - Guard rails:
+#     (A) Pattern Quality Guard: se o padrão estiver ruim, abster.
+#     (B) Anti-empate mais rígido: exige gap maior entre top1 e top2.
 #
 # Rotas:
 #   POST /webhook/<WEBHOOK_TOKEN>   (recebe mensagens do Telegram)
@@ -20,7 +23,7 @@
 #   INTEL_SIGNAL_INTERVAL (default: 20)
 #   INTEL_ANALYZE_INTERVAL (default: 0.2)
 #   FLUSH_KEY (default: meusegredo123)
-#   ALWAYS_FREE_FIRE (default: 1 -> ignora pendências abertas)
+#   ALWAYS_FREE_FIRE (default: 0 -> NÃO ignora pendências abertas)
 #
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
@@ -82,7 +85,8 @@ REPL_CHANNEL  = "-1003052132833"  # @fantanautomatico2
 # =========================
 # Toggle: liberar múltiplos G0 simultâneos (sem travar por pendência)
 # =========================
-ALWAYS_FREE_FIRE = os.getenv("ALWAYS_FREE_FIRE", "1").strip().lower() in ("1","true","yes","on")
+# 🔒 MAIS SEGURO por padrão (0): não ignorar pendências abertas
+ALWAYS_FREE_FIRE = os.getenv("ALWAYS_FREE_FIRE", "0").strip().lower() in ("1","true","yes","on")
 
 # =========================
 # MODO: Resultado rápido com recuperação oculta
@@ -100,7 +104,7 @@ W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
 ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
 GAP_MIN = 0.08
 
-# Filtros de qualidade para G0
+# Filtros de qualidade para G0 (mínimos globais – os efetivos vêm do _eff())
 MIN_CONF_G0 = 0.55
 MIN_GAP_G0  = 0.04
 MIN_SAMPLES = 1000
@@ -118,7 +122,8 @@ INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "0.2"))  # �
 # =========================
 SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta) [FAST+FREE]", version="3.11.0-freefire")
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta) [FAST+FREE] + guard rails",
+              version="3.12.0-guardrails")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -799,47 +804,48 @@ def _adaptive_phase() -> str:
     _phase_name, _phase_since_ts = target, now
     return _phase_name
 
+# ========= NOVO: thresholds mais conservadores nas fases =========
 def _eff() -> dict:
     p = _adaptive_phase()
-    # Mantemos min 2s em todas as fases para permitir simultâneos sem flood
+    # Mantemos min 4–5s para evitar flood; menos tiros/hora; thresholds mais altos
     if p == "A":
         return {
             "PHASE": "A",
-            "MAX_CONCURRENT_PENDINGS": 3,
-            "IA2_MAX_PER_HOUR": 30,
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": 2,
-            "IA2_COOLDOWN_AFTER_LOSS": 8,
-            "IA2_TIER_STRICT": 0.59,
-            "IA2_DELTA_GAP": 0.04,
-            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
-            "MIN_CONF_G0": 0.52,
-            "MIN_GAP_G0": 0.035,
+            "MAX_CONCURRENT_PENDINGS": 2,
+            "IA2_MAX_PER_HOUR": 12,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 4,
+            "IA2_COOLDOWN_AFTER_LOSS": 15,
+            "IA2_TIER_STRICT": 0.66,
+            "IA2_DELTA_GAP": 0.02,
+            "IA2_GAP_SAFETY": 0.06,
+            "MIN_CONF_G0": 0.62,
+            "MIN_GAP_G0": 0.055,
         }
     elif p == "B":
         return {
             "PHASE": "B",
-            "MAX_CONCURRENT_PENDINGS": 3,
-            "IA2_MAX_PER_HOUR": 30,
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": 2,
-            "IA2_COOLDOWN_AFTER_LOSS": 8,
-            "IA2_TIER_STRICT": 0.60,
-            "IA2_DELTA_GAP": 0.04,
-            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
-            "MIN_CONF_G0": 0.53,
-            "MIN_GAP_G0": 0.035,
+            "MAX_CONCURRENT_PENDINGS": 2,
+            "IA2_MAX_PER_HOUR": 12,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 4,
+            "IA2_COOLDOWN_AFTER_LOSS": 18,
+            "IA2_TIER_STRICT": 0.68,
+            "IA2_DELTA_GAP": 0.02,
+            "IA2_GAP_SAFETY": 0.06,
+            "MIN_CONF_G0": 0.64,
+            "MIN_GAP_G0": 0.058,
         }
     else:
         return {
             "PHASE": "C",
-            "MAX_CONCURRENT_PENDINGS": 3,
-            "IA2_MAX_PER_HOUR": 30,
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": 2,
-            "IA2_COOLDOWN_AFTER_LOSS": 10,
-            "IA2_TIER_STRICT": 0.62,
-            "IA2_DELTA_GAP": 0.03,
-            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
-            "MIN_CONF_G0": 0.55,
-            "MIN_GAP_G0": 0.040,
+            "MAX_CONCURRENT_PENDINGS": 1,
+            "IA2_MAX_PER_HOUR": 10,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 5,
+            "IA2_COOLDOWN_AFTER_LOSS": 20,
+            "IA2_TIER_STRICT": 0.70,
+            "IA2_DELTA_GAP": 0.02,
+            "IA2_GAP_SAFETY": 0.06,
+            "MIN_CONF_G0": 0.68,
+            "MIN_GAP_G0": 0.060,
         }
 
 _ia2_blocked_until_ts: int = 0
@@ -876,7 +882,7 @@ def _ia_set_post_loss_block():
 
 def _has_open_pending() -> bool:
     if ALWAYS_FREE_FIRE:
-        return False  # ✅ ignora pendências abertas
+        return False  # ⚠️ ignora pendências abertas (desaconselhado para alta acurácia)
     eff = _eff()
     open_cnt = int(_get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1"))
     return open_cnt >= eff["MAX_CONCURRENT_PENDINGS"]
@@ -1009,7 +1015,7 @@ def tail_top2_boost(tail: List[int], k:int=40) -> Dict[int, float]:
     return boosts
 
 # =========================
-# Predição (número seco)
+# Predição (número seco) + GUARD RAILS
 # =========================
 def ngram_backoff_score(tail: List[int], after_num: Optional[int], candidate: int) -> float:
     score = 0.0
@@ -1071,6 +1077,14 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
         pw = rowp["wins"] if rowp else 0; pl = rowp["losses"] if rowp else 0
         p_pat = laplace_ratio(pw, pl)
 
+        # ---- (A) Pattern Quality Guard ----
+        total_pat = (pw + pl)
+        if total_pat >= 10:
+            pat_rate = (pw + 1.0) / (total_pat + 2.0)  # Laplace
+            if pat_rate < 0.52:
+                # padrão ruim nesta janela → aborta geral (abstenção)
+                return None, 0.0, len(tail), {k: 1/len(base) for k in base}
+
         p_str = 1/len(base)
         if strategy:
             rows = query_one("SELECT wins, losses FROM stats_strategy WHERE strategy=? AND number=?", (strategy, c))
@@ -1097,10 +1111,11 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
         if post.get(number, 0.0) < (effx["MIN_CONF_G0"] + 0.08):
             return None, 0.0, samples, post
 
+    # ---- (B) Anti-empate mais rígido: gap mínimo 0.020 ----
     top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
     if len(top) == 2:
         t1, t2 = top[0][1], top[1][1]
-        if (t1 - t2) < 0.015:
+        if (t1 - t2) < 0.020:
             return None, 0.0, samples, post
 
     eff = _eff()
