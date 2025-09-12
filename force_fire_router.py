@@ -1,27 +1,37 @@
 # -*- coding: utf-8 -*-
-# force_fire_router.py
+# force_fire_router.py — rota manual de disparo de FIRE no Fantan Guardião
+
 import os
 import httpx
 from fastapi import APIRouter, Query
 
-# --- ENV / Telegram ---
+# ENV
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
+REPL_CHANNEL   = os.getenv("REPL_CHANNEL", "").strip()
 PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()
-REPL_CHANNEL   = os.getenv("REPL_CHANNEL", "").strip()  # opcional
 FLUSH_KEY      = os.getenv("FLUSH_KEY", "meusegredo123").strip()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 router = APIRouter()
 
+
 async def _send_message(chat_id: str, text: str):
+    """Função auxiliar para enviar mensagem ao Telegram."""
     if not TG_BOT_TOKEN or not chat_id:
         return False
     async with httpx.AsyncClient(timeout=15) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage",
-                          json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                                "disable_web_page_preview": True})
+        await client.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+        )
     return True
+
 
 @router.get("/debug/force_fire")
 async def debug_force_fire(
@@ -32,7 +42,7 @@ async def debug_force_fire(
     conf: float = Query(default=0.72),
     samples: int = Query(default=452122),
 ):
-    # segurança simples
+    """Disparo manual de FIRE (teste/debug)."""
     if not key or key != FLUSH_KEY:
         return {"ok": False, "error": "unauthorized"}
 
@@ -46,8 +56,10 @@ async def debug_force_fire(
 
     channel = REPL_CHANNEL or PUBLIC_CHANNEL
     await _send_message(channel, txt)
+
     return {"ok": True, "fire": number, "conf": conf, "samples": samples}
 
+
 def attach_force_fire(app):
-    """Alternativa: app.include_router(router)"""
+    """Anexa este router à instância principal do FastAPI."""
     app.include_router(router)
