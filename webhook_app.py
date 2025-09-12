@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+-*- coding: utf-8 -*-
 # Fantan Guardião — FIRE-only (G0 + Recuperação oculta) — AJUSTADO
 # Requisitos atendidos:
 #   • Só dispara a mensagem curta (sem cabeçalho de IA, sem relatórios extras):
@@ -9,6 +9,8 @@
 #   • Thresholds dinâmicos com warm-up iniciando em 0% e subindo conforme amostra e acc(7d).
 #   • Mantém boost leve do top-2 da cauda (40).
 #   • GREEN/LOSS continuam funcionando normalmente.
+#   • Relatório de saúde reativado (sem texto de IA), com modo automático a cada X minutos
+#     controlado por variáveis de ambiente, e disparo manual via /debug/flush.
 #
 # Rotas úteis preservadas (mesma estrutura):
 #   POST /webhook/<WEBHOOK_TOKEN>
@@ -42,6 +44,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 # Espelho/replicador opcional (mantido, mas pode apontar para o seu canal principal)
 REPL_ENABLED, REPL_CHANNEL = True, (os.getenv("REPL_CHANNEL") or "-1003052132833")
 
+# Relatório de saúde: auto (1) ou só manual (0), e intervalo em minutos
+HEALTH_AUTO = (os.getenv("HEALTH_AUTO", "1").strip() != "0")
+HEALTH_EVERY_MIN = int(os.getenv("HEALTH_EVERY_MIN", "30") or "30")
+
 # =========================
 # MODO & Hiperparâmetros
 # =========================
@@ -72,7 +78,7 @@ SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 CONF_CAP, GAP_CAP = 0.999, 1.0
 WARMUP_SAMPLES    = 5_000
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (ajustado)", version="3.11.2")
+app = FastAPI(title="Fantan Guardião — FIRE-only (ajustado)", version="3.11.3")
 
 # =========================
 # DB helpers
@@ -385,7 +391,8 @@ def _convert_last_loss_to_green_ia():
         return
     g0,loss,streak = row["g0"] or 0, row["loss"] or 0, row["streak"] or 0
     if loss>0: loss-=1; g0+=1; streak+=1
-    exec_write("""INSERT OR REPLACE INTO daily_score_ia (yyyymmdd,g0,loss,streak) VALUES (?,?,?,?)""",(y,g0,loss,streak))
+    exec_write("""INSERT OR REPLACE INTO daily_score_ia (yyyymmdd,g0,loss,streak) VALUES (?,?,?,?)""",
+               (y,g0,loss,streak))
 
 def _ia_acc_days(days:int=7) -> Tuple[int,int,float]:
     days = max(1, min(int(days), 30))
@@ -394,7 +401,7 @@ def _ia_acc_days(days:int=7) -> Tuple[int,int,float]:
     return int(g), int(l), (g/(g+l)) if (g+l)>0 else 0.0
 
 # =========================
-# Health + debug (sem relatórios longos)
+# Health + debug (relatório curto, sem texto de IA)
 # =========================
 def _get_scalar(sql: str, params: tuple = (), default: int|float = 0):
     row = query_one(sql, params)
@@ -407,10 +414,37 @@ def _mark_reason(r: str):
     global _ia2_last_reason,_ia2_last_reason_ts
     _ia2_last_reason, _ia2_last_reason_ts = r, now_ts()
 
+def _health_text() -> str:
+    try:
+        samples = int((query_one("SELECT SUM(weight) AS s FROM ngram_stats")["s"] or 0))
+    except: 
+        samples = 0
+
+    pend_open = int(_get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1"))
+    y = today_key_local()
+    r = query_one("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+    g0   = int(r["g0"]   if r and r["g0"]   is not None else 0)
+    loss = int(r["loss"] if r and r["loss"] is not None else 0)
+    total = g0 + loss
+    acc = (g0/total*100.0) if total else 0.0
+
+    age = max(0, now_ts() - (_ia2_last_reason_ts or now_ts()))
+    return ("🩺 <b>Saúde do Guardião</b>\n"
+            f"⏱️ UTC: <code>{utc_iso()}</code>\n"
+            f"📚 amostras≈<b>{samples}</b>\n"
+            f"📊 Hoje: G0=<b>{g0}</b> | Loss=<b>{loss}</b> | ✅ {acc:.2f}%\n"
+            f"⏳ pendências abertas: <b>{pend_open}</b>\n"
+            f"⚙️ conf≥{MIN_CONF_G0:.2f} | gap≥{MIN_GAP_G0:.3f}\n"
+            f"🧠 motivo: {_ia2_last_reason} (há {age}s)\n")
+
 async def _health_reporter_task():
-    # suprimido: não enviar relatórios automáticos
+    # envia a cada HEALTH_EVERY_MIN (padrão 30 min)
     while True:
-        await asyncio.sleep(30*60)
+        try:
+            await tg_broadcast(_health_text())
+        except Exception as e:
+            print(f"[HEALTH] erro: {e}")
+        await asyncio.sleep(max(60, HEALTH_EVERY_MIN * 60))
 
 async def _daily_reset_task():
     while True:
@@ -663,7 +697,9 @@ async def root():
 
 @app.on_event("startup")
 async def _boot_tasks():
-    try: asyncio.create_task(_health_reporter_task())
+    try:
+        if HEALTH_AUTO:
+            asyncio.create_task(_health_reporter_task())
     except Exception as e: print(f"[HEALTH] startup error: {e}")
     try: asyncio.create_task(_daily_reset_task())
     except Exception as e: print(f"[RESET] startup error: {e}")
@@ -766,13 +802,13 @@ async def webhook(token: str, request: Request):
         f"🧮 <b>Base:</b> [{', '.join(str(x) for x in base)}]",
         f"📊 Conf: {conf_capped*100:.2f}% | Amostra≈{samples}"
     ]
-    await tg_broadcast("\\n".join(out_lines))
+    await tg_broadcast("\n".join(out_lines))
 
     await ia2_process_once()
     return {"ok": True, "sent": True, "number": int(number), "conf": float(conf_capped), "samples": int(samples)}
 
 # =========================
-# DEBUG endpoints (sem envio de relatórios)
+# DEBUG endpoints (com envio de relatório de saúde no flush manual)
 # =========================
 @app.get("/debug/samples")
 async def debug_samples():
@@ -816,7 +852,8 @@ async def debug_state():
                 "MIN_CONF_G0": MIN_CONF_G0, "MIN_GAP_G0": MIN_GAP_G0,
                 "IA2_MAX_PER_HOUR": 20, "IA2_MIN_SECONDS_BETWEEN_FIRE": 10,
                 "IA2_COOLDOWN_AFTER_LOSS": 12, "MAX_CONCURRENT_PENDINGS": 2,
-                "WARMUP_SAMPLES": WARMUP_SAMPLES
+                "WARMUP_SAMPLES": WARMUP_SAMPLES,
+                "HEALTH_AUTO": HEALTH_AUTO, "HEALTH_EVERY_MIN": HEALTH_EVERY_MIN
             }
         }
     except Exception as e: return {"ok": False, "error": str(e)}
@@ -831,6 +868,10 @@ async def debug_flush(days: int = 7, key: str = Query(default="")):
         if now - (_last_flush_ts or 0) < 60:
             return {"ok": False,"error": "flush_cooldown","retry_after_seconds": 60 - (now - (_last_flush_ts or 0))}
         _last_flush_ts=now
-        # Sem envio de relatórios; apenas retorno rápido
+        # Envia o relatório curto de saúde
+        try:
+            await tg_broadcast(_health_text())
+        except Exception as e:
+            print(f"[FLUSH] erro ao enviar saúde: {e}")
         return {"ok": True, "flushed": True, "days": max(1,min(int(days),30))}
     except Exception as e: return {"ok": False, "error": str(e)}
