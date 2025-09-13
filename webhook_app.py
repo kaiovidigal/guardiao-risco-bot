@@ -1,110 +1,62 @@
 # -*- coding: utf-8 -*-
-# Guardião — IA independente + um único canal de sinais/resultados
-# - SIGNAL_CHANNEL recebe TUDO (sinais G0 gerados pela IA, GREEN/LOSS, progressão G1/G2)
-# - IA ignora “Entrada confirmada” como gatilho (usa só timeline/estatísticas)
-# - Fechamento de pendências com estágios (G0->G1->G2) e mensagens não silenciosas
-# - Anti-spam, debouncing e thresholds de precisão
+# Guardião AUTO — IA independente (G0/G1/G2) com metas de precisão (>=80% para FIRE)
+# - Lê apenas os números reais (mensagens "ANALISANDO" com Sequência: ...).
+# - Gera sinais de forma autônoma; NÃO depende do "Número seco (G0)" do canal.
+# - Publica TUDO (sinais + GREEN/LOSS) apenas no IA_CHANNEL.
+# - Recuperação até G2 (janela de 3 observações por pendência).
 #
-# Execução local:
-#   uvicorn webhook_app:app --host 0.0.0.0 --port 8000
+# Reqs (Render): fastapi, httpx, pydantic
 #
-# Variáveis de ambiente essenciais:
-#   TG_BOT_TOKEN      -> token do bot
-#   WEBHOOK_TOKEN     -> token do endpoint /webhook/<token>
-#   SIGNAL_CHANNEL    -> ID do canal onde TUDO será publicado (ex.: -1003052132833)
+# ENV esperadas:
+#   TG_BOT_TOKEN      -> token do bot do Telegram
+#   WEBHOOK_TOKEN     -> segredo da rota /webhook/<token>
+#   IA_CHANNEL        -> chat_id do canal de sinais (ex.: -1003052132833)
+#   DB_PATH           -> opcional (padrão: /data/data.db)
+#   WINDOW            -> tamanho da cauda p/ n-gram (padrão: 400)
+#   DECAY             -> decaimento de peso das amostras (padrão: 0.985)
+#   MIN_CONF_G0       -> confiança mínima p/ FIRE (padrão: 0.80)
+#   MIN_GAP_G0        -> gap mínimo entre top1 e top2 (padrão: 0.05)
+#   MIN_SAMPLES       -> amostras mínimas p/ FIRE (padrão: 2000)
+#   IA_MAX_PER_HOUR   -> anti-spam por hora (padrão: 30)
+#   IA_COOLDOWN_SEC   -> descanso após LOSS em G0 (padrão: 8s)
+#   IA_MIN_BETWEEN    -> intervalo mínimo entre sinais (padrão: 3s)
 #
-import os, re, json, time, sqlite3, asyncio, shutil
-from typing import List, Optional, Tuple, Dict
+import os, re, json, time, sqlite3, asyncio
 from datetime import datetime, timezone
-from collections import Counter
+from typing import Optional, List, Dict, Tuple
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 
 # =========================
-# ENV / CONFIG
+# Config
 # =========================
-DB_PATH = os.getenv("DB_PATH", "/data/data.db").strip() or "/data/data.db"
-TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
+DB_PATH         = os.getenv("DB_PATH", "/data/data.db")
+TG_BOT_TOKEN    = os.getenv("TG_BOT_TOKEN", "").strip()
+WEBHOOK_TOKEN   = os.getenv("WEBHOOK_TOKEN", "").strip()
+IA_CHANNEL      = os.getenv("IA_CHANNEL", "-1003052132833").strip()
 
-# Um ÚNICO canal para tudo (sinais + resultados)
-SIGNAL_CHANNEL = os.getenv("SIGNAL_CHANNEL", "-1003052132833").strip()
+WINDOW          = int(os.getenv("WINDOW", "400"))
+DECAY           = float(os.getenv("DECAY", "0.985"))
 
-# Desacoplar decisão da IA do canal de entrada
-USE_CHANNEL_G0 = False  # False = ignora “Entrada confirmada” como gatilho de G0
+# Pesos do backoff 4-3-2-1
+W4, W3, W2, W1  = 0.40, 0.30, 0.20, 0.10
 
-# Caminho p/ DB antigo (migração) — opcional
-OLD_DB_CANDIDATES = [
-    "/var/data/data.db",
-    "/opt/render/project/src/data.db",
-    "/opt/render/project/src/data/data.db",
-    "/data/data.db",
-]
+MIN_CONF_G0     = float(os.getenv("MIN_CONF_G0", "0.80"))
+MIN_GAP_G0      = float(os.getenv("MIN_GAP_G0",  "0.05"))
+MIN_SAMPLES     = int(os.getenv("MIN_SAMPLES",   "2000"))
 
-def _ensure_db_dir():
-    try:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    except Exception as e:
-        print(f"[DB] Falha ao criar dir DB: {e}")
+IA_MAX_PER_HOUR = int(os.getenv("IA_MAX_PER_HOUR", "30"))
+IA_COOLDOWN_SEC = int(os.getenv("IA_COOLDOWN_SEC", "8"))
+IA_MIN_BETWEEN  = int(os.getenv("IA_MIN_BETWEEN",  "3"))
 
-def _migrate_old_db_if_needed():
-    if os.path.exists(DB_PATH):
-        return
-    for src in OLD_DB_CANDIDATES:
-        if os.path.exists(src):
-            try:
-                _ensure_db_dir()
-                shutil.copy2(src, DB_PATH)
-                print(f"[DB] Migrado {src} -> {DB_PATH}")
-                return
-            except Exception as e:
-                print(f"[DB] Erro migrando {src} -> {DB_PATH}: {e}")
+TELEGRAM_API    = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-_ensure_db_dir()
-_migrate_old_db_if_needed()
-
-TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-
-# ====== Hyperparams / IA ======
-WINDOW = int(os.getenv("WINDOW", "400"))     # cauda analisada
-DECAY  = float(os.getenv("DECAY", "0.985"))
-
-# pesos do backoff n-gram
-W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
-
-# exponente de fusão (padrão/estratégia)
-ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
-
-# separação mínima de prob. entre 1º e 2º
-GAP_MIN = float(os.getenv("GAP_MIN", "0.08"))
-
-# Confiança mínima para soltar G0
-MIN_CONF_G0 = float(os.getenv("MIN_CONF_G0", "0.62"))
-# Amostra mínima de histórico (proxy de robustez)
-MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "1000"))
-
-# IA loop / segurança
-IA2_TIER_STRICT             = float(os.getenv("IA2_TIER_STRICT", "0.62"))
-IA2_DELTA_GAP               = float(os.getenv("IA2_DELTA_GAP", "0.03"))
-IA2_GAP_SAFETY              = float(os.getenv("IA2_GAP_SAFETY", "0.08"))
-IA2_MAX_PER_HOUR            = int(os.getenv("IA2_MAX_PER_HOUR", "30"))
-IA2_COOLDOWN_AFTER_LOSS     = int(os.getenv("IA2_COOLDOWN_AFTER_LOSS", "8"))
-IA2_MIN_SECONDS_BETWEEN_FIRE= int(os.getenv("IA2_MIN_SECONDS_BETWEEN_FIRE", "2"))
-
-# Estágios de recuperação
-MAX_STAGE     = 3  # G0,G1,G2
-SCORE_G0_ONLY = True  # placar conta só G0
-
-SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
-INTEL_DIR = os.getenv("INTEL_DIR", "/var/data/ai_intel").rstrip("/")
-os.makedirs(os.path.join(INTEL_DIR, "snapshots"), exist_ok=True)
-
-app = FastAPI(title="Guardião — IA independente", version="4.0.0")
+app = FastAPI(title="Guardião AUTO — IA independente", version="1.0.0")
 
 # =========================
-# SQLite
+# DB
 # =========================
 def _connect() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -114,7 +66,7 @@ def _connect() -> sqlite3.Connection:
     con.execute("PRAGMA synchronous=NORMAL;")
     return con
 
-def exec_write(sql: str, params: tuple = (), retries: int = 8, wait: float = 0.25):
+def exec_write(sql: str, params: tuple = (), retries: int = 8, wait: float = 0.2):
     for _ in range(retries):
         try:
             con = _connect()
@@ -127,19 +79,13 @@ def exec_write(sql: str, params: tuple = (), retries: int = 8, wait: float = 0.2
                 time.sleep(wait)
                 continue
             raise
-    raise sqlite3.OperationalError("Banco bloqueado após várias tentativas.")
+    raise sqlite3.OperationalError("DB bloqueado (várias tentativas).")
 
-def query_all(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
-    con = _connect()
-    rows = con.execute(sql, params).fetchall()
-    con.close()
-    return rows
+def query_all(sql: str, params: tuple = ()) -> List[sqlite3.Row]:
+    con = _connect(); rows = con.execute(sql, params).fetchall(); con.close(); return rows
 
 def query_one(sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
-    con = _connect()
-    row = con.execute(sql, params).fetchone()
-    con.close()
-    return row
+    con = _connect(); row  = con.execute(sql, params).fetchone();  con.close(); return row
 
 def init_db():
     con = _connect(); cur = con.cursor()
@@ -152,24 +98,14 @@ def init_db():
         n INTEGER NOT NULL, ctx TEXT NOT NULL, next INTEGER NOT NULL, weight REAL NOT NULL,
         PRIMARY KEY (n, ctx, next)
     )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS stats_pattern (
-        pattern_key TEXT NOT NULL, number INTEGER NOT NULL,
-        wins INTEGER NOT NULL DEFAULT 0, losses INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (pattern_key, number)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS stats_strategy (
-        strategy TEXT NOT NULL, number INTEGER NOT NULL,
-        wins INTEGER NOT NULL DEFAULT 0, losses INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (strategy, number)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS suggestions (
-        source_msg_id INTEGER PRIMARY KEY, strategy TEXT, seq_raw TEXT,
-        context_key TEXT, pattern_key TEXT, base TEXT,
-        suggested_number INTEGER, stage TEXT, sent_at INTEGER
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS last_by_strategy (
-        strategy TEXT PRIMARY KEY, source_msg_id INTEGER, suggested_number INTEGER,
-        context_key TEXT, pattern_key TEXT, stage TEXT, created_at INTEGER
+    cur.execute("""CREATE TABLE IF NOT EXISTS pending_outcome (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        suggested INTEGER NOT NULL,
+        stage INTEGER NOT NULL,
+        window_left INTEGER NOT NULL,
+        open INTEGER NOT NULL,
+        seen TEXT NOT NULL DEFAULT ''
     )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS daily_score (
         yyyymmdd TEXT PRIMARY KEY,
@@ -179,33 +115,14 @@ def init_db():
         loss INTEGER NOT NULL DEFAULT 0,
         streak INTEGER NOT NULL DEFAULT 0
     )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS pending_outcome (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL,
-        strategy TEXT, suggested INTEGER NOT NULL, stage INTEGER NOT NULL,
-        open INTEGER NOT NULL, window_left INTEGER NOT NULL,
-        seen_numbers TEXT DEFAULT '',
-        announced INTEGER NOT NULL DEFAULT 0,
-        source TEXT NOT NULL DEFAULT 'IA'
-    )""")
-    con.commit()
-    # Migrations idempotentes
-    for alter in [
-        "ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''",
-        "ALTER TABLE pending_outcome ADD COLUMN announced INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE pending_outcome ADD COLUMN source TEXT NOT NULL DEFAULT 'IA'",
-    ]:
-        try: cur.execute(alter); con.commit()
-        except sqlite3.OperationalError: pass
-    con.close()
-
+    con.commit(); con.close()
 init_db()
 
 # =========================
-# Telegram helpers
+# Telegram
 # =========================
 _httpx_client: Optional[httpx.AsyncClient] = None
-
-async def get_httpx() -> httpx.AsyncClient:
+async def _http() -> httpx.AsyncClient:
     global _httpx_client
     if _httpx_client is None:
         _httpx_client = httpx.AsyncClient(timeout=10)
@@ -215,324 +132,223 @@ async def get_httpx() -> httpx.AsyncClient:
 async def _shutdown():
     global _httpx_client
     try:
-        if _httpx_client:
-            await _httpx_client.aclose()
-    except Exception as e:
-        print(f"[HTTPX] close error: {e}")
+        if _httpx_client: await _httpx_client.aclose()
+    except Exception:
+        pass
 
-async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
-    if not TG_BOT_TOKEN or not chat_id:
-        return
+async def tg_send(chat_id: str, text: str, parse: str="HTML"):
+    if not TG_BOT_TOKEN or not chat_id: return
     try:
-        client = await get_httpx()
-        asyncio.create_task(
-            client.post(
-                f"{TELEGRAM_API}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": text,
-                    "parse_mode": parse,
-                    "disable_web_page_preview": True,
-                },
-            )
-        )
+        client = await _http()
+        await client.post(f"{TELEGRAM_API}/sendMessage",
+                          json={"chat_id": chat_id, "text": text, "parse_mode": parse,
+                                "disable_web_page_preview": True})
     except Exception as e:
         print(f"[TG] send error: {e}")
 
-async def tg_broadcast(text: str, parse: str="HTML"):
-    # ÚNICO canal para tudo
-    if SIGNAL_CHANNEL:
-        await tg_send_text(SIGNAL_CHANNEL, text, parse)
+async def send_signal(best:int, conf:float, samples:int):
+    txt = (
+        f"🤖 <b>Tiro seco por IA [FIRE]</b>\n"
+        f"🎯 Número seco (G0): <b>{best}</b>\n"
+        f"📈 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>"
+    )
+    await tg_send(IA_CHANNEL, txt)
 
-# aliases (mantidos para clareza)
-async def send_ia_text(text: str, parse: str="HTML"):      await tg_broadcast(text, parse)
-async def send_green_channel(n:int, stage_txt:str="G0"):   await tg_broadcast(f"✅ <b>GREEN</b> em <b>{stage_txt}</b> — Número: <b>{n}</b>")
-async def send_loss_channel(n:int, stage_txt:str="G0"):    await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{n}</b> (em {stage_txt})")
-async def send_green_ia(n:int, stage_txt:str="G0"):        await send_green_channel(n, stage_txt)
-async def send_loss_ia(n:int, stage_txt:str="G0"):         await send_loss_channel(n, stage_txt)
+async def send_green(n:int, stage_txt:str="G0"):
+    await tg_send(IA_CHANNEL, f"✅ <b>GREEN</b> em <b>{stage_txt}</b> — Número: <b>{n}</b>")
+
+async def send_loss(n:int, stage_txt:str="G0"):
+    await tg_send(IA_CHANNEL, f"❌ <b>LOSS</b> — Número: <b>{n}</b> (em {stage_txt})")
 
 # =========================
-# Timeline & modelos
+# Util
 # =========================
 def now_ts() -> int: return int(time.time())
-def today_key_local() -> str: return datetime.now(timezone.utc).strftime("%Y%m%d")
+def today_key() -> str: return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+def update_daily(stage: int, won: bool):
+    y = today_key()
+    r = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+    if not r: g0=g1=g2=loss=streak=0
+    else:     g0,g1,g2,loss,streak = r["g0"],r["g1"],r["g2"],r["loss"],r["streak"]
+    if won:
+        (g0,g1,g2)[stage if 0<=stage<=2 else 0]
+        if   stage==0: g0+=1
+        elif stage==1: g1+=1
+        elif stage==2: g2+=1
+        streak+=1
+    else:
+        loss+=1; streak=0
+    exec_write("""INSERT INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
+                  VALUES (?,?,?,?,?,?)
+                  ON CONFLICT(yyyymmdd) DO UPDATE SET
+                  g0=excluded.g0, g1=excluded.g1, g2=excluded.g2,
+                  loss=excluded.loss, streak=excluded.streak
+               """, (y,g0,g1,g2,loss,streak))
 
 def append_timeline(n: int):
     exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
 
-def get_recent_tail(window: int = WINDOW) -> List[int]:
-    rows = query_all("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (window,))
+def recent_tail(k:int=WINDOW) -> List[int]:
+    rows = query_all("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (k,))
     return [r["number"] for r in rows][::-1]
 
-def update_ngrams(decay: float = DECAY, max_n: int = 5, window: int = WINDOW):
-    tail = get_recent_tail(window)
+def update_ngrams(decay: float = DECAY, max_n:int=4, window:int=WINDOW):
+    tail = recent_tail(window)
     if len(tail) < 2: return
     for t in range(1, len(tail)):
-        nxt = tail[t]
-        dist = (len(tail)-1) - t
-        w = (decay ** dist)
+        nxt = tail[t]; dist = (len(tail)-1)-t; w = (decay ** dist)
         for n in range(2, max_n+1):
             if t-(n-1) < 0: break
             ctx = tail[t-(n-1):t]
             ctx_key = ",".join(str(x) for x in ctx)
-            exec_write("""
-                INSERT INTO ngram_stats (n, ctx, next, weight)
-                VALUES (?,?,?,?)
-                ON CONFLICT(n, ctx, next) DO UPDATE SET weight = weight + excluded.weight
-            """, (n, ctx_key, int(nxt), float(w)))
+            exec_write("""INSERT INTO ngram_stats (n,ctx,next,weight)
+                          VALUES (?,?,?,?)
+                          ON CONFLICT(n,ctx,next) DO UPDATE SET
+                          weight = weight + excluded.weight
+                       """, (n, ctx_key, int(nxt), float(w)))
 
-def prob_from_ngrams(ctx: List[int], candidate: int) -> float:
-    n = len(ctx) + 1
-    if n < 2 or n > 5: return 0.0
+def prob_from_ng(ctx: List[int], candidate: int) -> float:
+    n = len(ctx)+1
+    if n < 2 or n > 4: return 0.0
     ctx_key = ",".join(str(x) for x in ctx)
-    row = query_one("SELECT SUM(weight) AS w FROM ngram_stats WHERE n=? AND ctx=?", (n, ctx_key))
-    tot = (row["w"] or 0.0) if row else 0.0
-    if tot <= 0: return 0.0
-    row2 = query_one("SELECT weight FROM ngram_stats WHERE n=? AND ctx=? AND next=?", (n, ctx_key, candidate))
-    w = (row2["weight"] or 0.0) if row2 else 0.0
-    return w / tot
-
-# =========================
-# Parsers do canal (apenas para alimentar timeline/fechar pendências)
-# =========================
-GREEN_PATTERNS = [
-    re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I | re.S),
-]
-RED_PATTERNS = [
-    re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\(([1-4])\)", re.I | re.S),
-    re.compile(r"\bLOSS\b.*?Número[:\s]*([1-4])", re.I | re.S),
-]
-
-def extract_green_number(text: str) -> Optional[int]:
-    t = re.sub(r"\s+", " ", text)
-    for rx in GREEN_PATTERNS:
-        m = rx.search(t)
-        if m:
-            return int(m.group(1))
-    return None
-
-def extract_red_last_left(text: str) -> Optional[int]:
-    t = re.sub(r"\s+", " ", text)
-    for rx in RED_PATTERNS:
-        m = rx.search(t)
-        if m:
-            return int(m.group(1))
-    return None
-
-def is_analise(text:str) -> bool:
-    return bool(re.search(r"\bANALISANDO\b", text, flags=re.I))
-
-# =========================
-# Estatísticas
-# =========================
-def laplace_ratio(wins:int, losses:int) -> float:
-    return (wins + 1.0) / (wins + losses + 2.0)
-
-def update_daily_score(stage: Optional[int], won: bool):
-    y = today_key_local()
-    row = query_one("SELECT g0,g1,g2,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
-    if not row: g0=g1=g2=loss=streak=0
-    else:       g0,g1,g2,loss,streak = row["g0"],row["g1"],row["g2"],row["loss"],row["streak"]
-
-    if SCORE_G0_ONLY:
-        if won and stage == 0: g0 += 1; streak += 1
-        elif not won:          loss += 1; streak = 0
-    else:
-        if won:
-            if stage == 0: g0 += 1
-            elif stage == 1: g1 += 1
-            elif stage == 2: g2 += 1
-            streak += 1
-        else:
-            loss += 1; streak = 0
-
-    exec_write("""
-      INSERT INTO daily_score (yyyymmdd,g0,g1,g2,loss,streak)
-      VALUES (?,?,?,?,?,?)
-      ON CONFLICT(yyyymmdd) DO UPDATE SET
-        g0=excluded.g0, g1=excluded.g1, g2=excluded.g2, loss=excluded.loss, streak=excluded.streak
-    """, (y,g0,g1,g2,loss,streak))
-
-# Heurística extra: top-2 últimos K
-def tail_top2_boost(tail: List[int], k:int=40) -> Dict[int, float]:
-    boosts = {1:1.00, 2:1.00, 3:1.00, 4:1.00}
-    if not tail: return boosts
-    tail_k = tail[-k:] if len(tail) >= k else tail[:]
-    c = Counter(tail_k)
-    if not c: return boosts
-    freq = c.most_common()
-    if len(freq) >= 1: boosts[freq[0][0]] = 1.04
-    if len(freq) >= 2: boosts[freq[1][0]] = 1.02
-    return boosts
+    tot = query_one("SELECT SUM(weight) AS w FROM ngram_stats WHERE n=? AND ctx=?", (n, ctx_key))
+    totw = float(tot["w"] or 0.0) if tot else 0.0
+    if totw <= 0: return 0.0
+    row = query_one("SELECT weight FROM ngram_stats WHERE n=? AND ctx=? AND next=?", (n, ctx_key, int(candidate)))
+    w = float(row["weight"] or 0.0) if row else 0.0
+    return w / totw
 
 # =========================
 # Predição
 # =========================
-def ngram_backoff_score(tail: List[int], candidate: int) -> float:
-    score = 0.0
+def backoff_score(tail: List[int], candidate:int) -> float:
     if not tail: return 0.0
-    ctx4 = tail[-4:] if len(tail) >= 4 else []
-    ctx3 = tail[-3:] if len(tail) >= 3 else []
-    ctx2 = tail[-2:] if len(tail) >= 2 else []
-    ctx1 = tail[-1:] if len(tail) >= 1 else []
+    ctx4 = tail[-4:] if len(tail)>=4 else []
+    ctx3 = tail[-3:] if len(tail)>=3 else []
+    ctx2 = tail[-2:] if len(tail)>=2 else []
+    ctx1 = tail[-1:] if len(tail)>=1 else []
     parts = []
-    if len(ctx4)==4: parts.append((W4, prob_from_ngrams(ctx4[:-1], candidate)))
-    if len(ctx3)==3: parts.append((W3, prob_from_ngrams(ctx3[:-1], candidate)))
-    if len(ctx2)==2: parts.append((W2, prob_from_ngrams(ctx2[:-1], candidate)))
-    if len(ctx1)==1: parts.append((W1, prob_from_ngrams(ctx1[:-1], candidate)))
-    for w,p in parts: score += w*p
-    return score
+    if len(ctx4)==4: parts.append((W4, prob_from_ng(ctx4[:-1], candidate)))
+    if len(ctx3)==3: parts.append((W3, prob_from_ng(ctx3[:-1], candidate)))
+    if len(ctx2)==2: parts.append((W2, prob_from_ng(ctx2[:-1], candidate)))
+    if len(ctx1)==1: parts.append((W1, prob_from_ng(ctx1[:-1], candidate)))
+    return sum(w*p for w,p in parts)
 
-def confident_best(post: Dict[int,float], gap: float = GAP_MIN) -> Optional[int]:
-    a = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    if not a: return None
-    if len(a)==1: return a[0][0]
-    return a[0][0] if (a[0][1]-a[1][1]) >= gap else None
-
-def suggest_number(base: List[int]) -> Tuple[Optional[int],float,int,Dict[int,float]]:
-    if not base: base = [1,2,3,4]
-    tail = get_recent_tail(WINDOW)
-    boosts = tail_top2_boost(tail, k=40)
-    scores: Dict[int, float] = {}
+def suggest_number() -> Tuple[Optional[int], float, int, Dict[int,float]]:
+    base = [1,2,3,4]
+    tail = recent_tail(WINDOW)
+    if len(tail) < 5:
+        return None, 0.0, len(tail), {k: 0.25 for k in base}
+    scores: Dict[int,float] = {}
     for c in base:
-        ng = ngram_backoff_score(tail, c)
-        prior = 1.0/len(base)
-        score = (prior) * ((ng or 1e-6) ** ALPHA) * boosts.get(c,1.0)
-        scores[c] = score
+        s = backoff_score(tail, c) or 1e-9
+        scores[c] = s
     total = sum(scores.values()) or 1e-9
     post = {k: v/total for k,v in scores.items()}
-    number = confident_best(post, gap=GAP_MIN)
-    conf = post.get(number, 0.0) if number is not None else 0.0
-    # proxy de amostras (peso total acumulado)
-    roww = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
-    samples = int((roww["s"] or 0) if roww else 0)
-    # debouncing: se o último anunciado foi o mesmo nº e confiança caiu, abstenha
-    last = query_one("SELECT suggested, announced FROM pending_outcome ORDER BY id DESC LIMIT 1")
-    if last and number is not None and last["suggested"] == number and (last["announced"] or 0) == 1:
-        if conf < (MIN_CONF_G0 + 0.08):
-            return None, 0.0, samples, post
-    # abster em empate técnico
-    top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
-    if len(top) == 2 and (top[0][1] - top[1][1]) < 0.015:
-        return None, 0.0, samples, post
-    # checagens finais
-    if samples < MIN_SAMPLES or number is None or conf < MIN_CONF_G0:
-        return None, 0.0, samples, post
-    return number, conf, samples, post
+    top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    best = top[0][0]; conf = top[0][1]
+    gap  = top[0][1] - (top[1][1] if len(top)>1 else 0.0)
 
-def build_suggestion_msg(number:int, conf:float, samples:int, stage:str="G0") -> str:
-    return (
-        f"🤖 <b>{SELF_LABEL_IA} [FIRE]</b>\n"
-        f"🎯 Número seco ({stage}): <b>{number}</b>\n"
-        f"📈 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>"
-    )
+    # amostras ~ soma de pesos
+    roww = query_one("SELECT SUM(weight) AS s FROM ngram_stats", ())
+    samples = int((roww["s"] or 0.0) if roww else 0.0)
+
+    if conf < MIN_CONF_G0 or gap < MIN_GAP_G0 or samples < MIN_SAMPLES:
+        return None, conf, samples, post
+    return best, conf, samples, post
 
 # =========================
-# IA loop
+# IA loop com anti-spam
 # =========================
-_ia2_blocked_until_ts: int = 0
-_ia2_sent_this_hour: int = 0
-_ia2_hour_bucket: Optional[int] = None
-_ia2_last_fire_ts: int = 0
+_ia_last_fire_ts: int = 0
+_ia_blocked_until: int = 0
+_ia_hour_bucket: Optional[str] = None
+_ia_sent_this_hour: int = 0
 
-def _ia2_hour_key() -> int: return int(datetime.now(timezone.utc).strftime("%Y%m%d%H"))
-def _ia2_reset_hour():
-    global _ia2_sent_this_hour, _ia2_hour_bucket
-    hb = _ia2_hour_key()
-    if _ia2_hour_bucket != hb:
-        _ia2_hour_bucket = hb
-        _ia2_sent_this_hour = 0
-def _ia2_antispam_ok() -> bool:
-    _ia2_reset_hour()
-    return _ia2_sent_this_hour < IA2_MAX_PER_HOUR
-def _ia2_mark_sent():
-    global _ia2_sent_this_hour; _ia2_sent_this_hour += 1
-def _ia2_blocked_now() -> bool: return now_ts() < _ia2_blocked_until_ts
-def _ia_set_post_loss_block():
-    global _ia2_blocked_until_ts; _ia2_blocked_until_ts = now_ts() + int(IA2_COOLDOWN_AFTER_LOSS)
-def _ia2_can_fire_now() -> bool:
-    if _ia2_blocked_now(): return False
-    if not _ia2_antispam_ok(): return False
-    if now_ts() - _ia2_last_fire_ts < IA2_MIN_SECONDS_BETWEEN_FIRE: return False
-    return True
-def _ia2_mark_fire_sent():
-    global _ia2_last_fire_ts; _ia2_mark_sent(); _ia2_last_fire_ts = now_ts()
+def _hour_key() -> str: return datetime.utcnow().strftime("%Y%m%d%H")
 
-async def ia2_send_signal(best:int, conf:float, tail_len:int, mode:str):
-    txt = build_suggestion_msg(best, conf, tail_len, stage="G0")
-    await send_ia_text(txt)
+def _antispam_ok() -> bool:
+    global _ia_hour_bucket, _ia_sent_this_hour
+    hk = _hour_key()
+    if _ia_hour_bucket != hk:
+        _ia_hour_bucket = hk
+        _ia_sent_this_hour = 0
+    return _ia_sent_this_hour < IA_MAX_PER_HOUR
 
-def open_pending(strategy: Optional[str], suggested: int, source: str = "IA"):
-    exec_write("""
-        INSERT INTO pending_outcome
-        (created_at,strategy,suggested,stage,open,window_left,seen_numbers,announced,source)
-        VALUES (?,?,?,?,1,?, '', 1, ?)
-    """, (now_ts(), strategy or "", int(suggested), 0, MAX_STAGE, source))
+def _mark_sent():
+    global _ia_sent_this_hour, _ia_last_fire_ts
+    _ia_sent_this_hour += 1
+    _ia_last_fire_ts = now_ts()
 
-async def ia2_process_once():
-    # IA avalia continuamente e dispara quando critérios são satisfeitos
-    best, conf_raw, tail_len, post = suggest_number([1,2,3,4])
-    if best is None:
-        return
-    gap = 1.0
-    if post and len(post) >= 2:
-        top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-        if len(top) >= 2: gap = top[0][1] - top[1][1]
-    if _ia2_blocked_now(): return
-    if not _ia2_antispam_ok(): return
-    if now_ts() - _ia2_last_fire_ts < IA2_MIN_SECONDS_BETWEEN_FIRE: return
-    if (conf_raw >= IA2_TIER_STRICT or (conf_raw >= IA2_TIER_STRICT - IA2_DELTA_GAP and gap >= IA2_GAP_SAFETY)) and tail_len >= MIN_SAMPLES and _ia2_can_fire_now():
-        open_pending(None, best, source="IA")
-        await ia2_send_signal(best, conf_raw, tail_len, "FIRE")
-        _ia2_mark_fire_sent()
+def _blocked() -> bool:
+    return now_ts() < _ia_blocked_until
+
+def _cooldown_after_g0_loss():
+    global _ia_blocked_until
+    _ia_blocked_until = now_ts() + IA_COOLDOWN_SEC
+
+async def ia_process_once():
+    if _blocked(): return
+    if not _antispam_ok(): return
+    if now_ts() - _ia_last_fire_ts < IA_MIN_BETWEEN: return
+
+    best, conf, samples, post = suggest_number()
+    if best is None: return
+
+    # abrir pendência (G0, janela=3 -> G0/G1/G2)
+    exec_write("""INSERT INTO pending_outcome (created_at, suggested, stage, window_left, open, seen)
+                  VALUES (?,?,?,?,1,'')""", (now_ts(), int(best), 0, 3))
+    await send_signal(int(best), conf, samples)
+    _mark_sent()
 
 # =========================
 # Fechamento de pendências
 # =========================
-async def close_pending_with_result(n_observed: int, event_kind: str):
-    try:
-        rows = query_all("""
-            SELECT id, created_at, strategy, suggested, stage, open, window_left,
-                   seen_numbers, announced, source
-            FROM pending_outcome
-            WHERE open=1
-            ORDER BY id ASC
-        """)
-        if not rows: return {"ok": True, "no_open": True}
+async def close_with_observed(n_observed: int):
+    rows = query_all("SELECT id, suggested, stage, window_left, open, seen FROM pending_outcome WHERE open=1 ORDER BY id ASC")
+    if not rows: return
+    for r in rows:
+        pid = r["id"]; sug = int(r["suggested"]); stage = int(r["stage"]); left = int(r["window_left"])
+        seen = (r["seen"] or "")
+        seen2 = (seen + ("," if seen else "") + str(n_observed))
 
-        for r in rows:
-            pid        = r["id"]
-            suggested  = int(r["suggested"])
-            stage      = int(r["stage"])
-            left       = int(r["window_left"])
-            src        = (r["source"] or "IA").upper()
-            seen       = (r["seen_numbers"] or "").strip()
-            seen_new   = (seen + ("," if seen else ",") + str(int(n_observed)))
-
-            if int(n_observed) == suggested:
-                exec_write("UPDATE pending_outcome SET open=0, window_left=0, seen_numbers=? WHERE id=?", (seen_new, pid))
-                update_daily_score(0 if stage==0 else stage, True)
-                await send_green_channel(suggested, "G0" if stage==0 else f"G{stage}")
+        if n_observed == sug:
+            # GREEN
+            exec_write("UPDATE pending_outcome SET open=0, window_left=0, seen=? WHERE id=?", (seen2, pid))
+            await send_green(sug, "G0" if stage==0 else f"G{stage}")
+            update_daily(stage if stage<=2 else 0, True)
+        else:
+            # segue para próximo estágio ou encerra
+            if left > 1:
+                exec_write("UPDATE pending_outcome SET stage=stage+1, window_left=window_left-1, seen=? WHERE id=?", (seen2, pid))
+                if stage == 0:
+                    # LOSS em G0 (publica)
+                    await send_loss(sug, "G0")
+                    update_daily(0, False)
+                    _cooldown_after_g0_loss()
             else:
-                if left > 1:
-                    exec_write("""
-                        UPDATE pending_outcome
-                           SET stage = stage + 1, window_left = window_left - 1, seen_numbers=?
-                         WHERE id=?
-                    """, (seen_new, pid))
-                    if stage == 0:
-                        update_daily_score(0, False)
-                        _ia_set_post_loss_block()
-                        await send_loss_channel(suggested, "G0")
-                else:
-                    exec_write("UPDATE pending_outcome SET open=0, window_left=0, seen_numbers=? WHERE id=?", (seen_new, pid))
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+                exec_write("UPDATE pending_outcome SET open=0, window_left=0, seen=? WHERE id=?", (seen2, pid))
 
 # =========================
-# Webhook models & routes
+# Parsers de mensagens do canal
+# =========================
+# Considera mensagens de análise que trazem "Sequência: ..."
+SEQ_RX = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+
+def parse_sequence_numbers(text: str) -> List[int]:
+    m = SEQ_RX.search(text)
+    if not m: return []
+    parts = re.findall(r"[1-4]", m.group(1))
+    nums = [int(x) for x in parts]
+    # timeline: garantir ordem cronológica (antigo -> novo)
+    return nums[::-1]  # no seu canal, o último da string é o mais recente
+
+def is_analise(text: str) -> bool:
+    return bool(re.search(r"\bANALISANDO\b", text, flags=re.I)) or ("Sequência:" in text)
+
+# =========================
+# FastAPI models & routes
 # =========================
 class Update(BaseModel):
     update_id: int
@@ -543,25 +359,26 @@ class Update(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"ok": True, "detail": "Use POST /webhook/<WEBHOOK_TOKEN> ou GET /ping"}
+    return {"ok": True, "detail": "Guardião AUTO — use POST /webhook/<WEBHOOK_TOKEN> e /ping_ia"}
 
-@app.get("/ping")
-async def ping():
+@app.get("/ping_ia")
+async def ping_ia():
     try:
-        await tg_broadcast("🔧 Bot vivo — IA independente pronta.")
-        return {"ok": True, "to": SIGNAL_CHANNEL}
+        await tg_send(IA_CHANNEL, "🔧 Teste IA: ok")
+        return {"ok": True, "sent": True, "to": IA_CHANNEL}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 @app.on_event("startup")
-async def _boot_tasks():
+async def _boot():
     async def _loop():
         while True:
-            try: await ia2_process_once()
-            except Exception as e: print(f"[IA2] analyzer error: {e}")
-            await asyncio.sleep(0.25)
-    try: asyncio.create_task(_loop())
-    except Exception as e: print(f"[IA2] startup error: {e}")
+            try:
+                await ia_process_once()
+            except Exception as e:
+                print(f"[IA] loop error: {e}")
+            await asyncio.sleep(0.5)
+    asyncio.create_task(_loop())
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -573,24 +390,25 @@ async def webhook(token: str, request: Request):
     if not msg: return {"ok": True}
 
     text = (msg.get("text") or msg.get("caption") or "").strip()
-    t = re.sub(r"\s+", " ", text)
 
-    # GREEN/RED -> fecha pendências + timeline
-    gnum = extract_green_number(t); redn = extract_red_last_left(t)
-    if gnum is not None or redn is not None:
-        n_observed = gnum if gnum is not None else redn
-        append_timeline(n_observed); update_ngrams()
-        await close_pending_with_result(n_observed, "GREEN" if gnum is not None else "RED")
-        return {"ok": True, "observed": n_observed}
+    # 1) ingestão da timeline
+    if is_analise(text):
+        nums = parse_sequence_numbers(text)
+        if nums:
+            # acrescenta apenas os novos, na ordem certa
+            # (como defesa simples, só apenda todos — duplicatas não atrapalham n-gram laplace/decay)
+            for n in nums:
+                append_timeline(int(n))
+            update_ngrams()
+        return {"ok": True, "analise": True, "added": len(nums)}
 
-    # ANALISANDO -> apenas timeline (para alimentar IA)
-    if is_analise(t):
-        parts = re.findall(r"[1-4]", t)
-        seq_left_recent = [int(x) for x in parts]
-        seq_old_to_new  = seq_left_recent[::-1]  # chegam “da direita p/ esquerda”
-        for n in seq_old_to_new: append_timeline(n)
-        update_ngrams()
-        return {"ok": True, "analise": True}
+    # 2) fallback: se aparecer uma mensagem explícita com GREEN/LOSS contendo número, fecha janelas
+    g = re.search(r"\bGREEN\b.*?([1-4])", text, flags=re.I)
+    l = re.search(r"\bLOSS\b.*?([1-4])",  text, flags=re.I)
+    if g or l:
+        n = int((g or l).group(1))
+        append_timeline(n); update_ngrams()
+        await close_with_observed(n)
+        return {"ok": True, "observed": n}
 
-    # Entrada confirmada é ignorada como gatilho de decisão (IA é independente)
-    return {"ok": True, "ignored": "entry_confirmed_or_other"}
+    return {"ok": True, "ignored": True}
