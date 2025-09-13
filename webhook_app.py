@@ -3,6 +3,7 @@
 # - Inteligência em disco: /var/data/ai_intel (teto 1 GB + rotação)
 # - Batidas do sinal a cada 20s enquanto houver pendência aberta
 # - Analisador periódico a cada 2s com top combos recentes da cauda
+# - Aviso de ESCASSEZ: “Número X está N vezes sem vir” com edição automática no PUBLIC_CHANNEL
 #
 # Rotas:
 #   POST /webhook/<WEBHOOK_TOKEN>   (recebe mensagens do Telegram)
@@ -18,6 +19,10 @@
 #   INTEL_SIGNAL_INTERVAL (default: 20)
 #   INTEL_ANALYZE_INTERVAL (default: 2)
 #   FLUSH_KEY (default: meusegredo123)  # chave simples p/ /debug/flush
+#   SCARCITY_MIN_ABSENCES (default: 10)
+#   SCARCITY_CHECK_INTERVAL (default: 2)
+#   SCARCITY_CONFIRM_DELAY (default: 12)
+#   SCARCITY_EDIT_COOLDOWN (default: 6)
 
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
@@ -110,7 +115,16 @@ INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "2"))  # anal
 # =========================
 SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.8.0")
+# =========================
+# Escassez (números sem vir) — Config
+# =========================
+SCARCITY_MIN_ABSENCES   = int(os.getenv("SCARCITY_MIN_ABSENCES", "10"))   # mínimo p/ avisar (ex.: 10)
+SCARCITY_CHECK_INTERVAL = float(os.getenv("SCARCITY_CHECK_INTERVAL", "2"))  # loop do verificador (s)
+SCARCITY_CONFIRM_DELAY  = float(os.getenv("SCARCITY_CONFIRM_DELAY", "12"))  # espera pós-round (mitiga atrasos)
+SCARCITY_EDIT_COOLDOWN  = float(os.getenv("SCARCITY_EDIT_COOLDOWN", "6"))   # antispam de edição
+SCARCITY_CHANNEL        = PUBLIC_CHANNEL  # publica/edita no canal público
+
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.9.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -213,6 +227,13 @@ def init_db():
         wins INTEGER NOT NULL DEFAULT 0,
         losses INTEGER NOT NULL DEFAULT 0
     )""")
+    # Avisos de escassez (1 linha por número 1–4)
+    cur.execute("""CREATE TABLE IF NOT EXISTS scarcity_notif (
+        number INTEGER PRIMARY KEY,
+        message_id INTEGER,
+        count INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0
+    )""")
     con.commit()
     # Migrações idempotentes
     try: cur.execute("ALTER TABLE pending_outcome ADD COLUMN seen_numbers TEXT DEFAULT ''"); con.commit()
@@ -246,7 +267,23 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
             json={"chat_id": chat_id, "text": text, "parse_mode": parse, "disable_web_page_preview": True},
         )
 
+async def tg_edit_text(chat_id: str, message_id: int, text: str, parse: str="HTML"):
+    if not TG_BOT_TOKEN or not chat_id or not message_id:
+        return
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(
+            f"{TELEGRAM_API}/editMessageText",
+            json={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": parse,
+                "disable_web_page_preview": True,
+            },
+        )
+
 async def tg_broadcast(text: str, parse: str="HTML"):
+    # Réplica no canal espelho (se habilitado)
     if REPL_ENABLED and REPL_CHANNEL:
         await tg_send_text(REPL_CHANNEL, text, parse)
 
@@ -1049,6 +1086,118 @@ def build_suggestion_msg(number:int, base:List[int], pattern_key:str,
     )
 
 # =========================
+# ESCASSEZ — contadores e mensagens (PUBLIC_CHANNEL)
+# =========================
+def _last_round_ts() -> int:
+    row = query_one("SELECT created_at FROM timeline ORDER BY id DESC LIMIT 1")
+    return int(row["created_at"]) if row and row["created_at"] is not None else 0
+
+def _miss_counts_since_last() -> Dict[int,int]:
+    """
+    Retorna {1: faltas, 2: faltas, 3: faltas, 4: faltas},
+    onde 'faltas' = quantos resultados ocorreram depois da última vez que cada número apareceu.
+    """
+    row_last = query_one("SELECT id FROM timeline ORDER BY id DESC LIMIT 1")
+    if not row_last:
+        return {1:0,2:0,3:0,4:0}
+    misses = {}
+    for n in (1,2,3,4):
+        row_seen = query_one("SELECT MAX(id) AS mid FROM timeline WHERE number=?", (n,))
+        mid = int(row_seen["mid"]) if row_seen and row_seen["mid"] is not None else None
+        if mid is None:
+            cnt = _get_scalar("SELECT COUNT(*) FROM timeline")
+        else:
+            cnt = _get_scalar("SELECT COUNT(*) FROM timeline WHERE id>?", (mid,))
+        misses[n] = int(cnt)
+    return misses
+
+def _scarcity_row(n:int) -> Optional[sqlite3.Row]:
+    return query_one("SELECT number,message_id,count,updated_at FROM scarcity_notif WHERE number=?", (int(n),))
+
+def _scarcity_save(n:int, message_id:int, count:int):
+    exec_write("""
+        INSERT INTO scarcity_notif (number, message_id, count, updated_at)
+        VALUES (?,?,?,?)
+        ON CONFLICT(number) DO UPDATE SET
+          message_id=excluded.message_id,
+          count=excluded.count,
+          updated_at=excluded.updated_at
+    """, (int(n), int(message_id), int(count), now_ts()))
+
+def _scarcity_delete(n:int):
+    exec_write("DELETE FROM scarcity_notif WHERE number=?", (int(n),))
+
+def _scarcity_msg_running(n:int, c:int) -> str:
+    return (f"⚠️ <b>Fique atento</b>\n"
+            f"• Número <b>{n}</b> está há <b>{c}</b> rodadas sem vir.\n"
+            f"• Atualizo esta mensagem automaticamente a cada nova rodada.")
+
+def _scarcity_msg_reset(n:int) -> str:
+    return f"✅ Número <b>{n}</b> <b>acabou de sair</b>. Contador zerado."
+
+async def _scarcity_upsert_or_edit(n:int, c:int):
+    """Cria/edita a mensagem do número n conforme o contador c."""
+    if not SCARCITY_CHANNEL:
+        return  # Sem canal público configurado, não faz nada
+
+    row = _scarcity_row(n)
+
+    # Se ainda não atingiu o mínimo e não existe msg, não faz nada
+    if c < SCARCITY_MIN_ABSENCES and not row:
+        return
+
+    # Se caiu abaixo do mínimo e existe msg → edita para 'reset' e apaga o registro
+    if c < SCARCITY_MIN_ABSENCES and row and row["message_id"]:
+        try:
+            await tg_edit_text(SCARCITY_CHANNEL, int(row["message_id"]), _scarcity_msg_reset(n))
+        finally:
+            _scarcity_delete(n)
+        return
+
+    # Atingiu/ultrapassou o limiar: criar ou editar
+    txt = _scarcity_msg_running(n, c)
+    if not row or not row["message_id"]:
+        # criar nova
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json={"chat_id": SCARCITY_CHANNEL, "text": txt, "parse_mode":"HTML", "disable_web_page_preview": True},
+            )
+        try:
+            mid = (r.json().get("result") or {}).get("message_id")
+        except Exception:
+            mid = None
+        if mid:
+            _scarcity_save(n, int(mid), int(c))
+        return
+
+    # editar existente (respeita cooldown e evita editar repetido)
+    last_upd = int(row["updated_at"] or 0)
+    same_count = int(row["count"] or 0) == c
+    if (now_ts() - last_upd) < SCARCITY_EDIT_COOLDOWN and same_count:
+        return
+
+    try:
+        await tg_edit_text(SCARCITY_CHANNEL, int(row["message_id"]), txt)
+        _scarcity_save(n, int(row["message_id"]), int(c))
+    except Exception as e:
+        print(f"[SCARCITY] edit error n={n}: {e}")
+
+async def _scarcity_watcher_task():
+    """Monitora a timeline e mantém as mensagens de escassez atualizadas (no PUBLIC_CHANNEL)."""
+    while True:
+        try:
+            # Espera um pouco após o último round para reduzir impacto de delay do canal
+            last_ts = _last_round_ts()
+            if last_ts and (now_ts() - last_ts) >= SCARCITY_CONFIRM_DELAY:
+                misses = _miss_counts_since_last()
+                for n in (1,2,3,4):
+                    await _scarcity_upsert_or_edit(n, int(misses.get(n, 0)))
+        except Exception as e:
+            print(f"[SCARCITY] loop error: {e}")
+        await asyncio.sleep(max(0.5, SCARCITY_CHECK_INTERVAL))
+
+# =========================
 # IA2 — processo (FIRE-only + fila única)
 # =========================
 def _relevance_ok(conf_raw: float, gap: float, tail_len: int) -> bool:
@@ -1207,7 +1356,7 @@ class Update(BaseModel):
 async def root():
     return {"ok": True, "detail": "Use POST /webhook/<WEBHOOK_TOKEN>"}
 
-# Inicia health/reset + IA FIRE-only
+# Inicia health/reset + IA FIRE-only + ESCASSEZ
 @app.on_event("startup")
 async def _boot_tasks():
     try:
@@ -1230,6 +1379,12 @@ async def _boot_tasks():
         asyncio.create_task(_ia2_loop())
     except Exception as e:
         print(f"[IA2] startup error: {e}")
+
+    # NEW: watcher de escassez → publica/edita no PUBLIC_CHANNEL
+    try:
+        asyncio.create_task(_scarcity_watcher_task())
+    except Exception as e:
+        print(f"[SCARCITY] startup error: {e}")
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -1375,6 +1530,10 @@ async def debug_state():
             "IA2_MIN_SECONDS_BETWEEN_FIRE": IA2_MIN_SECONDS_BETWEEN_FIRE,
             "IA2_COOLDOWN_AFTER_LOSS": IA2_COOLDOWN_AFTER_LOSS,
             "INTEL_ANALYZE_INTERVAL": INTEL_ANALYZE_INTERVAL,
+            "SCARCITY_MIN_ABSENCES": SCARCITY_MIN_ABSENCES,
+            "SCARCITY_CONFIRM_DELAY": SCARCITY_CONFIRM_DELAY,
+            "SCARCITY_EDIT_COOLDOWN": SCARCITY_EDIT_COOLDOWN,
+            "SCARCITY_CHECK_INTERVAL": SCARCITY_CHECK_INTERVAL,
         }
 
         return {
