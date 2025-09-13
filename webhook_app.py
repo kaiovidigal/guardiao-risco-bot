@@ -48,7 +48,7 @@ INTEL_ANALYZE_INTERVAL = float(getenv("INTEL_ANALYZE_INTERVAL", "2"))
 
 SELF_LABEL_IA = getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.8.2")
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.8.3")
 
 # =========================
 # DB bootstrap + migração
@@ -165,7 +165,7 @@ async def tg_broadcast(text: str, parse: str="HTML"):
 # Envio exclusivo para IA FIRE/RESULT (com “ok”)
 async def tg_send_fire(text: str, parse: str="HTML"):
     if IA_FIRE_CHANNEL:
-        await tg_send_text(IA_FIRE_CHANNEL, text + "\n\nok", parse)
+        await tg_send_text(IA_FIRE_CHANNEL, text + "\\n\\nok", parse)
 
 # Mensagens genéricas (mantidas, mas não vão ao canal secundário)
 async def send_green_imediato(n:int, stage_txt:str="G0"): await tg_broadcast(f"✅ <b>GREEN</b> em <b>{stage_txt}</b> — Número: <b>{n}</b>")
@@ -173,8 +173,8 @@ async def send_loss_imediato(n:int, stage_txt:str="G0"):  await tg_broadcast(f"�
 async def send_recovery(_stage_txt:str): return
 
 async def ia2_send_signal(best:int, conf:float, tail_len:int, mode:str):
-    txt = (f"🤖 <b>{SELF_LABEL_IA} [{mode}]</b>\n"
-           f"🎯 Número seco (G0): <b>{best}</b>\n"
+    txt = (f"🤖 <b>{SELF_LABEL_IA} [{mode}]</b>\\n"
+           f"🎯 Número seco (G0): <b>{best}</b>\\n"
            f"📈 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{tail_len}</b>")
     await tg_send_fire(txt)
 
@@ -222,31 +222,31 @@ def prob_from_ngrams(ctx: List[int], candidate: int) -> float:
 # =========================
 # Parsers (canal)
 # =========================
-MUST_HAVE = (r"ENTRADA\s+CONFIRMADA", r"Mesa:\s*Fantan\s*-\s*Evolution")
-MUST_NOT  = (r"\bANALISANDO\b", r"\bPlacar do dia\b", r"\bAPOSTA ENCERRADA\b")
+MUST_HAVE = (r"ENTRADA\\s+CONFIRMADA", r"Mesa:\\s*Fantan\\s*-\\s*Evolution")
+MUST_NOT  = (r"\\bANALISANDO\\b", r"\\bPlacar do dia\\b", r"\\bAPOSTA ENCERRADA\\b")
 
 def is_real_entry(t: str) -> bool:
-    s = re.sub(r"\s+", " ", t).strip()
+    s = re.sub(r"\\s+", " ", t).strip()
     if any(re.search(b, s, re.I) for b in MUST_NOT): return False
     if not all(re.search(g, s, re.I) for g in MUST_HAVE): return False
     return any(re.search(p, s, re.I) for p in [
-        r"Sequ[eê]ncia:\s*[\d\s\|\-]+", r"\bKWOK\s*[1-4]\s*-\s*[1-4]", r"\bSS?H\s*[1-4](?:-[1-4]){0,3}",
-        r"\bODD\b|\bEVEN\b", r"Entrar\s+ap[oó]s\s+o\s+[1-4]"
+        r"Sequ[eê]ncia:\\s*[\\d\\s\\|\\-]+", r"\\bKWOK\\s*[1-4]\\s*-\\s*[1-4]", r"\\bSS?H\\s*[1-4](?:-[1-4]){0,3}",
+        r"\\bODD\\b|\\bEVEN\\b", r"Entrar\\s+ap[oó]s\\s+o\\s+[1-4]"
     ])
 
-gx = [re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\((\d)\)", re.I|re.S),
-      re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4])", re.I|re.S),
-      re.compile(r"\bGREEN\b.*?\(([1-4])\)", re.I|re.S)]
-rx = [re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\((.*?)\)", re.I|re.S),
-      re.compile(r"\bLOSS\b.*?Número[:\s]*([1-4])", re.I|re.S),
-      re.compile(r"\bRED\b.*?\(([1-4])\)", re.I|re.S)]
+gx = [re.compile(r"APOSTA\\s+ENCERRADA.*?\\bGREEN\\b.*?\\((\\d)\\)", re.I|re.S),
+      re.compile(r"\\bGREEN\\b.*?Número[:\\s]*([1-4])", re.I|re.S),
+      re.compile(r"\\bGREEN\\b.*?\\(([1-4])\\)", re.I|re.S)]
+rx = [re.compile(r"APOSTA\\s+ENCERRADA.*?\\bRED\\b.*?\\((.*?)\\)", re.I|re.S),
+      re.compile(r"\\bLOSS\\b.*?Número[:\\s]*([1-4])", re.I|re.S),
+      re.compile(r"\\bRED\\b.*?\\(([1-4])\\)", re.I|re.S)]
 
 def _first_14(s:str):
     n = re.findall(r"[1-4]", s)
     return int(n[0]) if n else None
 
 def extract_green_number(t: str) -> Optional[int]:
-    s = re.sub(r"\s+", " ", t)
+    s = re.sub(r"\\s+", " ", t)
     for r in gx:
         m = r.search(s)
         if m:
@@ -255,7 +255,7 @@ def extract_green_number(t: str) -> Optional[int]:
     return None
 
 def extract_red_last_left(t: str) -> Optional[int]:
-    s = re.sub(r"\s+", " ", t)
+    s = re.sub(r"\\s+", " ", t)
     for r in rx:
         m = r.search(s)
         if m:
@@ -264,13 +264,13 @@ def extract_red_last_left(t: str) -> Optional[int]:
     return None
 
 def extract_strategy(t: str) -> Optional[str]:
-    m = re.search(r"Estrat[eé]gia:\s*(\d+)", t, re.I); return m.group(1) if m else None
+    m = re.search(r"Estrat[eé]gia:\\s*(\\d+)", t, re.I); return m.group(1) if m else None
 
 def extract_seq_raw(t: str) -> Optional[str]:
-    m = re.search(r"Sequ[eê]ncia:\s*([^\n\r]+)", t, re.I); return m.group(1).strip() if m else None
+    m = re.search(r"Sequ[eê]ncia:\\s*([^\\n\\r]+)", t, re.I); return m.group(1).strip() if m else None
 
 def extract_after_num(t: str) -> Optional[int]:
-    m = re.search(r"Entrar\s+ap[oó]s\s+o\s+([1-4])", t, re.I); return int(m.group(1)) if m else None
+    m = re.search(r"Entrar\\s+ap[oó]s\\s+o\\s+([1-4])", t, re.I); return int(m.group(1)) if m else None
 
 def bases_from_sequence_left_recent(seq: List[int], k: int = 3) -> List[int]:
     out, seen = [], set()
@@ -280,15 +280,15 @@ def bases_from_sequence_left_recent(seq: List[int], k: int = 3) -> List[int]:
     return out
 
 def parse_bases_and_pattern(t: str) -> Tuple[List[int], str]:
-    s = re.sub(r"\s+", " ", t).strip()
-    m = re.search(r"\bKWOK\s*([1-4])\s*-\s*([1-4])", s, re.I)
+    s = re.sub(r"\\s+", " ", t).strip()
+    m = re.search(r"\\bKWOK\\s*([1-4])\\s*-\\s*([1-4])", s, re.I)
     if m: a,b = int(m.group(1)), int(m.group(2)); return [a,b], f"KWOK-{a}-{b}"
-    if re.search(r"\bODD\b", s, re.I):  return [1,3], "ODD"
-    if re.search(r"\bEVEN\b", s, re.I): return [2,4], "EVEN"
-    m = re.search(r"\bSS?H\s*([1-4])(?:-([1-4]))?(?:-([1-4]))?(?:-([1-4]))?", s, re.I)
+    if re.search(r"\\bODD\\b", s, re.I):  return [1,3], "ODD"
+    if re.search(r"\\bEVEN\\b", s, re.I): return [2,4], "EVEN"
+    m = re.search(r"\\bSS?H\\s*([1-4])(?:-([1-4]))?(?:-([1-4]))?(?:-([1-4]))?", s, re.I)
     if m:
       nums = [int(g) for g in m.groups() if g]; return nums, "SSH-" + "-".join(map(str, nums))
-    m = re.search(r"Sequ[eê]ncia:\s*([\d\s\|\-]+)", s, re.I)
+    m = re.search(r"Sequ[eê]ncia:\\s*([\\d\\s\\|\\-]+)", s, re.I)
     if m:
         parts = list(map(int, re.findall(r"[1-4]", m.group(1))))
         base = bases_from_sequence_left_recent(parts, 3)
@@ -372,10 +372,10 @@ _convert_last_loss_to_green_ia = lambda: _convert_last_loss_to_green_table("dail
 async def _send_score_generic(table:str, prefix:str):
     # Mantido, mas silencioso (broadcast desativado)
     y = today_key()
-    row = _one(f"SELECT g0,loss,streak FROM {table} WHERE yyyymmdd=?", (y,)).
+    row = _one(f"SELECT g0,loss,streak FROM {table} WHERE yyyymmdd=?", (y,))
     g0 = (row["g0"] if row else 0); loss = (row["loss"] if row else 0); streak = (row["streak"] if row else 0)
     acc = (g0/(g0+loss)*100) if (g0+loss) else 0.0
-    await tg_broadcast(f"{prefix}\n🟢 G0:{g0}  🔴 Loss:{loss}\n✅ Acerto: {acc:.2f}%\n🔥 Streak: {streak} GREEN(s)")
+    await tg_broadcast(f"{prefix}\\n🟢 G0:{g0}  🔴 Loss:{loss}\\n✅ Acerto: {acc:.2f}%\\n🔥 Streak: {streak} GREEN(s)")
 
 async def send_scoreboard():    await _send_score_generic("daily_score", "📊 <b>Placar do dia</b>")
 async def send_scoreboard_ia(): await _send_score_generic("daily_score_ia", "🤖 <b>Placar IA (dia)</b>")
@@ -419,14 +419,14 @@ def _health_text() -> str:
     try: age = max(0, now_ts()-(_ia2_last_reason_ts or now_ts()))
     except: age = 0
     return (
-        "🩺 <b>Saúde do Guardião</b>\n"
-        f"⏱️ UTC: <code>{utc_iso()}</code>\n—\n"
-        f"🗄️ timeline: <b>{_scalar('SELECT COUNT(*) FROM timeline')}</b>\n"
-        f"📚 ngram_stats: <b>{_scalar('SELECT COUNT(*) FROM ngram_stats')}</b> | amostras≈<b>{int(_scalar('SELECT SUM(weight) FROM ngram_stats'))}</b>\n"
-        f"⏳ pendências abertas: <b>{_scalar('SELECT COUNT(*) FROM pending_outcome WHERE open=1')}</b>\n"
-        f"💾 INTEL dir: <b>{_fmt_bytes(intel_size)}</b> | último snapshot: <code>{last_snap}</code>\n—\n"
-        f"📊 Placar (hoje - G0 only): G0=<b>{g0}</b> | Loss=<b>{loss}</b>\n"
-        f"🤖 Motivo último NÃO-FIRE/FIRE: {_ia2_last_reason} (há {age}s)\n"
+        "🩺 <b>Saúde do Guardião</b>\\n"
+        f"⏱️ UTC: <code>{utc_iso()}</code>\\n—\\n"
+        f"🗄️ timeline: <b>{_scalar('SELECT COUNT(*) FROM timeline')}</b>\\n"
+        f"📚 ngram_stats: <b>{_scalar('SELECT COUNT(*) FROM ngram_stats')}</b> | amostras≈<b>{int(_scalar('SELECT SUM(weight) FROM ngram_stats'))}</b>\\n"
+        f"⏳ pendências abertas: <b>{_scalar('SELECT COUNT(*) FROM pending_outcome WHERE open=1')}</b>\\n"
+        f"💾 INTEL dir: <b>{_fmt_bytes(intel_size)}</b> | último snapshot: <code>{last_snap}</code>\\n—\\n"
+        f"📊 Placar (hoje - G0 only): G0=<b>{g0}</b> | Loss=<b>{loss}</b>\\n"
+        f"🤖 Motivo último NÃO-FIRE/FIRE: {_ia2_last_reason} (há {age}s)\\n"
     )
 
 async def _health_reporter_task():
@@ -621,7 +621,7 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
 def build_suggestion_msg(number:int, base:List[int], pattern_key:str, after_num:Optional[int], conf:float, samples:int, stage:str="G0")->str:
     base_txt = ", ".join(map(str, base)) if base else "—"
     aft_txt = f" após {after_num}" if after_num else ""
-    return f"🎯 <b>Número seco ({stage}):</b> <b>{number}</b>\n🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\n🧮 <b>Base:</b> [{base_txt}]\n📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
+    return f"🎯 <b>Número seco ({stage}):</b> <b>{number}</b>\\n🧩 <b>Padrão:</b> {pattern_key}{aft_txt}\\n🧮 <b>Base:</b> [{base_txt}]\\n📊 Conf: {conf*100:.2f}% | Amostra≈{samples}"
 
 # =========================
 # IA2 — FIRE-only
@@ -636,7 +636,7 @@ def _ia2_reset_hour():
     hb = _ia2_hour_key()
     if _ia2_hour_bucket != hb: _ia2_hour_bucket, _ia2_sent_this_hour = hb, 0
 def _ia2_antispam_ok() -> bool: _ia2_reset_hour(); return _ia2_sent_this_hour < IA2_MAX_PER_HOUR
-def _ia2_mark_sent(): 
+def _ia2_mark_sent():
     global _ia2_sent_this_hour; _ia2_sent_this_hour += 1
 def _ia2_blocked_now() -> bool: return now_ts() < _ia2_blocked_until_ts
 def _ia_set_post_loss_block():
@@ -705,8 +705,8 @@ INTEL = _IntelStub(INTEL_DIR)
 # =========================
 def _sum_days(table:str, days:int):
     rows = _all(f"SELECT yyyymmdd, g0, loss FROM {table} ORDER BY yyyymmdd DESC LIMIT ?", (days,))
-    g0 = sum((r["g0"] or 0) for r in rows)
-    loss = sum((r["loss"] or 0) for r in rows)
+    g0 = sum((r['g0'] or 0) for r in rows)
+    loss = sum((r['loss'] or 0) for r in rows)
     acc = (g0/(g0+loss)*100.0) if (g0+loss) else 0.0
     return g0, loss, acc
 
@@ -715,18 +715,24 @@ def _mk_relatorio_text(days:int=7)->str:
     y = today_key()
     r  = _one("SELECT g0,loss FROM daily_score   WHERE yyyymmdd=?", (y,)) or {"g0":0,"loss":0}
     ri = _one("SELECT g0,loss FROM daily_score_ia WHERE yyyymmdd=?", (y,)) or {"g0":0,"loss":0}
-    g0,loss = (r["g0"] if isinstance(r, sqlite3.Row) else r["g0"]), (r["loss"] if isinstance(r, sqlite3.Row) else r["loss"])
-    ia_g0, ia_loss = (ri["g0"] if isinstance(ri, sqlite3.Row) else ri["g0"]), (ri["loss"] if isinstance(ri, sqlite3.Row) else ri["loss"])
+    if isinstance(r, sqlite3.Row):
+        g0, loss = r['g0'], r['loss']
+    else:
+        g0, loss = r['g0'], r['loss']
+    if isinstance(ri, sqlite3.Row):
+        ia_g0, ia_loss = ri['g0'], ri['loss']
+    else:
+        ia_g0, ia_loss = ri['g0'], ri['loss']
     acc_today = (g0/(g0+loss)*100.0) if (g0+loss) else 0.0
     ia_acc_today = (ia_g0/(ia_g0+ia_loss)*100.0) if (ia_g0+ia_loss) else 0.0
     sum_g0,sum_loss,acc_nd = _sum_days("daily_score", days)
     sum_ia_g0,sum_ia_loss,ia_acc_nd = _sum_days("daily_score_ia", days)
-    return ("📈 <b>Relatório de Desempenho</b>\n"
-            f"🗓️ Janela: <b>hoje</b> e últimos <b>{days}</b> dias\n—\n"
-            f"📣 <b>Canal (hoje)</b>: G0=<b>{g0}</b> | Loss=<b>{loss}</b> | Acerto=<b>{acc_today:.2f}%</b>\n"
-            f"🤖 <b>IA (hoje)</b>: G0=<b>{ia_g0}</b> | Loss=<b>{ia_loss}</b> | Acerto=<b>{ia_acc_today:.2f}%</b>\n—\n"
-            f"📣 <b>Canal ({days}d)</b>: G0=<b>{sum_g0}</b> | Loss=<b>{sum_loss}</b> | Acerto=<b>{acc_nd:.2f}%</b>\n"
-            f"🤖 <b>IA ({days}d)</b>: G0=<b>{sum_ia_g0}</b> | Loss=<b>{sum_ia_loss}</b> | Acerto=<b>{ia_acc_nd:.2f}%</b>\n")
+    return ("📈 <b>Relatório de Desempenho</b>\\n"
+            f"🗓️ Janela: <b>hoje</b> e últimos <b>{days}</b> dias\\n—\\n"
+            f"📣 <b>Canal (hoje)</b>: G0=<b>{g0}</b> | Loss=<b>{loss}</b> | Acerto=<b>{acc_today:.2f}%</b>\\n"
+            f"🤖 <b>IA (hoje)</b>: G0=<b>{ia_g0}</b> | Loss=<b>{ia_loss}</b> | Acerto=<b>{ia_acc_today:.2f}%</b>\\n—\\n"
+            f"📣 <b>Canal ({days}d)</b>: G0=<b>{sum_g0}</b> | Loss=<b>{sum_loss}</b> | Acerto=<b>{acc_nd:.2f}%</b>\\n"
+            f"🤖 <b>IA ({days}d)</b>: G0=<b>{sum_ia_g0}</b> | Loss=<b>{sum_ia_loss}</b> | Acerto=<b>{ia_acc_nd:.2f}%</b>\\n")
 
 # =========================
 # Webhook / API
@@ -763,7 +769,7 @@ async def webhook(token: str, request: Request):
     msg = upd.channel_post or upd.message or upd.edited_channel_post or upd.edited_message
     if not msg: return {"ok": True}
 
-    t = re.sub(r"\s+", " ", (msg.get("text") or msg.get("caption") or "").strip())
+    t = re.sub(r"\\s+", " ", (msg.get("text") or msg.get("caption") or "").strip())
 
     # GREEN / RED — registra número real e fecha/atualiza pendências
     gnum, redn = extract_green_number(t), extract_red_last_left(t)
@@ -787,7 +793,7 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "observed": n_observed, "kind": event_kind}
 
     # ANALISANDO — alimenta timeline
-    if re.search(r"\bANALISANDO\b", t, re.I):
+    if re.search(r"\\bANALISANDO\\b", t, re.I):
         seq_raw = extract_seq_raw(t)
         if seq_raw:
             for n in list(map(int, re.findall(r"[1-4]", seq_raw)))[::-1]:
