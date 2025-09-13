@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 Fantan Guardião — FIRE-only (G0 + Recuperação oculta), versão enxuta
-Ajustes solicitados:
+Ajustes:
 - Enviar SOMENTE IA FIRE no canal secundário -1002796105884 (com "ok")
 - Postar também o resultado (WIN/LOSS) da IA nesse canal (com "ok")
-- Evitar misturar: broadcasts gerais (health/placar/entradas do canal) desativados
+- Broadcasts gerais (health/placar/entradas do canal) desativados
+- PATCH: remover `.get` em sqlite3.Row (usa helper _val)
 """
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict
@@ -47,7 +48,7 @@ INTEL_ANALYZE_INTERVAL = float(getenv("INTEL_ANALYZE_INTERVAL", "2"))
 
 SELF_LABEL_IA = getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.8.1")
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.8.2")
 
 # =========================
 # DB bootstrap + migração
@@ -101,13 +102,20 @@ def _scalar(sql: str, params: tuple = (), default=0):
     r = _one(sql, params)
     if not r: return default
     try:
-        # retorna primeira coluna
         for v in r: return v if v is not None else default
     except Exception:
         pass
-    # fallback por chave
     k = r.keys()
     return r[k[0]] if k and r[k[0]] is not None else default
+
+def _val(row: Optional[sqlite3.Row], key: str, default=0):
+    """Safe extract value from sqlite3.Row, avoiding row.get(...)"""
+    if not row: return default
+    try:
+        v = row[key]
+        return default if v is None else v
+    except Exception:
+        return default
 
 def init_db():
     with _connect() as con:
@@ -204,9 +212,11 @@ def prob_from_ngrams(ctx: List[int], candidate: int) -> float:
     n = len(ctx) + 1
     if n < 2 or n > 5: return 0.0
     ctx_key = ",".join(map(str, ctx))
-    tot = (_one("SELECT SUM(weight) AS w FROM ngram_stats WHERE n=? AND ctx=?", (n, ctx_key)) or {}).get("w") or 0.0
+    row_tot = _one("SELECT SUM(weight) AS w FROM ngram_stats WHERE n=? AND ctx=?", (n, ctx_key))
+    tot = _val(row_tot, "w", 0.0)
     if not tot: return 0.0
-    w = (_one("SELECT weight FROM ngram_stats WHERE n=? AND ctx=? AND next=?", (n, ctx_key, candidate)) or {}).get("weight") or 0.0
+    row_w = _one("SELECT weight FROM ngram_stats WHERE n=? AND ctx=? AND next=?", (n, ctx_key, candidate))
+    w = _val(row_w, "weight", 0.0)
     return (w / tot) if tot else 0.0
 
 # =========================
@@ -362,7 +372,7 @@ _convert_last_loss_to_green_ia = lambda: _convert_last_loss_to_green_table("dail
 async def _send_score_generic(table:str, prefix:str):
     # Mantido, mas silencioso (broadcast desativado)
     y = today_key()
-    row = _one(f"SELECT * FROM {table} WHERE yyyymmdd=?", (y,))
+    row = _one(f"SELECT g0,loss,streak FROM {table} WHERE yyyymmdd=?", (y,)).
     g0 = (row["g0"] if row else 0); loss = (row["loss"] if row else 0); streak = (row["streak"] if row else 0)
     acc = (g0/(g0+loss)*100) if (g0+loss) else 0.0
     await tg_broadcast(f"{prefix}\n🟢 G0:{g0}  🔴 Loss:{loss}\n✅ Acerto: {acc:.2f}%\n🔥 Streak: {streak} GREEN(s)")
@@ -472,7 +482,7 @@ async def close_pending_with_result(n_real: int, event_kind: str):
         hit = (n_real == sug)
 
         if announced == 0:
-            # Primeira janela (G0) — público do canal original foi desativado; IA envia no canal secundário
+            # Primeira janela (G0)
             bump_pattern("PEND", sug, hit)
             if strat: bump_strategy(strat, sug, hit)
             update_daily_score(0 if hit else None, hit)
@@ -491,7 +501,7 @@ async def close_pending_with_result(n_real: int, event_kind: str):
                 else:
                     _write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, min(stage+1, MAX_STAGE-1), pid))
         else:
-            # Recuperação (G1/G2) — anteriormente silenciosa; agora reportamos IA no canal secundário
+            # Recuperação (G1/G2)
             left -= 1
             if hit:
                 try:
@@ -589,7 +599,8 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
     number = confident_best(post, gap=GAP_MIN)
     conf = post.get(number, 0.0) if number is not None else 0.0
 
-    samples = int(((_one("SELECT SUM(weight) AS s FROM ngram_stats") or {}).get("s") or 0))
+    row_s = _one("SELECT SUM(weight) AS s FROM ngram_stats")
+    samples = int(_val(row_s, "s", 0))
 
     # Anti-repique: se último anunciado fechou LOSS com mesmo número, exija mais confiança
     last = _one("SELECT suggested, announced FROM pending_outcome ORDER BY id DESC LIMIT 1")
@@ -704,7 +715,8 @@ def _mk_relatorio_text(days:int=7)->str:
     y = today_key()
     r  = _one("SELECT g0,loss FROM daily_score   WHERE yyyymmdd=?", (y,)) or {"g0":0,"loss":0}
     ri = _one("SELECT g0,loss FROM daily_score_ia WHERE yyyymmdd=?", (y,)) or {"g0":0,"loss":0}
-    g0,loss = r["g0"], r["loss"]; ia_g0, ia_loss = ri["g0"], ri["loss"]
+    g0,loss = (r["g0"] if isinstance(r, sqlite3.Row) else r["g0"]), (r["loss"] if isinstance(r, sqlite3.Row) else r["loss"])
+    ia_g0, ia_loss = (ri["g0"] if isinstance(ri, sqlite3.Row) else ri["g0"]), (ri["loss"] if isinstance(ri, sqlite3.Row) else ri["loss"])
     acc_today = (g0/(g0+loss)*100.0) if (g0+loss) else 0.0
     ia_acc_today = (ia_g0/(ia_g0+ia_loss)*100.0) if (ia_g0+ia_loss) else 0.0
     sum_g0,sum_loss,acc_nd = _sum_days("daily_score", days)
@@ -825,7 +837,8 @@ async def webhook(token: str, request: Request):
 # =========================
 @app.get("/debug/samples")
 async def debug_samples():
-    samples = int((_one("SELECT SUM(weight) AS s FROM ngram_stats") or {}).get("s") or 0)
+    row = _one("SELECT SUM(weight) AS s FROM ngram_stats")
+    samples = int(_val(row, "s", 0))
     return {"samples": samples, "MIN_SAMPLES": MIN_SAMPLES, "enough_samples": samples >= MIN_SAMPLES}
 
 @app.get("/debug/reason")
@@ -836,14 +849,17 @@ async def debug_reason():
 @app.get("/debug/state")
 async def debug_state():
     try:
-        samples = int((_one("SELECT SUM(weight) AS s FROM ngram_stats") or {}).get("s") or 0)
+        row_s = _one("SELECT SUM(weight) AS s FROM ngram_stats")
+        samples = int(_val(row_s, "s", 0))
         pend_open = _scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1")
         reason_age = max(0, now_ts()-(_ia2_last_reason_ts or now_ts()))
         y = today_key()
-        r = _one("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,)) or {"g0":0,"loss":0,"streak":0}
-        ria = _one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,)) or {"g0":0,"loss":0,"streak":0}
-        acc = (r["g0"]/max(1,(r["g0"]+r["loss"])))
-        ia_acc = (ria["g0"]/max(1,(ria["g0"]+ria["loss"])))
+        r = _one("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
+        ria = _one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
+        g0 = (r["g0"] if r else 0); loss = (r["loss"] if r else 0)
+        ia_g0 = (ria["g0"] if ria else 0); ia_loss = (ria["loss"] if ria else 0)
+        acc = (g0/max(1,(g0+loss)))
+        ia_acc = (ia_g0/max(1,(ia_g0+ia_loss)))
         cooldown_remaining = max(0, (_ia2_blocked_until_ts or 0) - now_ts())
         last_fire_age = max(0, now_ts() - (_ia2_last_fire_ts or 0))
         cfg = {
@@ -857,8 +873,8 @@ async def debug_state():
             "last_reason": _ia2_last_reason, "last_reason_age_seconds": int(reason_age),
             "hour_bucket": _ia2_hour_key(), "fires_enviados_nesta_hora": _ia2_sent_this_hour,
             "cooldown_pos_loss_seconds": int(cooldown_remaining), "ultimo_fire_ha_seconds": int(last_fire_age),
-            "placar_canal_hoje": {"g0": int(r["g0"]), "loss": int(r["loss"]), "acc_pct": round(acc*100, 2)},
-            "placar_ia_hoje": {"g0": int(ria["g0"]), "loss": int(ria["loss"]), "acc_pct": round(ia_acc*100, 2)},
+            "placar_canal_hoje": {"g0": int(g0), "loss": int(loss), "acc_pct": round(acc*100, 2)},
+            "placar_ia_hoje": {"g0": int(ia_g0), "loss": int(ia_loss), "acc_pct": round(ia_acc*100, 2)},
             "config": cfg,
         }
     except Exception as e:
