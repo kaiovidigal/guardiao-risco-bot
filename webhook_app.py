@@ -83,19 +83,19 @@ FAST_RESULT   = True      # publica G0 imediatamente
 SCORE_G0_ONLY = True      # placar do dia só conta G0 e Loss (limpo)
 
 # =========================
-# Hiperparâmetros (ajuste G0 para alvo ~80%)
+# Hiperparâmetros (ajuste G0 equilibrado)
 # =========================
 WINDOW = 400
 DECAY  = 0.985
 # Pesos (menos overfit em contexto longo)
 W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
 ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
-GAP_MIN = 0.12  # ↑ mais rígido
+GAP_MIN = 0.08
 
-# Filtros de qualidade para G0 (alvo ~80%)
-MIN_CONF_G0 = 0.80      # ↑ confiança mínima do top1
-MIN_GAP_G0  = 0.12      # ↑ distância top1 - top2
-MIN_SAMPLES = 1500      # ↑ libera FIRE só com base robusta
+# Filtros de qualidade para G0 (modo equilibrado)
+MIN_CONF_G0 = 0.55      # confiança mínima do top1 (filtro base)
+MIN_GAP_G0  = 0.04      # distância top1 - top2
+MIN_SAMPLES = 1000      # começa a liberar FIRE com ~1k amostras (fixo, sem ENV)
 
 # =========================
 # Inteligência em disco (/var/data) — ENV
@@ -767,10 +767,10 @@ def _convert_last_loss_to_green():
 # =========================
 # IA2 — FIRE-only (sem SOFT/INFO) + fila única
 # =========================
-# Limiar e segurança (alvo ~80%)
-IA2_TIER_STRICT             = 0.80  # % mínima para FIRE
-IA2_GAP_SAFETY              = 0.12  # gap top1-top2 que permite FIRE com tolerância
-IA2_DELTA_GAP               = 0.02  # tolerância (ex.: 0.78 com gap>=0.12)
+# Limiar e segurança
+IA2_TIER_STRICT             = 0.62  # % mínima para FIRE
+IA2_GAP_SAFETY              = 0.08  # gap top1-top2 que permite FIRE com pequena tolerância
+IA2_DELTA_GAP               = 0.03  # tolerância se gap for grande (ex.: 0.59 com gap>=0.08)
 IA2_MAX_PER_HOUR            = 10    # limite de FIRE por hora
 IA2_COOLDOWN_AFTER_LOSS     = 20    # segundos bloqueado após 1 loss
 IA2_MIN_SECONDS_BETWEEN_FIRE= 15    # espaçamento mínimo entre FIREs (anti-burst)
@@ -1021,7 +1021,7 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
         if post.get(number, 0.0) < (MIN_CONF_G0 + 0.08):
             return None, 0.0, samples, post
 
-    # Filtro de qualidade (alvo ~80%)
+    # Filtro de qualidade (modo equilibrado)
     top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
     gap = (top2[0][1] - (top2[1][1] if len(top2) > 1 else 0.0)) if top2 else 0.0
     enough_samples = samples >= MIN_SAMPLES
@@ -1052,7 +1052,7 @@ def build_suggestion_msg(number:int, base:List[int], pattern_key:str,
 # IA2 — processo (FIRE-only + fila única)
 # =========================
 def _relevance_ok(conf_raw: float, gap: float, tail_len: int) -> bool:
-    # Regra: FIRE se conf ≥ 80% OU (≥78% e gap ≥ 0.12), e com base suficiente
+    # Regra solicitada: FIRE se conf ≥ 62% OU (conf ≥ 59% e gap ≥ 0.08), e com base suficiente
     return (conf_raw >= IA2_TIER_STRICT or (conf_raw >= IA2_TIER_STRICT - IA2_DELTA_GAP and gap >= IA2_GAP_SAFETY)) \
            and (tail_len >= MIN_SAMPLES)
 
