@@ -1,15 +1,11 @@
 # -*- coding: utf-8 -*-
-# Guardião Fantan — IA Canal Secundário + AfterSync (postar só com resultado)
+# Guardião — IA Canal Secundário + AfterSync (posta só com resultado) + Tail Boost opcional
 #
 # O que esta versão faz:
-# - Lê eventos do Telegram via /webhook/<WEBHOOK_TOKEN>
-# - Alimenta timeline (números 1..4) quando vê GREEN/RED do canal de origem
-# - Se houver "Entrar após o X", enfileira o pedido e SÓ dispara o tiro da IA
-#   quando X realmente aparecer no timeline (sincronismo perfeito)
-# - Ao disparar, calcula o "número seco" (n-gram leve) e publica no IA_CHANNEL
-#   JÁ com o resultado GREEN/LOSS do round atual (não publica FIRE antecipado)
-# - Roteia as mensagens da IA apenas para IA_CHANNEL (não interfere no canal público)
-# - Endpoint de teste: /debug/ping_ia?key=<FLUSH_KEY>&text=...
+# - Só publica no IA_CHANNEL quando sai o resultado (GREEN/LOSS) — sem FIRE antecipado.
+# - "Após X" sincronizado: enfileira e dispara exatamente quando X aparece no timeline.
+# - N-gram leve para prever o número seco.
+# - (Novo) Boost opcional pela frequência dos últimos K lançamentos (top-2 da cauda).
 #
 # ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 # ENV recomendadas: IA_CHANNEL, FLUSH_KEY, PUBLIC_CHANNEL (opcional)
@@ -17,6 +13,7 @@
 import os, re, json, time, sqlite3, asyncio
 from typing import Optional, List, Tuple, Dict
 from datetime import datetime, timezone
+from collections import Counter
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
@@ -33,13 +30,22 @@ FLUSH_KEY      = os.getenv("FLUSH_KEY", "meusegredo123").strip()
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # Hiperparâmetros simples
-WINDOW = 400
+WINDOW = int(os.getenv("WINDOW", "400"))
 DECAY  = 0.985
 W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
-GAP_MIN, MIN_CONF_G0, MIN_GAP_G0, MIN_SAMPLES = 0.08, 0.55, 0.04, 400  # amostra reduzida para iniciar mais cedo
+GAP_MIN   = float(os.getenv("GAP_MIN", "0.08"))
+MIN_CONF_G0 = float(os.getenv("MIN_CONF_G0", "0.55"))
+MIN_GAP_G0  = float(os.getenv("MIN_GAP_G0", "0.04"))
+MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "400"))  # amostra reduzida para iniciar mais cedo
 SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Guardião — IA secundário + AfterSync", version="1.0.0")
+# (Novo) Boost de frequência da cauda
+USE_TAIL_FREQ_BOOST = os.getenv("USE_TAIL_FREQ_BOOST", "true").strip().lower() in ("1","true","yes","on")
+TAIL_FREQ_K         = int(os.getenv("TAIL_FREQ_K", "40"))
+TAIL_TOP1_BOOST     = float(os.getenv("TAIL_TOP1_BOOST", "1.04"))
+TAIL_TOP2_BOOST     = float(os.getenv("TAIL_TOP2_BOOST", "1.02"))
+
+app = FastAPI(title="Guardião — IA secundário + AfterSync + TailBoost", version="1.1.0")
 
 # =========================
 # DB helpers
@@ -189,7 +195,7 @@ def is_analise(text:str) -> bool:
     return bool(re.search(r"\bANALISANDO\b", text, flags=re.I))
 
 # =========================
-# N-gram model simples
+# N-gram model + Tail Boost
 # =========================
 def prob_from_ngrams(ctx: List[int], candidate: int) -> float:
     n = len(ctx) + 1
@@ -202,16 +208,27 @@ def prob_from_ngrams(ctx: List[int], candidate: int) -> float:
     w = (row2["weight"] or 0.0) if row2 else 0.0
     return w / tot
 
+def tail_top2_boost(tail: List[int], k:int) -> Dict[int, float]:
+    boosts = {1:1.0, 2:1.0, 3:1.0, 4:1.0}
+    if not tail: return boosts
+    t = tail[-k:] if len(tail) >= k else tail[:]
+    freq = Counter(t).most_common()
+    if len(freq) >= 1: boosts[freq[0][0]] = TAIL_TOP1_BOOST
+    if len(freq) >= 2: boosts[freq[1][0]] = TAIL_TOP2_BOOST
+    return boosts
+
 def suggest_number(base: List[int], after_num: Optional[int]) -> Tuple[Optional[int], float, int, Dict[int,float]]:
-    if not base: base = [1,2,3,4]
+    # Aqui ainda usamos 'base' como conjunto de candidatos (compatível com suas rotinas atuais).
+    # Se quiser liberar sempre [1,2,3,4], basta trocar a linha abaixo por: candidates = [1,2,3,4]
+    candidates = base if base else [1,2,3,4]
     tail = get_recent_tail(WINDOW)
     if len(tail) < MIN_SAMPLES:
-        return None, 0.0, len(tail), {k: 1/len(base) for k in base}
+        return None, 0.0, len(tail), {k: 1/len(candidates) for k in candidates}
 
-    # Se exigir "após X", só aceite quando X for o último
+    # Se exigir "após X", só aceite quando X for o último visto
     if after_num is not None:
         if not tail or tail[-1] != int(after_num):
-            return None, 0.0, len(tail), {k: 1/len(base) for k in base}
+            return None, 0.0, len(tail), {k: 1/len(candidates) for k in candidates}
 
     def backoff(ctx: List[int], c: int) -> float:
         parts = []
@@ -221,22 +238,30 @@ def suggest_number(base: List[int], after_num: Optional[int]) -> Tuple[Optional[
         if len(ctx)>=1: parts.append((W1, prob_from_ngrams(ctx[-1:], c)))
         return sum(w*p for w,p in parts) or 1e-6
 
+    boosts = tail_top2_boost(tail, k=TAIL_FREQ_K) if USE_TAIL_FREQ_BOOST else {1:1.0,2:1.0,3:1.0,4:1.0}
+
     scores: Dict[int, float] = {}
-    for c in base:
+    for c in candidates:
         ng = backoff(tail, c)
-        scores[c] = ng
+        scores[c] = boosts.get(c, 1.0) * ng
 
     total = sum(scores.values()) or 1e-9
     post = {k: v/total for k,v in scores.items()}
-    a = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    if len(a) < 1: return None, 0.0, len(tail), post
-    if len(a) >= 2 and (a[0][1]-a[1][1]) < MIN_GAP_G0:
+    ranked = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    if not ranked:
         return None, 0.0, len(tail), post
-    best = a[0][0]
-    conf = a[0][1]
-    if conf < MIN_CONF_G0:
-        return None, conf, len(tail), post
-    return best, conf, len(tail), post
+
+    if len(ranked) >= 2:
+        top_conf  = ranked[0][1]
+        gap       = ranked[0][1] - ranked[1][1]
+    else:
+        top_conf, gap = ranked[0][1], 1.0
+
+    if gap < MIN_GAP_G0 or top_conf < MIN_CONF_G0:
+        return None, top_conf, len(tail), post
+
+    best = ranked[0][0]
+    return best, top_conf, len(tail), post
 
 # =========================
 # Fila "após X"
@@ -258,12 +283,14 @@ def consume_wait_after(n_observed: int) -> List[sqlite3.Row]:
 # =========================
 # Mensagens IA (apenas quando sai resultado)
 # =========================
-async def ia_post_result(best:int, result_num:int, stage_txt:str, after_num: Optional[int], conf: float, samples: int):
+async def ia_post_result(best:int, result_num:int, stage_txt:str, after_num: Optional[int], conf: float, samples: int, base: Optional[List[int]]=None):
+    base_txt = f"\n🧮 Base (canal): {base}" if base else ""
     aft = f"\n       Após número {after_num}" if after_num is not None else ""
     status = "✅ <b>GREEN</b>" if int(best) == int(result_num) else "❌ <b>LOSS</b>"
     msg = (
         f"🤖 <b>{SELF_LABEL_IA}</b>\n"
-        f"🎯 Número seco ({stage_txt}): <b>{best}</b>{aft}\n"
+        f"🎯 Número seco ({stage_txt}): <b>{best}</b>{aft}"
+        f"{base_txt}\n"
         f"📈 Conf: <b>{conf*100:.2f}%</b> | Amostra≈<b>{samples}</b>\n"
         f"{status} — Número: <b>{result_num}</b> (em {stage_txt})"
     )
@@ -329,7 +356,7 @@ async def webhook(token: str, request: Request):
                 results.append({"queued_after": after_num, "skipped": "low_conf_or_gap", "samples": samples})
                 continue
             # Posta no IA_CHANNEL já com o resultado do round atual
-            await ia_post_result(int(best), int(n_observed), "G0", after_num, conf, samples)
+            await ia_post_result(int(best), int(n_observed), "G0", after_num, conf, samples, base=base)
             results.append({"queued_after": after_num, "best": int(best), "result": int(n_observed)})
         return {"ok": True, "observed": int(n_observed), "processed_waits": results}
 
