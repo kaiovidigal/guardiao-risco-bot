@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
-# Guardião — IA Canal Secundário + AfterSync (posta só com resultado) + Tail Boost opcional
+# Guardião — IA Canal Secundário (80% Calib) + AfterSync + TailBoost + SoftPrior
 #
-# O que esta versão faz:
-# - Só publica no IA_CHANNEL quando sai o resultado (GREEN/LOSS) — sem FIRE antecipado.
-# - "Após X" sincronizado: enfileira e dispara exatamente quando X aparece no timeline.
-# - N-gram leve para prever o número seco.
-# - (Novo) Boost opcional pela frequência dos últimos K lançamentos (top-2 da cauda).
+# Objetivo:
+# - IA SEMPRE considera candidatos [1,2,3,4].
+# - "Base" do canal (ex.: 4-3-2) é prior SUAVE (opcional), não trava os candidatos.
+# - "Após X" sincronizado: só dispara quando X realmente aparece no timeline.
+# - IA publica SOMENTE quando sai o resultado (GREEN/LOSS) no IA_CHANNEL (sem FIRE).
+# - Filtros mais rígidos (conf/gap/amostra) para mirar alta precisão (abstém mais).
+# - TailBoost opcional (top-2 mais frequentes da cauda K).
 #
 # ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
-# ENV recomendadas: IA_CHANNEL, FLUSH_KEY, PUBLIC_CHANNEL (opcional)
+# ENV recomendadas: IA_CHANNEL, FLUSH_KEY
+# ENV úteis de calibração:
+#   MIN_CONF_G0=0.64   MIN_GAP_G0=0.06   MIN_SAMPLES=800   WINDOW=500
+#   USE_SOFT_BASE_PRIOR=true  BASE_PRIOR_IN=1.08  BASE_PRIOR_OUT=1.00
+#   USE_TAIL_FREQ_BOOST=true  TAIL_FREQ_K=40  TAIL_TOP1_BOOST=1.04  TAIL_TOP2_BOOST=1.02
 #
 import os, re, json, time, sqlite3, asyncio
 from typing import Optional, List, Tuple, Dict
@@ -24,28 +30,33 @@ from pydantic import BaseModel
 DB_PATH = os.getenv("DB_PATH", "/data/data.db").strip() or "/data/data.db"
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-IA_CHANNEL     = os.getenv("IA_CHANNEL", "").strip()   # Canal secundário IA (ex: -1002796105884)
-PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()  # opcional (não usamos para IA)
+IA_CHANNEL     = os.getenv("IA_CHANNEL", "").strip()   # Ex.: -1002796105884
 FLUSH_KEY      = os.getenv("FLUSH_KEY", "meusegredo123").strip()
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# Hiperparâmetros simples
-WINDOW = int(os.getenv("WINDOW", "400"))
-DECAY  = 0.985
+# Hiperparâmetros
+WINDOW       = int(os.getenv("WINDOW", "500"))
+DECAY        = 0.985
 W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
-GAP_MIN   = float(os.getenv("GAP_MIN", "0.08"))
-MIN_CONF_G0 = float(os.getenv("MIN_CONF_G0", "0.55"))
-MIN_GAP_G0  = float(os.getenv("MIN_GAP_G0", "0.04"))
-MIN_SAMPLES = int(os.getenv("MIN_SAMPLES", "400"))  # amostra reduzida para iniciar mais cedo
-SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-# (Novo) Boost de frequência da cauda
+# Calibração (rigor alto)
+MIN_CONF_G0  = float(os.getenv("MIN_CONF_G0", "0.64"))   # ↑ seletivo p/ precisão
+MIN_GAP_G0   = float(os.getenv("MIN_GAP_G0",  "0.06"))   # ↑ separação top-2
+MIN_SAMPLES  = int(os.getenv("MIN_SAMPLES",  "800"))     # ↑ confiança no n-gram
+
+# Soft prior da base do canal (opcional)
+USE_SOFT_BASE_PRIOR = os.getenv("USE_SOFT_BASE_PRIOR", "true").strip().lower() in ("1","true","yes","on")
+BASE_PRIOR_IN  = float(os.getenv("BASE_PRIOR_IN",  "1.08"))  # leve boost p/ quem está na base
+BASE_PRIOR_OUT = float(os.getenv("BASE_PRIOR_OUT", "1.00"))  # neutro p/ fora da base
+
+# TailBoost (opcional)
 USE_TAIL_FREQ_BOOST = os.getenv("USE_TAIL_FREQ_BOOST", "true").strip().lower() in ("1","true","yes","on")
 TAIL_FREQ_K         = int(os.getenv("TAIL_FREQ_K", "40"))
 TAIL_TOP1_BOOST     = float(os.getenv("TAIL_TOP1_BOOST", "1.04"))
 TAIL_TOP2_BOOST     = float(os.getenv("TAIL_TOP2_BOOST", "1.02"))
 
-app = FastAPI(title="Guardião — IA secundário + AfterSync + TailBoost", version="1.1.0")
+SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
+app = FastAPI(title="Guardião — IA secundário (80cal) + AfterSync + TailBoost + SoftPrior", version="2.1.0")
 
 # =========================
 # DB helpers
@@ -86,7 +97,7 @@ def init_db():
         pattern_key TEXT NOT NULL,
         base TEXT NOT NULL,
         after_num INTEGER NOT NULL,
-        ttl_seconds INTEGER NOT NULL DEFAULT 180
+        ttl_seconds INTEGER NOT NULL DEFAULT 200
     )""")
     con.commit(); con.close()
 init_db()
@@ -134,7 +145,7 @@ async def send_ia(text: str, parse: str="HTML"):
     if IA_CHANNEL: await tg_send_text(IA_CHANNEL, text, parse)
 
 # =========================
-# Parsing helpers (canal origem)
+# Parsing helpers
 # =========================
 MUST_HAVE = (r"ENTRADA\s+CONFIRMADA", r"Mesa:\s*Fantan\s*-\s*Evolution")
 MUST_NOT  = (r"\bANALISANDO\b", r"\bPlacar do dia\b", r"\bAPOSTA ENCERRADA\b")
@@ -169,7 +180,7 @@ GREEN_PATTERNS = [
 ]
 RED_PATTERNS = [
     re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\((.*?)\)", re.I | re.S),
-    re.compile(r"\bLOSS\b.*?Número[:\s]*([1-4])", re.I | re.S),
+    re.compile(r"\bLOSS\b.*?Número[:\s]*([1-4])", re.I | re_S),
     re.compile(r"\bRED\b.*?\(([1-4])\)", re.I | re.S),
 ]
 
@@ -195,7 +206,7 @@ def is_analise(text:str) -> bool:
     return bool(re.search(r"\bANALISANDO\b", text, flags=re.I))
 
 # =========================
-# N-gram model + Tail Boost
+# N-gram + SoftPrior + TailBoost
 # =========================
 def prob_from_ngrams(ctx: List[int], candidate: int) -> float:
     n = len(ctx) + 1
@@ -218,18 +229,25 @@ def tail_top2_boost(tail: List[int], k:int) -> Dict[int, float]:
     return boosts
 
 def suggest_number(base: List[int], after_num: Optional[int]) -> Tuple[Optional[int], float, int, Dict[int,float]]:
-    # Aqui ainda usamos 'base' como conjunto de candidatos (compatível com suas rotinas atuais).
-    # Se quiser liberar sempre [1,2,3,4], basta trocar a linha abaixo por: candidates = [1,2,3,4]
-    candidates = base if base else [1,2,3,4]
+    # Candidatos SEMPRE [1,2,3,4]
+    candidates = [1,2,3,4]
     tail = get_recent_tail(WINDOW)
     if len(tail) < MIN_SAMPLES:
         return None, 0.0, len(tail), {k: 1/len(candidates) for k in candidates}
 
-    # Se exigir "após X", só aceite quando X for o último visto
+    # Se exigir "após X", só aceite quando X for o último visto (sincronismo)
     if after_num is not None:
         if not tail or tail[-1] != int(after_num):
             return None, 0.0, len(tail), {k: 1/len(candidates) for k in candidates}
 
+    # prior suave da "base" do canal
+    base_set = set(base or [])
+    def prior(c: int) -> float:
+        if not USE_SOFT_BASE_PRIOR or not base_set:
+            return 1.0
+        return BASE_PRIOR_IN if c in base_set else BASE_PRIOR_OUT
+
+    # backoff n-gram
     def backoff(ctx: List[int], c: int) -> float:
         parts = []
         if len(ctx)>=4: parts.append((W4, prob_from_ngrams(ctx[-4:-1], c)))
@@ -238,12 +256,12 @@ def suggest_number(base: List[int], after_num: Optional[int]) -> Tuple[Optional[
         if len(ctx)>=1: parts.append((W1, prob_from_ngrams(ctx[-1:], c)))
         return sum(w*p for w,p in parts) or 1e-6
 
-    boosts = tail_top2_boost(tail, k=TAIL_FREQ_K) if USE_TAIL_FREQ_BOOST else {1:1.0,2:1.0,3:1.0,4:1.0}
+    tail_boosts = tail_top2_boost(tail, k=TAIL_FREQ_K) if USE_TAIL_FREQ_BOOST else {1:1.0,2:1.0,3:1.0,4:1.0}
 
     scores: Dict[int, float] = {}
     for c in candidates:
         ng = backoff(tail, c)
-        scores[c] = boosts.get(c, 1.0) * ng
+        scores[c] = prior(c) * tail_boosts.get(c, 1.0) * ng
 
     total = sum(scores.values()) or 1e-9
     post = {k: v/total for k,v in scores.items()}
@@ -266,7 +284,7 @@ def suggest_number(base: List[int], after_num: Optional[int]) -> Tuple[Optional[
 # =========================
 # Fila "após X"
 # =========================
-def enqueue_wait_after(pattern_key: str, base: List[int], after_num: int, ttl:int=180):
+def enqueue_wait_after(pattern_key: str, base: List[int], after_num: int, ttl:int=200):
     exec_write("""INSERT INTO wait_after (created_at, strategy, pattern_key, base, after_num, ttl_seconds)
                   VALUES (?,?,?,?,?,?)""",
                (now_ts(), "", pattern_key, json.dumps(base), int(after_num), int(ttl)))
@@ -376,8 +394,9 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "skipped": True}
 
     after_num = extract_after_num(t)
-    # Base/padrão simples a partir da sequência (se existir)
-    base = [1,2,3,4]
+
+    # Extrai "base" da sequência apenas para prior suave (não restringe candidatos)
+    base = []
     seq_raw = extract_seq_raw(t)
     if seq_raw:
         nums = [int(x) for x in re.findall(r"[1-4]", seq_raw)]
@@ -386,11 +405,12 @@ async def webhook(token: str, request: Request):
             if n not in seen:
                 seen.add(n); b.append(n)
             if len(b) == 3: break
-        if b: base = b
+        base = b
 
     if after_num is not None:
-        enqueue_wait_after("GEN", base, int(after_num), ttl=180)
+        # TTL curto para manter alinhado ao ciclo do jogo
+        enqueue_wait_after("GEN", base, int(after_num), ttl=200)
         return {"ok": True, "queued_after": int(after_num), "base": base}
 
-    # Se não tem "após X", não dispara FIRE (apenas aprendizado via ANALISANDO/GREEN/RED)
+    # Sem "após X": não disparamos (somos IA secundária que só publica com resultado)
     return {"ok": True, "no_after": True}
