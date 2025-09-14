@@ -1,4 +1,4 @@
- -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # Fan Tan — Guardião (G0 + Recuperação oculta) com:
 # - Inteligência em disco: /var/data/ai_intel (teto 1 GB + rotação)
 # - Batidas do sinal a cada 20s enquanto houver pendência aberta
