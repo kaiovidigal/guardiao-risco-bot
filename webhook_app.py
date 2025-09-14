@@ -1,4 +1,4 @@
- -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 # Fan Tan — Guardião (G0 + Recuperação oculta) com:
 # - Inteligência em disco: /var/data/ai_intel (teto 1 GB + rotação)
 # - Batidas do sinal a cada 20s enquanto houver pendência aberta
@@ -139,7 +139,7 @@ def exec_write(sql: str, params: tuple = (), retries: int = 8, wait: float = 0.2
             raise
     raise sqlite3.OperationalError("Banco bloqueado após várias tentativas.")
 
-def query_all(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+def query_all(sql: str, params: tuple = ()) -> List[sqlite3.Row]:
     con = _connect()
     rows = con.execute(sql, params).fetchall()
     con.close()
@@ -571,7 +571,7 @@ async def send_scoreboard_ia():
     total = g0 + loss
     acc = (g0/total*100) if total else 0.0
     txt = (f"🤖 <b>Placar IA (dia)</b>\n"
-           f"🟢 G0:{g0}</b>  🔴 Loss:{loss}\n"
+           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
            f"✅ Acerto: {acc:.2f}%\n"
            f"🔥 Streak: {streak} GREEN(s)")
     await tg_broadcast(txt)
@@ -1006,7 +1006,7 @@ async def close_pending_with_result(n_observed: int, event_kind: str):
             left       = int(r["window_left"])
             src        = (r["source"] or "CHAN").upper()
             seen       = (r["seen_numbers"] or "").strip()
-            seen_new   = (seen + ("," if seen else "") + str(int(n_observed)))
+            seen_new   = (seen + (\",\" if seen else \"\") + str(int(n_observed)))
 
             if int(n_observed) == suggested:
                 # GREEN
@@ -1038,11 +1038,11 @@ async def close_pending_with_result(n_observed: int, event_kind: str):
                 # Não bateu
                 if left > 1:
                     # avança estágio (G1->G2) mantendo pendência aberta
-                    exec_write("""
+                    exec_write(\"\"\"
                         UPDATE pending_outcome
                            SET stage = stage + 1, window_left = window_left - 1, seen_numbers=?
                          WHERE id=?
-                    """, (seen_new, pid))
+                    \"\"\", (seen_new, pid))
                     if stage == 0:
                         # PRIMEIRO erro (G0): conta LOSS e anuncia com conferência
                         update_daily_score(0, False)
