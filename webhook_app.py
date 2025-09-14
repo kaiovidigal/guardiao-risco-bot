@@ -884,18 +884,18 @@ def _eff() -> dict:
             "MIN_GAP_G0": 0.035,
         }
     else:
-    return {
-        "PHASE": "C",
-        "MAX_CONCURRENT_PENDINGS": 1,
-        "IA2_MAX_PER_HOUR": 12,
-        "IA2_MIN_SECONDS_BETWEEN_FIRE": 12,
-        "IA2_COOLDOWN_AFTER_LOSS": 15,
-        "IA2_TIER_STRICT": 0.62,
-        "IA2_DELTA_GAP": 0.03,
-        "IA2_GAP_SAFETY": IA2_GAP_SAFETY,   # ✅ mantenha só esta
-        "MIN_CONF_G0": 0.55,
-        "MIN_GAP_G0": 0.040,
-    }
+        return {
+            "PHASE": "C",
+            "MAX_CONCURRENT_PENDINGS": 1,
+            "IA2_MAX_PER_HOUR": 12,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 12,
+            "IA2_COOLDOWN_AFTER_LOSS": 15,
+            "IA2_TIER_STRICT": 0.62,
+            "IA2_DELTA_GAP": 0.03,
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,   # ✅ mantenha só esta
+            "MIN_CONF_G0": 0.55,
+            "MIN_GAP_G0": 0.040,
+        }
 
 # Estado volátil
 _ia2_blocked_until_ts: int = 0
