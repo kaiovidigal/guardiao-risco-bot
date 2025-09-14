@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-# Guardião — Tiro Seco (versão enxuta v3 - fechamento rígido)
-# Mudanças vs v2:
-# - Só fecha GREEN/LOSS quando houver números de conferência (1..4) ligados à mensagem.
-# - Removido fallback que lia números soltos. Se não vier número → não fecha.
+# Guardião — Tiro Seco (versão enxuta v3.1 - fechamento rígido + sequência no aviso)
+# Adições vs v3:
+# - GREEN/LOSS exibem o número de conferência ao lado em parênteses: GREEN (1) / LOSS (4)
+# - Mensagens incluem a linha "🚥 Sequência: a | b | c" com os números lidos na mensagem de fechamento
 #
 # Rotas:
 #   POST /webhook/<WEBHOOK_TOKEN>
@@ -38,7 +38,7 @@ WINDOW    = 400
 MIN_SAMPLES = 120   # relaxado para não travar em cenários com pouco histórico
 MIN_CONF   = 0.48   # relaxado
 
-app = FastAPI(title="Guardião — Tiro Seco (lite v3)", version="1.2.0")
+app = FastAPI(title="Guardião — Tiro Seco (lite v3.1)", version="1.3.1")
 
 # =========================
 # SQLite helpers
@@ -114,12 +114,21 @@ async def tg_broadcast(text: str, parse: str="HTML"):
     if REPL_CHANNEL:
         await tg_send_text(REPL_CHANNEL, text, parse)
 
-# Mensagens com número de conferência
-async def send_green(sugerido:int, stage_txt:str, conferido:int):
-    await tg_broadcast(f"✅ <b>GREEN</b> em <b>{stage_txt}</b> — Número: <b>{sugerido}</b> • Conf: <b>{conferido}</b>")
+def _seq_str(numbers: List[int]) -> str:
+    return " | ".join(str(n) for n in numbers) if numbers else "—"
 
-async def send_loss(sugerido:int, stage_txt:str, conferido:int):
-    await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b> ({stage_txt}) • Conf: <b>{conferido}</b>")
+# Mensagens com número de conferência + sequência
+async def send_green(sugerido:int, stage_txt:str, conferido:int, seq:List[int]):
+    await tg_broadcast(
+        f"✅ <b>GREEN</b> (<b>{conferido}</b>) em <b>{stage_txt}</b> — Número: <b>{sugerido}</b> • Conf: <b>{conferido}</b>\n"
+        f"🚥 <b>Sequência:</b> {_seq_str(seq)}"
+    )
+
+async def send_loss(sugerido:int, stage_txt:str, conferido:int, seq:List[int]):
+    await tg_broadcast(
+        f"❌ <b>LOSS</b> (<b>{conferido}</b>) — Número: <b>{sugerido}</b> ({stage_txt}) • Conf: <b>{conferido}</b>\n"
+        f"🚥 <b>Sequência:</b> {_seq_str(seq)}"
+    )
 
 async def send_sinal_g0(num:int, conf:float, samples:int):
     await tg_broadcast(
@@ -258,7 +267,8 @@ def open_pending(suggested:int):
     """, (now_ts(), int(suggested), 0, 1, MAX_STAGE))
 
 async def apply_closures_with_numbers(numbers: List[int]):
-    """Aplica a sequência de números observados (até 3) nas pendências abertas, na ordem FIFO."""
+    """Aplica a sequência de números observados (até 3) nas pendências abertas, na ordem FIFO.
+       Agora inclui a sequência na mensagem de GREEN/LOSS."""
     if not numbers:
         return
     rows = query_all("""SELECT id, suggested, stage, open, window_left
@@ -268,24 +278,25 @@ async def apply_closures_with_numbers(numbers: List[int]):
     r = rows[0]
     pid, suggested, stage, left = r["id"], int(r["suggested"]), int(r["stage"]), int(r["window_left"])
     stage_names = {0:"G0",1:"G1",2:"G2"}
+    seq = numbers[:]  # sequência recebida na msg
     for i, obs in enumerate(numbers, start=1):
         if obs == suggested:
             # GREEN
             exec_write("UPDATE pending_outcome SET open=0, window_left=0 WHERE id=?", (pid,))
-            await send_green(suggested, stage_names.get(stage, f"G{stage}"), obs)
+            await send_green(suggested, stage_names.get(stage, f"G{stage}"), obs, seq)
             return
         # não bateu
         left_now = max(0, left - 1)
         if left_now > 0:
             # avança estágio e continua aberta
             exec_write("UPDATE pending_outcome SET stage=stage+1, window_left=? WHERE id=?", (left_now, pid))
-            # se foi o primeiro erro (G0), registra LOSS visual
+            # se foi o primeiro erro (G0), registra LOSS visual (com sequência)
             if stage == 0:
-                await send_loss(suggested, "G0", obs)
+                await send_loss(suggested, "G0", obs, seq)
             stage += 1
             left = left_now
         else:
-            # esgotou (terceiro número) -> fecha
+            # esgotou (terceiro número) -> fecha silencioso
             exec_write("UPDATE pending_outcome SET open=0, window_left=0 WHERE id=?", (pid,))
             return
 
@@ -301,7 +312,7 @@ class Update(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"ok": True, "detail": "Guardião — Tiro Seco (lite v3) - fechamento rígido"}
+    return {"ok": True, "detail": "Guardião — Tiro Seco (lite v3.1) - fechamento rígido + sequência"}
 
 @app.get("/debug/pending")
 async def debug_pending():
