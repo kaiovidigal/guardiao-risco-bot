@@ -22,6 +22,7 @@
 import os, re, json, time, sqlite3, asyncio, shutil
 from typing import List, Optional, Tuple, Dict, Any
 from datetime import datetime, timezone, timedelta
+from collections import Counter
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -92,8 +93,8 @@ W4, W3, W2, W1 = 0.38, 0.30, 0.20, 0.12
 ALPHA, BETA, GAMMA = 1.05, 0.70, 0.40
 GAP_MIN = 0.08
 
-# Filtros de qualidade para G0 (modo equilibrado)
-MIN_CONF_G0 = 0.55      # confiança mínima do top1 (filtro base)
+# Filtros de qualidade para G0 (modo default; serão sobrescritos por fase)
+MIN_CONF_G0 = 0.55      # confiança mínima do top1
 MIN_GAP_G0  = 0.04      # distância top1 - top2
 MIN_SAMPLES = 1000      # começa a liberar FIRE com ~1k amostras (fixo, sem ENV)
 
@@ -110,7 +111,7 @@ INTEL_ANALYZE_INTERVAL = float(os.getenv("INTEL_ANALYZE_INTERVAL", "2"))  # anal
 # =========================
 SELF_LABEL_IA = os.getenv("SELF_LABEL_IA", "Tiro seco por IA")
 
-app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.8.0")
+app = FastAPI(title="Fantan Guardião — FIRE-only (G0 + Recuperação oculta)", version="3.10.0")
 
 # =========================
 # SQLite helpers (WAL + timeout + retry)
@@ -250,20 +251,38 @@ async def tg_broadcast(text: str, parse: str="HTML"):
     if REPL_ENABLED and REPL_CHANNEL:
         await tg_send_text(REPL_CHANNEL, text, parse)
 
-# === Mensagens (recuperação oculta NÃO emite broadcast) ===
+# ===== Linha pronta de placar (mostrada em GREEN/LOSS) =====
+def _score_line() -> str:
+    y = today_key_local()
+    row = query_one("SELECT g0,g1,g2,loss FROM daily_score WHERE yyyymmdd=?", (y,))
+    g0   = (row["g0"] if row else 0)
+    loss = (row["loss"] if row else 0)
+    total = g0 + loss
+    acc = (g0/total*100.0) if total else 0.0
+    return f"📈 Placar geral: {g0} GREEN / {loss} LOSS — Acerto: {acc:.1f}% (N={total})"
+
+# === Mensagens (recuperação oculta NÃO emite broadcast automaticamente; aqui emitimos) ===
 async def send_green_imediato(sugerido:int, stage_txt:str="G0"):
-    await tg_broadcast(f"✅ <b>GREEN</b> em <b>{stage_txt}</b> — Número: <b>{sugerido}</b>")
+    txt = (
+        "GREEN:\n"
+        f"🟢 <b>GREEN</b> em <b>{stage_txt}</b> — finalizado.\n"
+        f"{_score_line()}"
+    )
+    await tg_broadcast(txt)
 
 async def send_loss_imediato(sugerido:int, stage_txt:str="G0"):
-    await tg_broadcast(f"❌ <b>LOSS</b> — Número: <b>{sugerido}</b> (em {stage_txt})")
+    txt = (
+        "LOSS:\n"
+        f"🔴 <b>LOSS</b> em <b>{stage_txt}</b> — finalizado.\n"
+        f"{_score_line()}"
+    )
+    await tg_broadcast(txt)
 
 # Mantida para compat, mas não usada quando recuperação bate:
 async def send_recovery(_stage_txt:str):
-    # Oculto por especificação do owner.
     return
 
 async def ia2_send_signal(best:int, conf:float, tail_len:int, mode:str):
-    # Somente FIRE
     txt = (
         f"🤖 <b>{SELF_LABEL_IA} [{mode}]</b>\n"
         f"🎯 Número seco (G0): <b>{best}</b>\n"
@@ -545,10 +564,24 @@ async def send_scoreboard_ia():
     total = g0 + loss
     acc = (g0/total*100) if total else 0.0
     txt = (f"🤖 <b>Placar IA (dia)</b>\n"
-           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
+           f"🟢 G0:{g0}</b>  🔴 Loss:{loss}\n"
            f"✅ Acerto: {acc:.2f}%\n"
            f"🔥 Streak: {streak} GREEN(s)")
     await tg_broadcast(txt)
+
+# ===== Métricas de desempenho (IA) =====
+def _ia_acc_days(days:int=7) -> Tuple[int,int,float]:
+    """Retorna (greens, losses, acc) da IA numa janela de N dias (inclui hoje)."""
+    days = max(1, min(int(days), 30))
+    rows = query_all("""
+        SELECT g0, loss FROM daily_score_ia
+        ORDER BY yyyymmdd DESC
+        LIMIT ?
+    """, (days,))
+    g = sum((r["g0"] or 0) for r in rows)
+    l = sum((r["loss"] or 0) for r in rows)
+    acc = (g/(g+l)) if (g+l)>0 else 0.0
+    return int(g), int(l), float(acc)
 
 # ======== Estatística de recuperação G1 ========
 def bump_recov_g1(number:int, won:bool):
@@ -643,7 +676,6 @@ def _last_snapshot_info():
 _ia2_last_reason: str = "—"
 _ia2_last_reason_ts: int = 0
 def _mark_reason(r: str):
-    """Grava, em memória, o motivo do último NÃO-FIRE (ou FIRE) com timestamp."""
     global _ia2_last_reason, _ia2_last_reason_ts
     _ia2_last_reason = r
     _ia2_last_reason_ts = now_ts()
@@ -664,12 +696,27 @@ def _health_text() -> str:
     # IA snapshot
     ia_g0, ia_loss, ia_total, ia_acc = _daily_score_snapshot_ia()
 
-    # NOVO: motivo do último NÃO-FIRE/FIRE
+    # Motivo último NÃO-FIRE/FIRE
     try:
         last_reason_age = max(0, now_ts() - (_ia2_last_reason_ts or now_ts()))
         last_reason_line = f"🤖 Motivo último NÃO-FIRE/FIRE: {_ia2_last_reason} (há {last_reason_age}s)"
     except Exception:
         last_reason_line = "🤖 Motivo último NÃO-FIRE/FIRE: —"
+
+    # Linha extra: fase adaptativa, limites efetivos e acc(7d)
+    try:
+        eff = _eff()
+        _g7, _l7, acc7 = _ia_acc_days(7)
+        phase_line = (
+            f"🧭 Fase: {eff['PHASE']} | "
+            f"Max/h: {eff['IA2_MAX_PER_HOUR']} | "
+            f"Conc.: {eff['MAX_CONCURRENT_PENDINGS']} | "
+            f"Conf≥{eff['IA2_TIER_STRICT']:.2f} (flex −{eff['IA2_DELTA_GAP']:.2f} c/gap≥{eff['IA2_GAP_SAFETY']:.2f}) | "
+            f"G0 conf/gap≥{eff['MIN_CONF_G0']:.2f}/{eff['MIN_GAP_G0']:.3f} | "
+            f"IA 7d: {(_g7+_l7)} ops • {acc7*100:.2f}%"
+        )
+    except Exception:
+        phase_line = "🧭 Fase: —"
 
     return (
         "🩺 <b>Saúde do Guardião</b>\n"
@@ -688,24 +735,20 @@ def _health_text() -> str:
         f"🤖 <b>IA</b> G0=<b>{ia_g0}</b> | Loss=<b>{ia_loss}</b> | Total=<b>{ia_total}</b>\n"
         f"✅ <b>IA Acerto (dia):</b> <b>{ia_acc:.2f}%</b>\n"
         f"{last_reason_line}\n"
+        f"{phase_line}\n"
     )
 
 async def _health_reporter_task():
     while True:
         try:
-            # 1) Saúde do Guardião
             await tg_broadcast(_health_text())
-
-            # 2) Relatório Canal x IA (integrado no mesmo ciclo)
             try:
-                txt = _mk_relatorio_text(days=7)  # janela padrão fixa no código
+                txt = _mk_relatorio_text(days=7)  # Canal x IA (7d)
                 await tg_broadcast(txt)
             except Exception as e:
                 print(f"[RELATORIO] erro ao gerar/enviar: {e}")
-
         except Exception as e:
             print(f"[HEALTH] erro ao enviar relatório: {e}")
-
         await asyncio.sleep(30 * 60)  # 30 minutos
 
 async def _daily_reset_task():
@@ -729,6 +772,176 @@ async def _daily_reset_task():
         except Exception as e:
             print(f"[RESET] erro: {e}")
             await asyncio.sleep(60)
+
+# =========================
+# IA2 — FIRE-only (sem SOFT/INFO) + fila única (adaptativa)
+# =========================
+# Limiar base (usados nas fases; IA2_GAP_SAFETY é fixo)
+IA2_TIER_STRICT             = 0.62  # default (será sobrescrito por fase)
+IA2_GAP_SAFETY              = 0.08  # gap top1-top2 que permite flex
+IA2_DELTA_GAP               = 0.03  # default (será sobrescrito por fase)
+IA2_MAX_PER_HOUR            = 10    # default (será sobrescrito por fase)
+IA2_COOLDOWN_AFTER_LOSS     = 20    # default (será sobrescrito por fase)
+IA2_MIN_SECONDS_BETWEEN_FIRE= 15    # default (será sobrescrito por fase)
+
+# ===== Fases adaptativas por amostra + desempenho (com amortecimento) =====
+_S_A_MAX = 20_000     # Fase A até 20k amostras
+_S_B_MAX = 100_000    # Fase B até 100k amostras; >= isso considera C (se performar)
+
+_ACC_TO_B = 0.55      # precisa >=55% para subir/ficar em B (7d)
+_ACC_TO_C = 0.58      # precisa >=58% para subir/ficar em C (7d)
+_ACC_FALL_B = 0.52    # se cair <52%, rebaixa de B
+_ACC_FALL_C = 0.55    # se cair <55%, rebaixa de C
+
+_PHASE_DWELL = 60 * 60  # 1h de dwell para evitar troca constante
+
+_phase_name: str = "A"
+_phase_since_ts: int = 0
+
+def _current_samples() -> int:
+    row = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
+    return int((row["s"] or 0) if row else 0)
+
+def _decide_phase(samples:int, acc7:float) -> str:
+    if samples < _S_A_MAX:
+        return "A"
+    if samples < _S_B_MAX:
+        return "B" if acc7 >= _ACC_TO_B else "A"
+    if acc7 >= _ACC_TO_C:
+        return "C"
+    if acc7 >= _ACC_TO_B:
+        return "B"
+    return "A" if acc7 < _ACC_FALL_B else "B"
+
+def _adaptive_phase() -> str:
+    global _phase_name, _phase_since_ts
+    s = _current_samples()
+    _g, _l, acc7 = _ia_acc_days(7)
+    target = _decide_phase(s, acc7)
+
+    now = now_ts()
+    if _phase_since_ts == 0:
+        _phase_name, _phase_since_ts = target, now
+        return _phase_name
+    if target == _phase_name:
+        return _phase_name
+
+    # subir de fase exige dwell
+    if target > _phase_name:
+        if now - _phase_since_ts < _PHASE_DWELL:
+            return _phase_name
+        _phase_name, _phase_since_ts = target, now
+        return _phase_name
+
+    # queda por performance
+    if _phase_name == "C" and acc7 < _ACC_FALL_C:
+        _phase_name, _phase_since_ts = "B", now
+        return _phase_name
+    if _phase_name == "B" and acc7 < _ACC_FALL_B:
+        _phase_name, _phase_since_ts = "A", now
+        return _phase_name
+
+    # demais casos: respeita dwell
+    if now - _phase_since_ts < _PHASE_DWELL:
+        return _phase_name
+
+    _phase_name, _phase_since_ts = target, now
+    return _phase_name
+
+def _eff() -> dict:
+    p = _adaptive_phase()
+    if p == "A":
+        return {
+            "PHASE": "A",
+            "MAX_CONCURRENT_PENDINGS": 2,
+            "IA2_MAX_PER_HOUR": 30,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 7,
+            "IA2_COOLDOWN_AFTER_LOSS": 10,
+            "IA2_TIER_STRICT": 0.59,
+            "IA2_DELTA_GAP": 0.04,   # flex: 0.55 se gap ≥ 0.08
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
+            "MIN_CONF_G0": 0.52,
+            "MIN_GAP_G0": 0.035,
+        }
+    elif p == "B":
+        return {
+            "PHASE": "B",
+            "MAX_CONCURRENT_PENDINGS": 2,
+            "IA2_MAX_PER_HOUR": 20,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 10,
+            "IA2_COOLDOWN_AFTER_LOSS": 12,
+            "IA2_TIER_STRICT": 0.60,
+            "IA2_DELTA_GAP": 0.04,
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
+            "MIN_CONF_G0": 0.53,
+            "MIN_GAP_G0": 0.035,
+        }
+    else:
+        return {
+            "PHASE": "C",
+            "MAX_CONCURRENT_PENDINGS": 1,
+            "IA2_MAX_PER_HOUR": 12,
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": 12,
+            "IA2_COOLDOWN_AFTER_LOSS": 15,
+            "IA2_TIER_STRICT": 0.62,
+            "IA2_DELTA_GAP": 0.03,
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
+            "MIN_CONF_G0": 0.55,
+            "MIN_GAP_G0": 0.040,
+        }
+
+# Estado volátil
+_ia2_blocked_until_ts: int = 0
+_ia2_sent_this_hour: int = 0
+_ia2_hour_bucket: Optional[int] = None
+_ia2_last_fire_ts: int = 0
+
+def _ia2_hour_key() -> int:
+    return int(datetime.now(timezone.utc).strftime("%Y%m%d%H"))
+
+def _ia2_reset_hour():
+    global _ia2_sent_this_hour, _ia2_hour_bucket
+    hb = _ia2_hour_key()
+    if _ia2_hour_bucket != hb:
+        _ia2_hour_bucket = hb
+        _ia2_sent_this_hour = 0
+
+def _ia2_antispam_ok() -> bool:
+    eff = _eff()
+    _ia2_reset_hour()
+    return _ia2_sent_this_hour < eff["IA2_MAX_PER_HOUR"]
+
+def _ia2_mark_sent():
+    global _ia2_sent_this_hour
+    _ia2_sent_this_hour += 1
+
+def _ia2_blocked_now() -> bool:
+    return now_ts() < _ia2_blocked_until_ts
+
+def _ia_set_post_loss_block():
+    global _ia2_blocked_until_ts
+    eff = _eff()
+    _ia2_blocked_until_ts = now_ts() + int(eff["IA2_COOLDOWN_AFTER_LOSS"])
+
+def _has_open_pending() -> bool:
+    eff = _eff()
+    open_cnt = int(_get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1"))
+    return open_cnt >= eff["MAX_CONCURRENT_PENDINGS"]
+
+def _ia2_can_fire_now() -> bool:
+    eff = _eff()
+    if _ia2_blocked_now():
+        return False
+    if not _ia2_antispam_ok():
+        return False
+    if now_ts() - _ia2_last_fire_ts < eff["IA2_MIN_SECONDS_BETWEEN_FIRE"]:
+        return False
+    return True
+
+def _ia2_mark_fire_sent():
+    global _ia2_last_fire_ts
+    _ia2_mark_sent()
+    _ia2_last_fire_ts = now_ts()
 
 # =========================
 # Pendências (FastResult: G0 imediato + recuperação oculta)
@@ -765,166 +978,101 @@ def _convert_last_loss_to_green():
         """, (y, g0, row["g1"] or 0, row["g2"] or 0, loss, streak))
 
 # =========================
-# IA2 — FIRE-only (sem SOFT/INFO) + fila única
+# Fechamento de pendências (GREEN/RED observado)
 # =========================
-# Limiar e segurança
-IA2_TIER_STRICT             = 0.62  # % mínima para FIRE
-IA2_GAP_SAFETY              = 0.08  # gap top1-top2 que permite FIRE com pequena tolerância
-IA2_DELTA_GAP               = 0.03  # tolerância se gap for grande (ex.: 0.59 com gap>=0.08)
-IA2_MAX_PER_HOUR            = 10    # limite de FIRE por hora
-IA2_COOLDOWN_AFTER_LOSS     = 20    # segundos bloqueado após 1 loss
-IA2_MIN_SECONDS_BETWEEN_FIRE= 15    # espaçamento mínimo entre FIREs (anti-burst)
-
-# Estado volátil
-_ia2_blocked_until_ts: int = 0
-_ia2_sent_this_hour: int = 0
-_ia2_hour_bucket: Optional[int] = None
-_ia2_last_fire_ts: int = 0
-
-def _ia2_hour_key() -> int:
-    return int(datetime.now(timezone.utc).strftime("%Y%m%d%H"))
-
-def _ia2_reset_hour():
-    global _ia2_sent_this_hour, _ia2_hour_bucket
-    hb = _ia2_hour_key()
-    if _ia2_hour_bucket != hb:
-        _ia2_hour_bucket = hb
-        _ia2_sent_this_hour = 0
-
-def _ia2_antispam_ok() -> bool:
-    _ia2_reset_hour()
-    return _ia2_sent_this_hour < IA2_MAX_PER_HOUR
-
-def _ia2_mark_sent():
-    global _ia2_sent_this_hour
-    _ia2_sent_this_hour += 1
-
-def _ia2_blocked_now() -> bool:
-    return now_ts() < _ia2_blocked_until_ts
-
-def _ia_set_post_loss_block():
-    global _ia2_blocked_until_ts
-    _ia2_blocked_until_ts = now_ts() + int(IA2_COOLDOWN_AFTER_LOSS)
-
-def _has_open_pending() -> bool:
-    return bool(_get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1"))
-
-def _ia2_can_fire_now() -> bool:
-    """Checa bloqueios e espaçamento mínimo entre FIREs."""
-    if _ia2_blocked_now():
-        return False
-    if not _ia2_antispam_ok():
-        return False
-    if now_ts() - _ia2_last_fire_ts < IA2_MIN_SECONDS_BETWEEN_FIRE:
-        return False
-    return True
-
-def _ia2_mark_fire_sent():
-    """Marca contadores/tempo do último FIRE enviado."""
-    global _ia2_last_fire_ts
-    _ia2_mark_sent()
-    _ia2_last_fire_ts = now_ts()
-
-async def close_pending_with_result(n_real: int, event_kind: str):
-    rows = query_all("""
-        SELECT id,strategy,suggested,stage,open,window_left,seen_numbers,announced,source
-        FROM pending_outcome
-        WHERE open=1
-        ORDER BY id
-    """)
-    for r in rows:
-        pid   = int(r["id"])
-        strat = (r["strategy"] or "")
-        sug   = int(r["suggested"])
-        stage = int(r["stage"])
-        left  = int(r["window_left"])
-        announced = int(r["announced"])
-        source = (r["source"] or "CHAN").upper()
-
-        seen_txt = (r["seen_numbers"] or "")
-        seen_txt2 = (seen_txt + ("|" if seen_txt else "") + str(n_real))
-        exec_write("UPDATE pending_outcome SET seen_numbers=? WHERE id=?", (seen_txt2, pid))
-
-        hit = (n_real == sug)
-
-        if announced == 0:
-            # Primeira janela (G0) — público
-            if hit:
-                bump_pattern("PEND", sug, True)
-                if strat: bump_strategy(strat, sug, True)
-                update_daily_score(0, True)
-                if source == "IA":
-                    update_daily_score_ia(0, True)
-                await send_green_imediato(sug, "G0")
-                exec_write("UPDATE pending_outcome SET announced=1, open=0 WHERE id=?", (pid,))
-                await send_scoreboard()
-                if source == "IA":
-                    await send_scoreboard_ia()
-            else:
-                bump_pattern("PEND", sug, False)
-                if strat: bump_strategy(strat, sug, False)
-                update_daily_score(None, False)
-                if source == "IA":
-                    update_daily_score_ia(None, False)
-                await send_loss_imediato(sug, "G0")
-
-                # IA fica bloqueada por um período pós-loss
-                if source == "IA":
-                    _ia_set_post_loss_block()
-
-                exec_write("UPDATE pending_outcome SET announced=1 WHERE id=?", (pid,))
-                await send_scoreboard()
-                if source == "IA":
-                    await send_scoreboard_ia()
-
-                left -= 1
-                if left <= 0 or MAX_STAGE <= 1:
-                    exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-                else:
-                    next_stage = min(stage+1, MAX_STAGE-1)
-                    exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
-        else:
-            # Recuperação (G1/G2) — silenciosa (sem broadcast)
-            left -= 1
-            if hit:
-                # Converte último LOSS -> GREEN silenciosamente (placares)
-                try:
-                    _convert_last_loss_to_green()
-                    if source == "IA":
-                        _convert_last_loss_to_green_ia()
-                    await send_scoreboard()
-                    if source == "IA":
-                        await send_scoreboard_ia()
-                except Exception as _e:
-                    print(f"[SCORE] convert loss->green erro: {_e}")
-
-                if stage == 1:
-                    try:
-                        bump_recov_g1(sug, True)
-                    except Exception as _e:
-                        print(f"[RECOV_G1] erro mark win: {_e}")
-
-                bump_pattern("RECOV", sug, True)
-                if strat: bump_strategy(strat, sug, True)
-                exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-            else:
-                if left <= 0:
-                    if stage >= 1:
-                        try:
-                            bump_recov_g1(sug, False)
-                        except Exception as _e:
-                            print(f"[RECOV_G1] erro mark loss: {_e}")
-                    exec_write("UPDATE pending_outcome SET open=0 WHERE id=?", (pid,))
-                else:
-                    next_stage = min(stage+1, MAX_STAGE-1)
-                    exec_write("UPDATE pending_outcome SET window_left=?, stage=? WHERE id=?", (left, next_stage, pid))
-
+async def close_pending_with_result(n_observed: int, event_kind: str):
     try:
-        still_open = query_one("SELECT 1 FROM pending_outcome WHERE open=1")
-        if not still_open:
-            INTEL.stop_signal()
+        rows = query_all("""
+            SELECT id, created_at, strategy, suggested, stage, open, window_left,
+                   seen_numbers, announced, source
+            FROM pending_outcome
+            WHERE open=1
+            ORDER BY id ASC
+        """)
+        if not rows:
+            return {"ok": True, "no_open": True}
+
+        for r in rows:
+            pid        = r["id"]
+            suggested  = int(r["suggested"])
+            stage      = int(r["stage"])
+            left       = int(r["window_left"])
+            src        = (r["source"] or "CHAN").upper()
+            seen       = (r["seen_numbers"] or "").strip()
+            seen_new   = (seen + ("," if seen else "") + str(int(n_observed)))
+
+            if int(n_observed) == suggested:
+                # GREEN
+                exec_write("UPDATE pending_outcome SET open=0, window_left=0, seen_numbers=? WHERE id=?",
+                           (seen_new, pid))
+
+                if stage == 0:
+                    # GREEN direto no G0
+                    update_daily_score(0, True)
+                    if src == "IA":
+                        update_daily_score_ia(0, True)
+                    await send_green_imediato(suggested, "G0")
+                else:
+                    # Recuperação: converte o último LOSS em GREEN (placar G0-only permanece)
+                    _convert_last_loss_to_green()
+                    if src == "IA":
+                        _convert_last_loss_to_green_ia()
+                    bump_recov_g1(suggested, True)
+                    # envia mensagem indicando o estágio real em que bateu
+                    await send_green_imediato(suggested, f"G{stage}")
+
+                try:
+                    INTEL.stop_signal()
+                except Exception:
+                    pass
+
+            else:
+                # Não bateu
+                if left > 1:
+                    # avança estágio (G1->G2) mantendo pendência aberta
+                    exec_write("""
+                        UPDATE pending_outcome
+                           SET stage = stage + 1, window_left = window_left - 1, seen_numbers=?
+                         WHERE id=?
+                    """, (seen_new, pid))
+                    if stage == 0:
+                        # PRIMEIRO erro (G0): conta LOSS e anuncia
+                        update_daily_score(0, False)
+                        if src == "IA":
+                            update_daily_score_ia(0, False)
+                        await send_loss_imediato(suggested, "G0")
+                        _ia_set_post_loss_block()
+                        bump_recov_g1(suggested, False)
+                else:
+                    # pendência esgotada (já contabilizado loss no G0)
+                    exec_write("UPDATE pending_outcome SET open=0, window_left=0, seen_numbers=? WHERE id=?",
+                               (seen_new, pid))
+        return {"ok": True}
     except Exception as e:
-        print(f"[INTEL] stop_signal check error: {e}")
+        return {"ok": False, "error": str(e)}
+
+# =========================
+# Heurística extra: top-2 da cauda (40) — leve boost
+# =========================
+def tail_top2_boost(tail: List[int], k:int=40) -> Dict[int, float]:
+    """
+    Retorna multiplicadores discretos para {1,2,3,4} a partir dos 40 últimos números.
+    Top1 recebe x1.04; Top2 recebe x1.02; demais x1.00.
+    Esse efeito é *leve* e não sobrepõe as demais fontes (ngrams/padrões/estratégia).
+    """
+    boosts = {1:1.00, 2:1.00, 3:1.00, 4:1.00}
+    if not tail:
+        return boosts
+    tail_k = tail[-k:] if len(tail) >= k else tail[:]
+    c = Counter(tail_k)
+    if not c:
+        return boosts
+    freq = c.most_common()
+    if len(freq) >= 1:
+        boosts[freq[0][0]] = 1.04
+    if len(freq) >= 2:
+        boosts[freq[1][0]] = 1.02
+    return boosts
 
 # =========================
 # Predição (número seco)
@@ -982,6 +1130,9 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
         if (len(tail)-1 - last_idx) > 60:
             return None, 0.0, len(tail), {k: 1/len(base) for k in base}
 
+    # Boost leve do top-2 da cauda(40)
+    boost_tail = tail_top2_boost(tail, k=40)
+
     for c in base:
         ng = ngram_backoff_score(tail, after_num, c)
 
@@ -997,13 +1148,14 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
             sl = rows["losses"] if rows else 0
             p_str = laplace_ratio(sw, sl)
 
-        # leve boost por horário
-        boost = 1.0
-        if p_pat >= 0.60: boost = 1.05
-        elif p_pat <= 0.40: boost = 0.97
+        # leve bias por horário do padrão
+        boost_pat = 1.05 if p_pat >= 0.60 else (0.97 if p_pat <= 0.40 else 1.00)
+
+        # multiplicador do top-2 da cauda
+        boost_hist = boost_tail.get(c, 1.00)
 
         prior = 1.0/len(base)
-        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost
+        score = (prior) * ((ng or 1e-6) ** ALPHA) * (p_pat ** BETA) * (p_str ** GAMMA) * boost_pat * boost_hist
         scores[c] = score
 
     total = sum(scores.values()) or 1e-9
@@ -1018,18 +1170,30 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
     # Anti-repique: se último anunciado fechou LOSS com mesmo número, exija mais confiança
     last = query_one("SELECT suggested, announced FROM pending_outcome ORDER BY id DESC LIMIT 1")
     if last and number is not None and last["suggested"] == number and (last["announced"] or 0) == 1:
-        if post.get(number, 0.0) < (MIN_CONF_G0 + 0.08):
+        effx = _eff()
+        if post.get(number, 0.0) < (effx["MIN_CONF_G0"] + 0.08):
             return None, 0.0, samples, post
 
-    # Filtro de qualidade (modo equilibrado)
+    # Paraquedas: evita empate técnico top1~top2 (rachas perigosas)
+    top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
+    if len(top) == 2:
+        t1, t2 = top[0][1], top[1][1]
+        if (t1 - t2) < 0.015:
+            return None, 0.0, samples, post
+
+    # Filtro de qualidade (dinâmico por fase)
+    eff = _eff()
+    MIN_CONF_EFF = eff["MIN_CONF_G0"]
+    MIN_GAP_EFF  = eff["MIN_GAP_G0"]
+
     top2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
     gap = (top2[0][1] - (top2[1][1] if len(top2) > 1 else 0.0)) if top2 else 0.0
     enough_samples = samples >= MIN_SAMPLES
     should_abstain = (
         enough_samples and (
             (number is None) or
-            (post.get(number, 0.0) < MIN_CONF_G0) or
-            (gap < MIN_GAP_G0)
+            (post.get(number, 0.0) < MIN_CONF_EFF) or
+            (gap < MIN_GAP_EFF)
         )
     )
     if should_abstain:
@@ -1049,53 +1213,51 @@ def build_suggestion_msg(number:int, base:List[int], pattern_key:str,
     )
 
 # =========================
-# IA2 — processo (FIRE-only + fila única)
+# IA2 — processo (FIRE-only + fila única adaptativa)
 # =========================
 def _relevance_ok(conf_raw: float, gap: float, tail_len: int) -> bool:
-    # Regra solicitada: FIRE se conf ≥ 62% OU (conf ≥ 59% e gap ≥ 0.08), e com base suficiente
-    return (conf_raw >= IA2_TIER_STRICT or (conf_raw >= IA2_TIER_STRICT - IA2_DELTA_GAP and gap >= IA2_GAP_SAFETY)) \
+    eff = _eff()
+    strict = eff["IA2_TIER_STRICT"]
+    delta  = eff["IA2_DELTA_GAP"]
+    gap_s  = eff["IA2_GAP_SAFETY"]
+    return (conf_raw >= strict or (conf_raw >= strict - delta and gap >= gap_s)) \
            and (tail_len >= MIN_SAMPLES)
 
 async def ia2_process_once():
-    # Base GEN (sem restrição)
     base, pattern_key, strategy, after_num = [], "GEN", None, None
     tail = get_recent_tail(WINDOW)
     best, conf_raw, tail_len, post = suggest_number(base, pattern_key, strategy, after_num)
 
     if best is None:
-        # Não chegou a um número confiável
         if tail_len < MIN_SAMPLES:
             _mark_reason(f"amostra_insuficiente({tail_len}<{MIN_SAMPLES})")
         else:
             _mark_reason("sem_numero_confiavel(conf/gap)")
         return
 
-    # gap top1-top2
     gap = 1.0
     if post and len(post) >= 2:
         top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
         if len(top) >= 2:
             gap = top[0][1] - top[1][1]
 
-    # Fila única: se tiver pendência aberta (G0→G2), não dispara
     if _has_open_pending():
         _mark_reason("pendencia_aberta(aguardando G1/G2)")
         return
 
-    # Bloqueios de antispam/cooldown
     if _ia2_blocked_now():
         _mark_reason("cooldown_pos_loss")
         return
     if not _ia2_antispam_ok():
         _mark_reason("limite_hora_atingido")
         return
-    if now_ts() - _ia2_last_fire_ts < IA2_MIN_SECONDS_BETWEEN_FIRE:
+    eff = _eff()
+    if now_ts() - _ia2_last_fire_ts < eff["IA2_MIN_SECONDS_BETWEEN_FIRE"]:
         _mark_reason("espacamento_minimo")
         return
 
-    # Regra de relevância (confiança/gap + base suficiente)
     if _relevance_ok(conf_raw, gap, tail_len) and _ia2_can_fire_now():
-        open_pending(strategy, best, source="IA")     # abre pendência como G0
+        open_pending(strategy, best, source="IA")
         await ia2_send_signal(best, conf_raw, tail_len, "FIRE")
         _ia2_mark_fire_sent()
         _mark_reason(f"FIRE(best={best}, conf={conf_raw:.3f}, gap={gap:.3f}, tail={tail_len})")
@@ -1156,18 +1318,15 @@ def _fmt_pct(num:int, den:int) -> float:
 def _mk_relatorio_text(days:int=7) -> str:
     days = max(1, min(int(days), 30))
 
-    # Hoje (canal)
     y = today_key_local()
     r = query_one("SELECT g0,loss,streak FROM daily_score WHERE yyyymmdd=?", (y,))
     g0 = (r["g0"] if r else 0); loss = (r["loss"] if r else 0)
     acc_today = _fmt_pct(g0, g0+loss)
 
-    # Hoje (IA)
     ria = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
     ia_g0 = (ria["g0"] if ria else 0); ia_loss = (ria["loss"] if ria else 0)
     ia_acc_today = _fmt_pct(ia_g0, ia_g0+ia_loss)
 
-    # Janela N dias
     chan_rows = _read_daily_score_days(days)
     ia_rows   = _read_daily_score_ia_days(days)
 
@@ -1177,7 +1336,7 @@ def _mk_relatorio_text(days:int=7) -> str:
 
     sum_ia_g0 = sum((rr["g0"] or 0) for rr in ia_rows)
     sum_ia_loss = sum((rr["loss"] or 0) for rr in ia_rows)
-    ia_acc_ndays = _fmt_pct(sum_ia_g0, sum_ia_g0+sum_ia_loss)
+    ia_acc_ndays = _fmt_pct(sum_ia_g0, sum_ia_loss + sum_ia_g0)
 
     return (
         "📈 <b>Relatório de Desempenho</b>\n"
@@ -1218,7 +1377,6 @@ async def _boot_tasks():
         asyncio.create_task(_daily_reset_task())
     except Exception as e:
         print(f"[RESET] startup error: {e}")
-    # loop simples: roda IA2 a cada INTEL_ANALYZE_INTERVAL
     async def _ia2_loop():
         while True:
             try:
@@ -1264,7 +1422,6 @@ async def webhook(token: str, request: Request):
             bump_pattern(pat_key, suggested, won)
             if strat: bump_strategy(strat, suggested, won)
 
-        # roda IA após evento (pode abrir nova janela apenas se não houver pendência)
         await ia2_process_once()
         return {"ok": True, "observed": n_observed, "kind": event_kind}
 
@@ -1274,7 +1431,7 @@ async def webhook(token: str, request: Request):
         if seq_raw:
             parts = re.findall(r"[1-4]", seq_raw)
             seq_left_recent = [int(x) for x in parts]
-            seq_old_to_new  = seq_left_recent[::-1]
+            seq_old_to_new  = seq_left_recent[::-1]   # direita->esquerda (mais novo à direita)
             for n in seq_old_to_new:
                 append_timeline(n)
             update_ngrams()
@@ -1285,6 +1442,12 @@ async def webhook(token: str, request: Request):
     if not is_real_entry(t):
         await ia2_process_once()
         return {"ok": True, "skipped": True}
+
+    # Fila travada: se houver pendência aberta, ignora novas entradas
+    open_cnt = int(_get_scalar("SELECT COUNT(*) FROM pending_outcome WHERE open=1"))
+    if open_cnt > 0:
+        await ia2_process_once()
+        return {"ok": True, "ignored": "pendencia_em_andamento"}
 
     source_msg_id = msg.get("message_id")
     if query_one("SELECT 1 FROM suggestions WHERE source_msg_id=?", (source_msg_id,)):
@@ -1318,21 +1481,18 @@ async def webhook(token: str, request: Request):
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_broadcast(out)
 
-    # roda IA após abrir janela do canal (não dispara nada pois há pendência)
     await ia2_process_once()
     return {"ok": True, "sent": True, "number": number, "conf": conf, "samples": samples}
 
 # =========================
 # ENDPOINTS DE DEBUG
 # =========================
-# Ver amostras atuais x mínimo (sem proteger por chave)
 @app.get("/debug/samples")
 async def debug_samples():
     row = query_one("SELECT SUM(weight) AS s FROM ngram_stats")
     samples = int((row["s"] or 0) if row else 0)
     return {"samples": samples, "MIN_SAMPLES": MIN_SAMPLES, "enough_samples": samples >= MIN_SAMPLES}
 
-# Motivo do último NÃO-FIRE/FIRE
 @app.get("/debug/reason")
 async def debug_reason():
     try:
@@ -1341,7 +1501,6 @@ async def debug_reason():
     except Exception as e:
         return {"error": str(e)}
 
-# Estado agregado
 @app.get("/debug/state")
 async def debug_state():
     try:
@@ -1366,16 +1525,22 @@ async def debug_state():
         cooldown_remaining = max(0, (_ia2_blocked_until_ts or 0) - now_ts())
         last_fire_age = max(0, now_ts() - (_ia2_last_fire_ts or 0))
 
+        eff = _eff()
+
         cfg = {
+            "PHASE": eff["PHASE"],
             "MIN_SAMPLES": MIN_SAMPLES,
-            "IA2_TIER_STRICT": IA2_TIER_STRICT,
-            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
-            "IA2_DELTA_GAP": IA2_DELTA_GAP,
-            "IA2_MAX_PER_HOUR": IA2_MAX_PER_HOUR,
-            "IA2_MIN_SECONDS_BETWEEN_FIRE": IA2_MIN_SECONDS_BETWEEN_FIRE,
-            "IA2_COOLDOWN_AFTER_LOSS": IA2_COOLDOWN_AFTER_LOSS,
+            "IA2_TIER_STRICT": eff["IA2_TIER_STRICT"],
+            "IA2_DELTA_GAP": eff["IA2_DELTA_GAP"],
+            "IA2_GAP_SAFETY": eff["IA2_GAP_SAFETY"],
+            "IA2_MAX_PER_HOUR": eff["IA2_MAX_PER_HOUR"],
+            "IA2_MIN_SECONDS_BETWEEN_FIRE": eff["IA2_MIN_SECONDS_BETWEEN_FIRE"],
+            "IA2_COOLDOWN_AFTER_LOSS": eff["IA2_COOLDOWN_AFTER_LOSS"],
+            "MAX_CONCURRENT_PENDINGS": eff["MAX_CONCURRENT_PENDINGS"],
             "INTEL_ANALYZE_INTERVAL": INTEL_ANALYZE_INTERVAL,
         }
+
+        _g7, _l7, acc7 = _ia_acc_days(7)
 
         return {
             "samples": samples,
@@ -1389,6 +1554,7 @@ async def debug_state():
             "ultimo_fire_ha_seconds": int(last_fire_age),
             "placar_canal_hoje": {"g0": int(g0), "loss": int(loss), "acc_pct": round(acc*100, 2)},
             "placar_ia_hoje": {"g0": int(ia_g0), "loss": int(ia_loss), "acc_pct": round(ia_acc*100, 2)},
+            "ia_acc_7d": {"greens": _g7, "losses": _l7, "acc_pct": round(acc7*100, 2)},
             "config": cfg,
         }
     except Exception as e:
@@ -1402,11 +1568,9 @@ _last_flush_ts: int = 0
 async def debug_flush(request: Request, days: int = 7, key: str = ""):
     global _last_flush_ts
     try:
-        # Checagem de chave
         if not key or key != FLUSH_KEY:
             return {"ok": False, "error": "unauthorized"}
 
-        # Antispam: 60s
         now = now_ts()
         if now - (_last_flush_ts or 0) < 60:
             return {
@@ -1415,13 +1579,11 @@ async def debug_flush(request: Request, days: int = 7, key: str = ""):
                 "retry_after_seconds": 60 - (now - (_last_flush_ts or 0))
             }
 
-        # 1) Saúde do Guardião
         try:
             await tg_broadcast(_health_text())
         except Exception as e:
             print(f"[FLUSH] erro ao enviar saúde: {e}")
 
-        # 2) Relatório Canal x IA
         try:
             txt = _mk_relatorio_text(days=max(1, min(days, 30)))
             await tg_broadcast(txt)
