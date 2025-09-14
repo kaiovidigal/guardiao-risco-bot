@@ -1,21 +1,18 @@
 # -*- coding: utf-8 -*-
-# Guardião — Tiro Seco (versão enxuta)
-# Mantém apenas o fluxo do sinal "tiro seco" + fechamento (GREEN/LOSS) com conferência.
-# Regras:
-# - Sugere 1 número (G0) por entrada válida.
-# - Mantém a pendência aberta até ler até 3 números de fechamento (GREEN/RED).
-#   • se bater antes, fecha GREEN
-#   • a cada não-bate, avança estágio (G1, G2). No 3º número, encerra a pendência.
-# - Ao lado da mensagem de GREEN/LOSS, mostra o número conferido (exigência).
+# Guardião — Tiro Seco (versão enxuta v3 - fechamento rígido)
+# Mudanças vs v2:
+# - Só fecha GREEN/LOSS quando houver números de conferência (1..4) ligados à mensagem.
+# - Removido fallback que lia números soltos. Se não vier número → não fecha.
 #
 # Rotas:
 #   POST /webhook/<WEBHOOK_TOKEN>
 #   GET  /
+#   GET  /debug/pending
 #
 # ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 # ENV opcionais: DB_PATH (default: /data/data.db), REPL_CHANNEL (-100... ou @canal)
 
-import os, re, json, time, sqlite3, asyncio
+import os, re, time, sqlite3
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
@@ -29,7 +26,7 @@ from pydantic import BaseModel
 DB_PATH       = os.getenv("DB_PATH", "/data/data.db").strip() or "/data/data.db"
 TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
-REPL_CHANNEL  = os.getenv("REPL_CHANNEL", "").strip() or "-1003052132833"  # pode ajustar
+REPL_CHANNEL  = os.getenv("REPL_CHANNEL", "").strip() or "-1003052132833"  # ajuste se necessário
 
 if not TG_BOT_TOKEN or not WEBHOOK_TOKEN:
     print("⚠️ Defina TG_BOT_TOKEN e WEBHOOK_TOKEN.")
@@ -37,11 +34,11 @@ if not TG_BOT_TOKEN or not WEBHOOK_TOKEN:
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 MAX_STAGE = 3   # G0, G1, G2
-WINDOW    = 400 # cauda p/ ngram simples
-MIN_SAMPLES = 200  # libera sugestão quando já tem algum lastro
-MIN_CONF   = 0.50  # confiança mínima ingênua (top1)
+WINDOW    = 400
+MIN_SAMPLES = 120   # relaxado para não travar em cenários com pouco histórico
+MIN_CONF   = 0.48   # relaxado
 
-app = FastAPI(title="Guardião — Tiro Seco (lite)", version="1.0.0")
+app = FastAPI(title="Guardião — Tiro Seco (lite v3)", version="1.2.0")
 
 # =========================
 # SQLite helpers
@@ -194,35 +191,37 @@ def extract_seq_raw(text: str) -> Optional[str]:
     m = re.search(r"Sequ[eê]ncia:\s*([^\n\r]+)", text, flags=re.I)
     return m.group(1).strip() if m else None
 
-# GREEN/RED patterns + extrair até 3 números
+# Termos flexíveis para GREEN/LOSS/RED (aceita variações) — exigiremos número junto
+GREEN_WORD = r"GR+E+E?N"   # GREEN, GREEM, GREN
+LOSS_WORD  = r"LO+S+S?"    # LOSS, LOS
+RED_WORD   = r"RED"
+
+# Padrões (aceitam com/sem parênteses), mas SEM fallback
 GREEN_PATTERNS = [
-    re.compile(r"APOSTA\s+ENCERRADA.*?\bGREEN\b.*?\(([^)]*)\)", re.I | re.S),
-    re.compile(r"\bGREEN\b.*?Número[:\s]*([1-4](?:\D+[1-4]){0,2})", re.I | re.S),
+    re.compile(rf"APOSTA\s+ENCERRADA.*?\b{GREEN_WORD}\b.*?\(([^)]*)\)", re.I | re.S),
+    re.compile(rf"\b{GREEN_WORD}\b[^0-9]*([1-4](?:\D+[1-4]){{0,2}})", re.I | re.S),  # GREEN 2 | GREEN 2 3
 ]
 RED_PATTERNS = [
-    re.compile(r"APOSTA\s+ENCERRADA.*?\bRED\b.*?\(([^)]*)\)", re.I | re.S),
-    re.compile(r"\b(RED|LOSS)\b.*?([1-4](?:\D+[1-4]){0,2})", re.I | re.S),
+    re.compile(rf"APOSTA\s+ENCERRADA.*?\b({LOSS_WORD}|{RED_WORD})\b.*?\(([^)]*)\)", re.I | re.S),
+    re.compile(rf"\b({LOSS_WORD}|{RED_WORD})\b[^0-9]*([1-4](?:\D+[1-4]){{0,2}})", re.I | re.S),  # LOS 1 3 4
 ]
 
 def extract_outcome_numbers(text:str) -> List[int]:
+    """Retorna até 3 números (1..4) SOMENTE se estiverem atrelados à mensagem GREEN/LOS/RED."""
     t = re.sub(r"\s+", " ", text)
-    buf = []
     for rx in GREEN_PATTERNS + RED_PATTERNS:
         m = rx.search(t)
-        if m:
-            for g in m.groups():
-                if not g: continue
-                buf.extend(re.findall(r"[1-4]", g))
-            break
-    if not buf:
-        buf = re.findall(r"[1-4]", t)
-    nums = [int(x) for x in buf if x in {"1","2","3","4"}]
-    # limitar a 3
-    out = []
-    for n in nums:
-        out.append(n)
-        if len(out) == 3: break
-    return out
+        if not m:
+            continue
+        buf = []
+        for g in m.groups():
+            if not g:
+                continue
+            buf.extend(re.findall(r"[1-4]", g))
+        nums = [int(x) for x in buf if x in {"1","2","3","4"}]
+        if nums:
+            return nums[:3]
+    return []  # sem números de conferência → não fecha
 
 # =========================
 # Sugerir número (tiro seco minimalista)
@@ -232,7 +231,6 @@ def suggest_number() -> Tuple[Optional[int], float, int]:
     samples = len(tail)
     if samples < MIN_SAMPLES:
         return None, 0.0, samples
-    # usa contexto curto (2 e 1)
     scores: Dict[int,float] = {1:1e-6,2:1e-6,3:1e-6,4:1e-6}
     if len(tail) >= 2:
         p2_ctx = tail[-2:]
@@ -267,7 +265,6 @@ async def apply_closures_with_numbers(numbers: List[int]):
                         FROM pending_outcome WHERE open=1 ORDER BY id ASC""")
     if not rows:
         return
-    # Aplica números contra a PRIMEIRA pendência aberta apenas (fila única)
     r = rows[0]
     pid, suggested, stage, left = r["id"], int(r["suggested"]), int(r["stage"]), int(r["window_left"])
     stage_names = {0:"G0",1:"G1",2:"G2"}
@@ -285,13 +282,11 @@ async def apply_closures_with_numbers(numbers: List[int]):
             # se foi o primeiro erro (G0), registra LOSS visual
             if stage == 0:
                 await send_loss(suggested, "G0", obs)
-            # prepara para próxima iteração
             stage += 1
             left = left_now
         else:
             # esgotou (terceiro número) -> fecha
             exec_write("UPDATE pending_outcome SET open=0, window_left=0 WHERE id=?", (pid,))
-            # já sinalizamos LOSS no primeiro erro; aqui apenas encerra sem nova msg
             return
 
 # =========================
@@ -306,7 +301,23 @@ class Update(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"ok": True, "detail": "Guardião — Tiro Seco (lite)"}
+    return {"ok": True, "detail": "Guardião — Tiro Seco (lite v3) - fechamento rígido"}
+
+@app.get("/debug/pending")
+async def debug_pending():
+    rows = query_all("""SELECT id, created_at, suggested, stage, open, window_left
+                        FROM pending_outcome ORDER BY id DESC LIMIT 5""")
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"],
+            "created_at": r["created_at"],
+            "suggested": r["suggested"],
+            "stage": r["stage"],
+            "open": r["open"],
+            "window_left": r["window_left"],
+        })
+    return {"last5": out}
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
@@ -321,9 +332,12 @@ async def webhook(token: str, request: Request):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     t = re.sub(r"\s+", " ", text)
 
-    # 1) Fechamentos (GREEN/RED): ler até 3 números e aplicar
-    if re.search(r"\b(GREEN|RED|LOSS)\b", t, flags=re.I) or re.search(r"\bAPOSTA\s+ENCERRADA\b", t, flags=re.I):
+    # 1) Fechamentos (GREEN/RED/LOSS/LOS): ler até 3 números e aplicar — SOMENTE se houver números
+    if re.search(rf"\b({GREEN_WORD}|{LOSS_WORD}|{RED_WORD}|APOSTA\s+ENCERRADA)\b", t, flags=re.I):
         nums = extract_outcome_numbers(t)
+        if not nums:
+            # Sem número de conferência → não fecha, não libera
+            return {"ok": True, "ignored_no_numbers": True}
         # Registrar timeline (todos os números lidos)
         for n in nums:
             append_timeline(n)
@@ -333,18 +347,20 @@ async def webhook(token: str, request: Request):
 
     # 2) ANALISANDO -> alimentar timeline (sequências cruas)
     if re.search(r"\bANALISANDO\b", t, flags=re.I):
-        seq_raw = extract_seq_raw(t)
-        if seq_raw:
-            parts = re.findall(r"[1-4]", seq_raw)
-            # em geral as sequências vêm "da esquerda para a direita", então revertemos para cronologia
-            seq_old_to_new = [int(x) for x in parts][::-1]
-            for n in seq_old_to_new:
+        seq = extract_seq_raw(t)
+        if seq:
+            parts = re.findall(r"[1-4]", seq)
+            for n in [int(x) for x in parts][::-1]:
                 append_timeline(n)
             update_ngrams()
         return {"ok": True, "analise": True}
 
     # 3) ENTRADA CONFIRMADA -> gerar tiro seco (G0) e abrir pendência
     if is_real_entry(t):
+        # bloquear novo sinal se já há pendência aberta
+        open_cnt = query_one("SELECT COUNT(*) AS c FROM pending_outcome WHERE open=1")["c"] or 0
+        if open_cnt > 0:
+            return {"ok": True, "skipped_open_pending": True}
         # evitar duplicado por message_id
         source_msg_id = msg.get("message_id")
         if query_one("SELECT 1 FROM suggestions WHERE source_msg_id=?", (source_msg_id,)):
