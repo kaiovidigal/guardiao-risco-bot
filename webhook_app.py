@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+ -*- coding: utf-8 -*-
 # Fan Tan — Guardião (G0 + Recuperação oculta) com:
 # - Inteligência em disco: /var/data/ai_intel (teto 1 GB + rotação)
 # - Batidas do sinal a cada 20s enquanto houver pendência aberta
@@ -572,7 +572,7 @@ async def send_scoreboard_ia():
     acc = (g0/total*100) if total else 0.0
     txt = (f"🤖 <b>Placar IA (dia)</b>\n"
            f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
-           f"✅ Acerto: {acc:.2f}%</b>\n"
+           f"✅ Acerto: {acc:.2f}%\n"
            f"🔥 Streak: {streak} GREEN(s)")
     await tg_broadcast(txt)
 
@@ -1273,7 +1273,7 @@ class _IntelStub:
 
     def start_signal(self, suggested: int, strategy: Optional[str] = None):
         self._signal_active = True
-               self._last_num = suggested
+        self._last_num = suggested
         try:
             path = os.path.join(self.base_dir, "snapshots", "latest_top.json")
             with open(path, "w") as f:
