@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+ -*- coding: utf-8 -*-
 # Fan Tan — Guardião (G0 + Recuperação oculta) com:
 # - Inteligência em disco: /var/data/ai_intel (teto 1 GB + rotação)
 # - Batidas do sinal a cada 20s enquanto houver pendência aberta
@@ -571,7 +571,7 @@ async def send_scoreboard_ia():
     total = g0 + loss
     acc = (g0/total*100) if total else 0.0
     txt = (f"🤖 <b>Placar IA (dia)</b>\n"
-           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
+           f"🟢 G0:{g0}</b>  🔴 Loss:{loss}\n"
            f"✅ Acerto: {acc:.2f}%\n"
            f"🔥 Streak: {streak} GREEN(s)")
     await tg_broadcast(txt)
@@ -1021,7 +1021,7 @@ async def close_pending_with_result(n_observed: int, event_kind: str):
                     update_daily_score(0, True)
                     if src == "IA":
                         update_daily_score_ia(0, True)
-                    await send_green_imediato(suggested, "G0", seq_txt=seq_txt)
+                    await send_green_imediato(sugerido=suggested, stage_txt="G0", seq_txt=seq_txt)
                 else:
                     # Recuperação oculta: converte o último LOSS em GREEN
                     _convert_last_loss_to_green()
@@ -1049,7 +1049,7 @@ async def close_pending_with_result(n_observed: int, event_kind: str):
                         if src == "IA":
                             update_daily_score_ia(0, False)
                         seq_txt = _fmt_seq_conferencia(seen, n_observed, suggested)
-                        await send_loss_imediato(suggested, "G0", obs=n_observed, seq_txt=seq_txt)
+                        await send_loss_imediato(sugerido=suggested, stage_txt="G0", obs=n_observed, seq_txt=seq_txt)
                         _ia_set_post_loss_block()
                         bump_recov_g1(suggested, False)
                 else:
@@ -1522,7 +1522,7 @@ async def debug_state():
             "MIN_SAMPLES": MIN_SAMPLES,
             "IA2_TIER_STRICT": eff["IA2_TIER_STRICT"],
             "IA2_DELTA_GAP": eff["IA2_DELTA_GAP"],
-            "IA2_GAP_SAFETY": eff["IA2_GAP_SAFETY"],
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
             "IA2_MAX_PER_HOUR": eff["IA2_MAX_PER_HOUR"],
             "IA2_MIN_SECONDS_BETWEEN_FIRE": eff["IA2_MIN_SECONDS_BETWEEN_FIRE"],
             "IA2_COOLDOWN_AFTER_LOSS": eff["IA2_COOLDOWN_AFTER_LOSS"],
