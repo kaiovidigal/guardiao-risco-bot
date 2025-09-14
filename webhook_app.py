@@ -565,13 +565,13 @@ def _convert_last_loss_to_green_ia():
 async def send_scoreboard_ia():
     y = today_key_local()
     row = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
-    g0=row["g0"] if row else 0
-    loss=row["loss"] if row else 0
-    streak=row["streak"] if row else 0
+    g0 = row["g0"] if row else 0
+    loss = row["loss"] if row else 0
+    streak = row["streak"] if row else 0
     total = g0 + loss
     acc = (g0/total*100) if total else 0.0
     txt = (f"🤖 <b>Placar IA (dia)</b>\n"
-           f"🟢 G0:{g0}</b>  🔴 Loss:{loss}\n"
+           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
            f"✅ Acerto: {acc:.2f}%\n"
            f"🔥 Streak: {streak} GREEN(s)")
     await tg_broadcast(txt)
