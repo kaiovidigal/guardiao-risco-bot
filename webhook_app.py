@@ -399,6 +399,23 @@ def extract_red_last_left(text: str) -> Optional[int]:
 def is_analise(text:str) -> bool:
     return bool(re.search(r"\bANALISANDO\b", text, flags=re.I))
 
+# >>> PATCH: parser para sequência de até 3 tokens (número 1-4 ou 'X')
+RESULT_SEQ_PATTERNS = [
+    re.compile(r"APOSTA\s+ENCERRADA.*?\b(GREEN|RED)\b.*?\(([^)]{1,60})\)", re.I | re.S),
+    re.compile(r"\b(GREEN|RED|LOSS)\b[^()\n]*\(([^)]{1,60})\)", re.I | re.S),
+]
+def extract_result_tokens(text: str) -> Tuple[Optional[str], List[str]]:
+    t = re.sub(r"\s+", " ", text)
+    for rx in RESULT_SEQ_PATTERNS:
+        m = rx.search(t)
+        if m:
+            kind = (m.group(1) or "").upper()
+            content = m.group(2)
+            tokens = re.findall(r"[1-4]|[xX]", content)
+            tokens = [tok.upper() for tok in tokens][:3]
+            return kind, tokens
+    return None, []
+
 # =========================
 # Estatísticas & placar diário
 # =========================
@@ -546,7 +563,7 @@ async def send_scoreboard_ia():
     txt = (f"🤖 <b>Placar IA (dia)</b>\n"
            f"🟢 G0:{g0}</b>  🔴 Loss:{loss}\n"
            f"✅ Acerto: {acc:.2f}%\n"
-           f"🔥 Streak: {streak} GREEN(s)")
+           f"🔥 Streak: {streak}</b> GREEN(s)")
     await tg_broadcast(txt)
 
 # ===== Métricas de desempenho (IA) =====
@@ -833,7 +850,7 @@ def _eff() -> dict:
     if p == "A":
         return {
             "PHASE": "A",
-            "MAX_CONCURRENT_PENDINGS": 2,
+            "MAX_CONCURRENT_PENDINGS": 1,  # >>> PATCH: travar novo sinal até fechar
             "IA2_MAX_PER_HOUR": 30,
             "IA2_MIN_SECONDS_BETWEEN_FIRE": 7,
             "IA2_COOLDOWN_AFTER_LOSS": 10,
@@ -846,7 +863,7 @@ def _eff() -> dict:
     elif p == "B":
         return {
             "PHASE": "B",
-            "MAX_CONCURRENT_PENDINGS": 2,
+            "MAX_CONCURRENT_PENDINGS": 1,  # >>> PATCH
             "IA2_MAX_PER_HOUR": 20,
             "IA2_MIN_SECONDS_BETWEEN_FIRE": 10,
             "IA2_COOLDOWN_AFTER_LOSS": 12,
@@ -936,6 +953,15 @@ def open_pending(strategy: Optional[str], suggested: int, source: str = "CHAN"):
         INTEL.start_signal(suggested=int(suggested), strategy=strategy)
     except Exception as e:
         print(f"[INTEL] start_signal error: {e}")
+
+# >>> PATCH: marcar anúncio feito (para antirrepique funcionar)
+def _mark_last_open_as_announced():
+    try:
+        row = query_one("SELECT id FROM pending_outcome WHERE open=1 ORDER BY id DESC LIMIT 1")
+        if row:
+            exec_write("UPDATE pending_outcome SET announced=1 WHERE id=?", (int(row["id"]),))
+    except Exception as e:
+        print(f"[ANNOUNCE] erro marcar announced: {e}")
 
 # Conversão (geral) de 1 LOSS -> 1 GREEN ao recuperar (silencioso)
 def _convert_last_loss_to_green():
@@ -1030,15 +1056,32 @@ async def close_pending_with_result(n_observed: int, event_kind: str):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# >>> PATCH: registrar 'X' (terceiro item) e fechar a pendência
+def _append_token_and_maybe_close_x():
+    rows = query_all("""
+        SELECT id, seen_numbers FROM pending_outcome
+        WHERE open=1
+        ORDER BY id ASC
+    """)
+    if not rows:
+        return
+    for r in rows:
+        pid = int(r["id"])
+        seen = (r["seen_numbers"] or "").strip()
+        parts = [p for p in seen.split(",") if p]
+        # anexar X
+        seen_new = seen + ("," if seen else "") + "X"
+        # fecha quando atingir 3 tokens (como solicitado)
+        if len(parts) + 1 >= 3:
+            exec_write("UPDATE pending_outcome SET seen_numbers=?, open=0, window_left=0 WHERE id=?",
+                       (seen_new, pid))
+        else:
+            exec_write("UPDATE pending_outcome SET seen_numbers=? WHERE id=?", (seen_new, pid))
+
 # =========================
 # Heurística extra: top-2 da cauda (40) — leve boost
 # =========================
 def tail_top2_boost(tail: List[int], k:int=40) -> Dict[int, float]:
-    """
-    Retorna multiplicadores discretos para {1,2,3,4} a partir dos 40 últimos números.
-    Top1 recebe x1.04; Top2 recebe x1.02; demais x1.00.
-    Esse efeito é *leve* e não sobrepõe as demais fontes (ngrams/padrões/estratégia).
-    """
     boosts = {1:1.00, 2:1.00, 3:1.00, 4:1.00}
     if not tail:
         return boosts
@@ -1127,10 +1170,7 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
             sl = rows["losses"] if rows else 0
             p_str = laplace_ratio(sw, sl)
 
-        # leve bias por horário do padrão
         boost_pat = 1.05 if p_pat >= 0.60 else (0.97 if p_pat <= 0.40 else 1.00)
-
-        # multiplicador do top-2 da cauda
         boost_hist = boost_tail.get(c, 1.00)
 
         prior = 1.0/len(base)
@@ -1153,7 +1193,7 @@ def suggest_number(base: List[int], pattern_key: str, strategy: Optional[str], a
         if post.get(number, 0.0) < (effx["MIN_CONF_G0"] + 0.08):
             return None, 0.0, samples, post
 
-    # Paraquedas: evita empate técnico top1~top2 (rachas perigosas)
+    # Paraquedas: evita empate técnico top1~top2
     top = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
     if len(top) == 2:
         t1, t2 = top[0][1], top[1][1]
@@ -1240,6 +1280,8 @@ async def ia2_process_once():
         await ia2_send_signal(best, conf_raw, tail_len, "FIRE")
         _ia2_mark_fire_sent()
         _mark_reason(f"FIRE(best={best}, conf={conf_raw:.3f}, gap={gap:.3f}, tail={tail_len})")
+        # >>> PATCH: marcar anunciado
+        _mark_last_open_as_announced()
         return
 
     _mark_reason(f"reprovado_relevancia(conf={conf_raw:.3f}, gap={gap:.3f}, tail={tail_len})")
@@ -1382,7 +1424,21 @@ async def webhook(token: str, request: Request):
     text = (msg.get("text") or msg.get("caption") or "").strip()
     t = re.sub(r"\s+", " ", text)
 
-    # 1) GREEN / RED — registra número real e fecha/atualiza pendências
+    # >>> PATCH: tratar sequência de tokens (ex.: GREEN/RED (2 | 3 | X))
+    kind_seq, tokens = extract_result_tokens(t)
+    if tokens:
+        for tok in tokens:
+            if tok == "X":
+                _append_token_and_maybe_close_x()
+            else:
+                n_observed = int(tok)
+                append_timeline(n_observed)
+                update_ngrams()
+                await close_pending_with_result(n_observed, kind_seq or "RED")
+        await ia2_process_once()
+        return {"ok": True, "processed_tokens": tokens, "kind": (kind_seq or "—")}
+
+    # 1) GREEN / RED — fallback legado (número simples)
     gnum = extract_green_number(t)
     redn = extract_red_last_left(t)
     if gnum is not None or redn is not None:
@@ -1453,6 +1509,9 @@ async def webhook(token: str, request: Request):
 
     out = build_suggestion_msg(int(number), base, pattern_key, after_num, conf, samples, stage="G0")
     await tg_broadcast(out)
+
+    # >>> PATCH: marcar anúncio do sinal como feito
+    _mark_last_open_as_announced()
 
     await ia2_process_once()
     return {"ok": True, "sent": True, "number": number, "conf": conf, "samples": samples}
