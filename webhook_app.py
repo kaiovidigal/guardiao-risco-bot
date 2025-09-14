@@ -1,4 +1,4 @@
- -*- coding: utf-8 -*-
+ # -*- coding: utf-8 -*-
 # Guardião — Tiro Seco (lite v3.2 DEBUG)
 # >>> Versão com LOG detalhado em stdout (print) para inspeção no Render logs
 # >>> Não altera o funcionamento: só adiciona prints nos pontos-chave.
