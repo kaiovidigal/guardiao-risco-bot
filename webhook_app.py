@@ -139,7 +139,7 @@ def exec_write(sql: str, params: tuple = (), retries: int = 8, wait: float = 0.2
             raise
     raise sqlite3.OperationalError("Banco bloqueado após várias tentativas.")
 
-def query_all(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+def query_all(sql: str, params: tuple = ()) -> List[sqlite3.Row]:
     con = _connect()
     rows = con.execute(sql, params).fetchall()
     con.close()
@@ -565,14 +565,14 @@ def _convert_last_loss_to_green_ia():
 async def send_scoreboard_ia():
     y = today_key_local()
     row = query_one("SELECT g0,loss,streak FROM daily_score_ia WHERE yyyymmdd=?", (y,))
-    g0=row["g0"] if row else 0
-    loss=row["loss"] if row else 0
-    streak=row["streak"] if row else 0
+    g0 = row["g0"] if row else 0
+    loss = row["loss"] if row else 0
+    streak = row["streak"] if row else 0
     total = g0 + loss
     acc = (g0/total*100) if total else 0.0
     txt = (f"🤖 <b>Placar IA (dia)</b>\n"
-           f"🟢 G0:{g0}</b>  🔴 Loss:{loss}\n"
-           f"✅ Acerto: {acc:.2f}%\n"
+           f"🟢 G0:{g0}  🔴 Loss:{loss}\n"
+           f"✅ Acerto: {acc:.2f}%</b>\n"
            f"🔥 Streak: {streak} GREEN(s)")
     await tg_broadcast(txt)
 
@@ -892,8 +892,7 @@ def _eff() -> dict:
             "IA2_COOLDOWN_AFTER_LOSS": 15,
             "IA2_TIER_STRICT": 0.62,
             "IA2_DELTA_GAP": 0.03,
-            "IA2_GAP_SAFETY": IA2_GAP_SAFET
-                 "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,   # ✅ mantenha só esta
             "MIN_CONF_G0": 0.55,
             "MIN_GAP_G0": 0.040,
         }
@@ -1022,7 +1021,7 @@ async def close_pending_with_result(n_observed: int, event_kind: str):
                     update_daily_score(0, True)
                     if src == "IA":
                         update_daily_score_ia(0, True)
-                    await send_green_imediato(suggested, "G0", seq_txt=seq_txt)
+                    await send_green_imediato(sugerido=suggested, stage_txt="G0", seq_txt=seq_txt)
                 else:
                     # Recuperação oculta: converte o último LOSS em GREEN
                     _convert_last_loss_to_green()
@@ -1050,7 +1049,7 @@ async def close_pending_with_result(n_observed: int, event_kind: str):
                         if src == "IA":
                             update_daily_score_ia(0, False)
                         seq_txt = _fmt_seq_conferencia(seen, n_observed, suggested)
-                        await send_loss_imediato(suggested, "G0", obs=n_observed, seq_txt=seq_txt)
+                        await send_loss_imediato(sugerido=suggested, stage_txt="G0", obs=n_observed, seq_txt=seq_txt)
                         _ia_set_post_loss_block()
                         bump_recov_g1(suggested, False)
                 else:
@@ -1274,7 +1273,7 @@ class _IntelStub:
 
     def start_signal(self, suggested: int, strategy: Optional[str] = None):
         self._signal_active = True
-        self._last_num = suggested
+               self._last_num = suggested
         try:
             path = os.path.join(self.base_dir, "snapshots", "latest_top.json")
             with open(path, "w") as f:
@@ -1523,7 +1522,7 @@ async def debug_state():
             "MIN_SAMPLES": MIN_SAMPLES,
             "IA2_TIER_STRICT": eff["IA2_TIER_STRICT"],
             "IA2_DELTA_GAP": eff["IA2_DELTA_GAP"],
-            "IA2_GAP_SAFETY": eff["IA2_GAP_SAFETY"],
+            "IA2_GAP_SAFETY": IA2_GAP_SAFETY,
             "IA2_MAX_PER_HOUR": eff["IA2_MAX_PER_HOUR"],
             "IA2_MIN_SECONDS_BETWEEN_FIRE": eff["IA2_MIN_SECONDS_BETWEEN_FIRE"],
             "IA2_COOLDOWN_AFTER_LOSS": eff["IA2_COOLDOWN_AFTER_LOSS"],
