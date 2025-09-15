@@ -1,39 +1,59 @@
-from fastapi import FastAPI, Request
-import httpx
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
+import requests
 import os
 
-app = FastAPI()
+app = FastAPI(title="Guardião Risco Bot")
 
-# 🔑 Configurações fixas
-TELEGRAM_TOKEN = "8217345207:AAEf5DjyRgIzxtDlTZVJX5bOjLw-uSg_i5o"
-SECRET_KEY = "meusegredo123"
+# Pegue de variáveis de ambiente (recomendado no Render)
+# ou caia para os defaults que você me passou.
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8217345207:AAEf5DjyRgIzxtDlTZVJX5bOjLw-uSg_i5o")
+DEFAULT_CHAT_ID = os.getenv("CHAT_ID", "-1001234567890")  # troque pelo ID real do canal/grupo
 
-# 👥 Canal ou grupo de destino
-CHAT_ID = -1001234567890  # troque pelo ID real do grupo/canal
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-# 🚀 Rota healthcheck
+def send_to_telegram(chat_id: str, text: str):
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    r = requests.post(url, json=payload, timeout=10)
+    try:
+        j = r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"Telegram retornou {r.status_code}: {r.text}")
+    if not j.get("ok"):
+        raise HTTPException(status_code=502, detail=j)
+    return j
+
+# ---------- WEBHOOK DO TELEGRAM (apenas log) ----------
+@app.post("/webhook/" + TELEGRAM_TOKEN)
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    print("Webhook Telegram recebido:", data)
+    # aqui você poderia reagir a comandos (/start, etc), se quiser
+    return {"ok": True}
+
+# ---------- TESTE RÁPIDO ----------
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-# 🚀 Rota webhook protegida
-@app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-    if token != SECRET_KEY:
-        return {"error": "Token inválido"}
+@app.get("/send")
+def send_test():
+    return send_to_telegram(DEFAULT_CHAT_ID, "✅ Teste funcionando! 🚀")
 
-    data = await request.json()
+# ---------- ENVIAR SINAIS ----------
+class SignalIn(BaseModel):
+    text: str                      # texto completo do sinal (ex: "ENTRADA CONFIRMADA...\nSequência: 1 | 4 | 2 ...")
+    chat_id: str | None = None     # opcional: sobrescrever o chat destino
 
-    text = data.get("text", "⚠️ Sinal recebido sem texto")
-    msg = f"📢 *Novo Sinal Recebido:*\n\n{text}"
+@app.post("/signal")
+def send_signal(sinal: SignalIn):
+    chat_id = sinal.chat_id or DEFAULT_CHAT_ID
+    text = sinal.text.strip()
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    # Opcional: pequenas melhorias de formatação pra ficar bonito
+    # Exemplo: destacar "ENTRADA CONFIRMADA" se existir
+    if text.upper().startswith("ENTRADA"):
+        text = f"✅ <b>{text.splitlines()[0].strip()}</b>\n" + "\n".join(text.splitlines()[1:])
 
-    async with httpx.AsyncClient() as client:
-        r = await client.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": msg,
-            "parse_mode": "Markdown"
-        })
-
-    return {"status": "enviado", "telegram_response": r.json()}
+    return send_to_telegram(chat_id, text)
