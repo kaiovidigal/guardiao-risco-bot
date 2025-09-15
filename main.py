@@ -1,13 +1,16 @@
-# main.py
 from fastapi import FastAPI
-from . import api_fanta
+from api_fanta import get_latest_result
 
-app = FastAPI()
+app = FastAPI(title="Guardião Risco Bot")
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
 @app.get("/")
-async def get_fantan_result():
-    result = await api_fanta.get_latest_result()
+async def root():
+    result = await get_latest_result()
     if result:
-        return {"numero": result[0], "timestamp": result[1]}
+        numero, ts_epoch = result
+        return {"numero": numero, "timestamp": ts_epoch}
     return {"erro": "Nenhum resultado válido encontrado"}
-
