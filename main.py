@@ -1,19 +1,21 @@
 from fastapi import FastAPI, Request
-from api_fanta import get_latest_result
 import requests
+import os
+from api_fanta import get_latest_result
 
 app = FastAPI(title="Guardião Risco Bot")
 
-# Configurações do bot
+# Configurações do bot Telegram
 TELEGRAM_TOKEN = "8315698154:AAH38hr2RbR0DtfalMNuXdGsh4UghDeztK4"
-CHAT_ID = "-1003052132833"  # seu grupo/canal no Telegram
+CHAT_ID = "-1003052132833"  # seu grupo/canal do Telegram
 
-# --- HEALTH CHECK ---
+
+# ---------- ROTAS DE STATUS ----------
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-# --- ROTA PRINCIPAL (FanTan API) ---
+
 @app.get("/")
 async def root():
     result = await get_latest_result()
@@ -22,14 +24,15 @@ async def root():
         return {"numero": numero, "timestamp": ts_epoch}
     return {"erro": "Nenhum resultado válido encontrado"}
 
-# --- ROTA DE WEBHOOK (para receber mensagens externas) ---
+
+# ---------- ROTAS DO TELEGRAM ----------
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
     print("Mensagem recebida:", data)  # aparece nos logs do Render
     return {"ok": True}
 
-# --- ROTA DE TESTE DE ENVIO PARA TELEGRAM ---
+
 @app.get("/send")
 async def send_message():
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
