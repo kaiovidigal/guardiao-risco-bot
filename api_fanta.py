@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 
 API_URL = (os.getenv("API_URL") or "").strip()
 API_KEY = (os.getenv("API_KEY") or "").strip()
-API_POLL_SECONDS = float(os.getenv("API_POLL_SECONDS", "1"))  # 👈 default 1s
+API_POLL_SECONDS = float(os.getenv("API_POLL_SECONDS", "1"))
 
 if not API_URL:
     raise RuntimeError("Defina API_URL (ex.: http://189.1.172.114:8080/api-evolution/Fan-Tan/result.json)")
@@ -42,49 +42,31 @@ def _coerce_int_1_4(x) -> Optional[int]:
     return None
 
 def parse_payload(payload: dict) -> Optional[int]:
-    """
-    Procura o último número no JSON, aceitando formatos comuns:
-      {"ultimo":3}, {"result":3}, {"n":3}, {"ultimoNumero":3}, {"ultimo_resultado":3}, {"last":3}
-      {"hist":[...,3]} / {"history":[...,3]} etc. -> pega o último
-    """
     if not isinstance(payload, dict):
         return None
-
-    # chaves diretas
     for k in ("ultimo", "result", "n", "ultimoNumero", "ultimo_resultado", "last"):
         if k in payload:
             n = _coerce_int_1_4(payload[k])
             if n is not None:
                 return n
-
-    # coleções com histórico
     for k in ("hist", "history", "ultimos", "ultimas", "resultados"):
         if k in payload and isinstance(payload[k], (list, tuple)) and payload[k]:
             n = _coerce_int_1_4(payload[k][-1])
             if n is not None:
                 return n
-
-    # fallback: qualquer valor 1..4
     for v in payload.values():
         n = _coerce_int_1_4(v)
         if n is not None:
             return n
-
     return None
 
-_last_tuple: Optional[Tuple[int, int]] = None  # (numero, ts_epoch)
+_last_tuple: Optional[Tuple[int, int]] = None
 
 async def get_latest_result(client: Optional[httpx.AsyncClient] = None) -> Optional[Tuple[int, int]]:
-    """
-    Faz GET no endpoint e retorna (numero, ts_epoch) quando houver payload válido.
-    Caso o payload não tenha número válido, retorna None.
-    Não faz dedupe temporal — cada resposta vira "observado".
-    """
     close_client = False
     if client is None:
         client = httpx.AsyncClient(timeout=8)
         close_client = True
-
     try:
         r = await client.get(API_URL, headers=_headers)
         r.raise_for_status()
