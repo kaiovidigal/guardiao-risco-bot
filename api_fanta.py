@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+no# -*- coding: utf-8 -*-
 """
 api_fanta.py
 Cliente simples para ler o último resultado do Fan-Tan a partir da sua API.
