@@ -1,26 +1,29 @@
 from fastapi import FastAPI, Request
-import requests
+import os, requests
 
-app = FastAPI()
+app = FastAPI(title="Guardião Risco Bot")
 
-# Configurações do bot
-TELEGRAM_TOKEN = "8217345207:AAEf5DjyRgIzxtDlTZVJX5bOjLw-uSg_i5o"
-CHAT_ID = "-1003052132833"  # seu grupo/canal no Telegram
+TELEGRAM_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# --- ROTA DE WEBHOOK ---
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# Webhook para receber sinais (POST em /webhook)
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
-    print("Mensagem recebida:", data)  # só para debug nos logs do Render
+    # aqui você pode transformar 'data' em uma mensagem formatada
+    print("Mensagem recebida no webhook:", data)
     return {"ok": True}
 
-# --- ROTA DE TESTE DE ENVIO ---
+# Rota de teste para enviar mensagem ao Telegram
 @app.get("/send")
-async def send_message():
+def send_message():
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return {"error": "Faltam TG_BOT_TOKEN ou CHAT_ID no ambiente"}
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": "✅ Teste funcionando no canal! 🚀"
-    }
-    r = requests.post(url, json=payload)
-    return {"status": r.json()}
+    payload = {"chat_id": CHAT_ID, "text": "✅ Teste funcionando no canal! 🚀"}
+    r = requests.post(url, json=payload, timeout=10)
+    return {"status": r.status_code, "response": r.json()}
