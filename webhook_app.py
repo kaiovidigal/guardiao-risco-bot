@@ -1,61 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Webhook (GEN híbrido + estratégia + timeout 45s + relatório 5min + reset diário + ML com hot-reload + auto-train)
-"""
-
-import os, re, time, json, sqlite3, asyncio, pickle, subprocess
+import os, re, time, json, sqlite3, asyncio, pickle
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone, timedelta
-from math import isfinite
 from zoneinfo import ZoneInfo
-from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
 # ========= ENV =========
-TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()  # destino
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # fonte
-DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
+env = lambda k, d=None: os.getenv(k, d).strip() if os.getenv(k) is not None else (d if d is not None else "")
+to_f = lambda k, d: float(os.getenv(k, d))
+to_i = lambda k, d: int(os.getenv(k, d))
 
-RESET_TZ       = os.getenv("RESET_TZ", "America/Sao_Paulo").strip()
+TG_BOT_TOKEN   = env("TG_BOT_TOKEN")
+WEBHOOK_TOKEN  = env("WEBHOOK_TOKEN", "meusegredo123")
+TARGET_CHANNEL = env("TARGET_CHANNEL", "-1002796105884")
+SOURCE_CHANNEL = env("SOURCE_CHANNEL", "-1002810508717")
+DB_PATH        = env("DB_PATH", "/var/data/main.sqlite")
+RESET_TZ       = env("RESET_TZ", "America/Sao_Paulo")
 
-# ========= ML / MODELOS =========
-MODEL_DIR    = os.getenv("MODEL_DIR", "/var/data").strip() or "/var/data"
-MODEL_PATH   = os.getenv("MODEL_PATH", "/var/data/model_GLOBAL.pkl").strip() or "/var/data/model_GLOBAL.pkl"  # fallback compatível
-ML_MIN_PROBA = float(os.getenv("ML_MIN_PROBA", "0.75"))   # limiar mínimo p/ aceitar previsão
-ML_GAP_MIN   = float(os.getenv("ML_GAP_MIN", "0.05"))     # gap vs segundo melhor
-ENSEMBLE_MODE= os.getenv("ENSEMBLE_MODE", "gate").strip() # "gate" | "blend" | "ml_only"
+MODEL_DIR      = env("MODEL_DIR", "/var/data")
+MODEL_PATH     = env("MODEL_PATH", os.path.join(MODEL_DIR, "model_GLOBAL.pkl"))
+ML_MIN_PROBA   = to_f("ML_MIN_PROBA", 0.78)
+ML_GAP_MIN     = to_f("ML_GAP_MIN", 0.08)
+ENSEMBLE_MODE  = env("ENSEMBLE_MODE", "blend")  # "gate" | "blend" | "ml_only"
 
-# ========= AUTO-TRAIN =========
-AUTO_TRAIN       = os.getenv("AUTO_TRAIN", "0").strip() == "1"
-TRAIN_EVERY_MIN  = int(os.getenv("TRAIN_EVERY_MIN", "120"))
-TRAIN_MIN_LABELS = int(os.getenv("TRAIN_MIN_LABELS", "200"))
+REPORT_EVERY_SEC   = to_i("REPORT_EVERY_SEC", 300)
+GOOD_DAY_THRESHOLD = to_f("GOOD_DAY_THRESHOLD", 0.70)
+BAD_DAY_THRESHOLD  = to_f("BAD_DAY_THRESHOLD", 0.40)
+
+SHORT_WINDOW   = to_i("SHORT_WINDOW", 40)
+LONG_WINDOW    = to_i("LONG_WINDOW", 600)
+CONF_SHORT_MIN = to_f("CONF_SHORT_MIN", 0.49)
+CONF_LONG_MIN  = to_f("CONF_LONG_MIN", 0.59)
+GAP_MIN        = to_f("GAP_MIN", 0.025)
+FINAL_TIMEOUT  = to_i("FINAL_TIMEOUT", 45)
+
+TRAIN_ON_START        = env("TRAIN_ON_START", "false").lower() in ("1","true","yes","y")
+MIN_SAMPLES_PER_PATTERN = to_i("MIN_SAMPLES_PER_PATTERN", 120)
+REGISTRY_PATH         = env("REGISTRY_PATH", "/var/data/registry.json")
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
-if not WEBHOOK_TOKEN:
-    raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
-
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-app = FastAPI(title="guardiao-auto-bot (GEN híbrido + estratégia + ML + auto-train)", version="4.0.0")
 
-# ========= HÍBRIDO (curta/longa) =========
-SHORT_WINDOW    = 40
-LONG_WINDOW     = 600
-CONF_SHORT_MIN  = 0.49
-CONF_LONG_MIN   = 0.59
-GAP_MIN         = 0.025
-FINAL_TIMEOUT   = 45       # começa quando houver 2 observados
-
-# ========= Relatório / Sinais do dia =========
-REPORT_EVERY_SEC   = 5 * 60
-GOOD_DAY_THRESHOLD = 0.70
-BAD_DAY_THRESHOLD  = 0.40
+app = FastAPI(title="guardiao-auto-bot (híbrido + ML opcional)", version="3.3.0")
 
 # ========= Utils =========
 def now_ts() -> int: return int(time.time())
@@ -73,30 +64,15 @@ def _connect() -> sqlite3.Connection:
     con.execute("PRAGMA busy_timeout=10000;")
     return con
 
-def _exec_write(sql: str, params: tuple=()):
-    for attempt in range(6):
-        try:
-            con = _connect(); cur = con.cursor()
-            cur.execute(sql, params)
-            con.commit(); con.close(); return
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower() or "busy" in str(e).lower():
-                time.sleep(0.25*(attempt+1)); continue
-            raise
-
-def _query_all(sql: str, params: tuple=()) -> List[sqlite3.Row]:
-    con = _connect(); cur = con.cursor()
-    rows = cur.execute(sql, params).fetchall()
-    con.close()
-    return rows
-
 def migrate_db():
     con = _connect(); cur = con.cursor()
+    # timeline
     cur.execute("""CREATE TABLE IF NOT EXISTS timeline (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER NOT NULL,
         number INTEGER NOT NULL
     )""")
+    # pending
     cur.execute("""CREATE TABLE IF NOT EXISTS pending (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER,
@@ -115,6 +91,7 @@ def migrate_db():
         outcome TEXT,
         stage TEXT
     )""")
+    # score
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
         id INTEGER PRIMARY KEY CHECK (id=1),
         green INTEGER DEFAULT 0,
@@ -122,7 +99,8 @@ def migrate_db():
     )""")
     if not cur.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
-    # Tabela de logs de ML
+
+    # ml_log (para treino supervisionado)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ml_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,15 +122,33 @@ def migrate_db():
             outcome TEXT
         )
     """)
-    # Correções idempotentes
+
+    # defaults/correções
     try:
-        cur.execute("UPDATE pending SET stage='OPEN'      WHERE stage IS NULL OR stage=''")
+        cur.execute("UPDATE pending SET stage='OPEN' WHERE stage IS NULL OR stage=''")
         cur.execute("UPDATE pending SET outcome='PENDING' WHERE outcome IS NULL OR outcome=''")
     except sqlite3.OperationalError:
         pass
     con.commit(); con.close()
 
 migrate_db()
+
+def _exec_write(sql: str, params: tuple=()):
+    for attempt in range(6):
+        try:
+            con = _connect(); cur = con.cursor()
+            cur.execute(sql, params)
+            con.commit(); con.close(); return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() or "busy" in str(e).lower():
+                time.sleep(0.25*(attempt+1)); continue
+            raise
+
+def _query_all(sql: str, params: tuple=()) -> List[sqlite3.Row]:
+    con = _connect(); cur = con.cursor()
+    rows = cur.execute(sql, params).fetchall()
+    con.close()
+    return rows
 
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
@@ -161,7 +157,7 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
                           json={"chat_id": chat_id, "text": text, "parse_mode": parse,
                                 "disable_web_page_preview": True})
 
-# ========= Score =========
+# ========= Score helpers =========
 def bump_score(outcome: str):
     con = _connect(); cur = con.cursor()
     row = cur.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
@@ -171,19 +167,16 @@ def bump_score(outcome: str):
     cur.execute("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,?,?)", (g, l))
     con.commit(); con.close()
 
-def reset_score(): _exec_write("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,0,0)")
-
 def score_text() -> str:
     con = _connect()
     row = con.execute("SELECT green, loss FROM score WHERE id=1").fetchone()
     con.close()
-    if not row: return "0 GREEN × 0 LOSS — 0.0%"
-    g, l = int(row["green"]), int(row["loss"])
+    g, l = (int(row["green"]), int(row["loss"])) if row else (0, 0)
     total = g + l
     acc = (g/total*100.0) if total>0 else 0.0
     return f"{g} GREEN × {l} LOSS — {acc:.1f}%"
 
-# ========= Timeline / N-gram =========
+# ========= N-gram timeline =========
 def append_timeline(seq: List[int]):
     for n in seq:
         _exec_write("INSERT INTO timeline (created_at, number) VALUES (?,?)", (now_ts(), int(n)))
@@ -222,14 +215,14 @@ def _post_from_tail(tail: List[int], after: Optional[int], candidates: List[int]
         ctx1 = tail[-1:] if len(tail)>=1 else []
 
     posts = {c: 0.0 for c in candidates}
-    ctxs  = [(4,ctx4),(3,ctx3),(2,ctx2),(1,ctx1)]
-    for lvl, ctx in ctxs:
+    for lvl, ctx in [(4,ctx4),(3,ctx3),(2,ctx2),(1,ctx1)]:
         if not ctx: continue
         counts = _ctx_counts(tail, ctx[:-1])
         tot = sum(counts.values())
         if tot == 0: continue
         for n in candidates:
-            posts[n] += W[4-lvl] * (counts.get(n,0)/tot)
+            posts[n] += [0,0,0,0,0,0,0,0,0][0]  # noop p/ linters
+            posts[n] += [0.46, 0.30, 0.16, 0.08][4-lvl] * (counts.get(n,0)/tot)
     s = sum(posts.values()) or 1e-9
     return {k: v/s for k,v in posts.items()}
 
@@ -243,26 +236,21 @@ def _best_conf_gap(post: Dict[int,float]) -> Tuple[int,float,float]:
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-KWOK_RX  = re.compile(r"\bKWOK\s*([1-4])s*-\s*([1-4])", re.I)
+KWOK_RX  = re.compile(r"\bKWOK\s*([1-4])\s*-\s*([1-4])", re.I)
 SSH_RX   = re.compile(r"\bSS?H\s*([1-4])(?:-([1-4]))?(?:-([1-4]))?(?:-([1-4]))?", re.I)
 ODD_RX   = re.compile(r"\bODD\b", re.I)
 EVEN_RX  = re.compile(r"\bEVEN\b", re.I)
-
 GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
 LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
-
 PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
 ANY_14_RX      = re.compile(r"[1-4]")
 
 def parse_candidates_and_pattern(t: str) -> Tuple[List[int], str]:
     m = KWOK_RX.search(t)
     if m:
-        try:
-            a,b = int(m.group(1)), int(m.group(2))
-            base = sorted(list({a,b}))
-            return base, f"KWOK-{a}-{b}"
-        except Exception:
-            pass
+        a,b = int(m.group(1)), int(m.group(2))
+        base = sorted(list({a,b}))
+        return base, f"KWOK-{a}-{b}"
     if ODD_RX.search(t):  return [1,3], "ODD"
     if EVEN_RX.search(t): return [2,4], "EVEN"
     m = SSH_RX.search(t)
@@ -300,7 +288,7 @@ def parse_close_numbers(text: str) -> List[int]:
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:3]
 
-# ========= Decisor (híbrido + estratégia) =========
+# ========= Decisor (híbrido) =========
 def choose_single_number_hybrid(after: Optional[int], candidates: List[int]) -> Tuple[Optional[int], float, float, int, Dict[int,float], Dict[int,float]]:
     candidates = sorted(list(dict.fromkeys([c for c in candidates if c in (1,2,3,4)]))) or [1,2,3,4]
     tail_s = get_tail(SHORT_WINDOW)
@@ -314,113 +302,84 @@ def choose_single_number_hybrid(after: Optional[int], candidates: List[int]) -> 
         best = b_s
     return best, c_s, c_l, len(tail_s), post_s, post_l
 
-# ========= ML loaders (multi-modelo com hot-reload) =========
-import joblib
-_registry_path = os.path.join(MODEL_DIR, "registry.json")
-_models_cache: Dict[str, Tuple[float, object]] = {}  # path -> (mtime, model)
+# ========= ML =========
+_MODELS: Dict[str,object] = {}
 
-def _model_path_for(pattern_key: str) -> str:
-    pk = (pattern_key or "GEN").upper()
-    cand = os.path.join(MODEL_DIR, f"model_{pk}.pkl")
-    if os.path.exists(cand): return cand
-    cand_g = os.path.join(MODEL_DIR, "model_GLOBAL.pkl")
-    if os.path.exists(cand_g): return cand_g
-    return MODEL_PATH  # fallback compatível
-
-def _load_model_path(path: str):
+def _load_model_file(path: str):
     try:
-        return joblib.load(path)
-    except Exception:
-        return None
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return pickle.load(f)
+    except Exception as e:
+        print(f"[ML] falha ao carregar {path}: {e}")
+    return None
 
-def get_model_for_pattern(pattern_key: str):
-    path = _model_path_for(pattern_key)
-    p = Path(path)
-    mtime = p.stat().st_mtime if p.exists() else 0
-    cached = _models_cache.get(path)
-    if (not cached) or (cached[0] != mtime):
-        model = _load_model_path(path)
-        _models_cache[path] = (mtime, model)
-    return _models_cache[path][1]  # pode ser None
+def load_models():
+    # por padrão tenta modelos específicos + GLOBAL
+    pats = ["GEN","KWOK","SSH","SEQ","ODD","EVEN","GLOBAL"]
+    for p in pats:
+        fn = f"model_{p}.pkl" if p!="GLOBAL" else "model_GLOBAL.pkl"
+        mdl = _load_model_file(os.path.join(MODEL_DIR, fn))
+        if mdl is not None:
+            _MODELS[p] = mdl
+    # fallback único
+    if "GLOBAL" not in _MODELS:
+        mdl = _load_model_file(MODEL_PATH)
+        if mdl is not None:
+            _MODELS["GLOBAL"] = mdl
 
-def _top2_from_post(post: Dict[int,float]) -> Tuple[float,float]:
-    vals = sorted(post.values(), reverse=True)
-    a = vals[0] if vals else 0.0
-    b = vals[1] if len(vals)>1 else 0.0
-    return a, b
+def _top2(vals: Dict[int,float]) -> Tuple[float,float]:
+    s = sorted(vals.values(), reverse=True)
+    return (s[0], s[1]) if len(s)>1 else (s[0] if s else 0.0, 0.0)
 
-def build_features_for_candidates(after: Optional[int], base: List[int],
-                                  conf_s: float, conf_l: float,
-                                  post_s: Dict[int,float], post_l: Dict[int,float],
-                                  samples_s: int, pattern_key: str) -> Dict[str, float]:
-    a_s, b_s = _top2_from_post(post_s)
-    a_l, b_l = _top2_from_post(post_l)
-    gap_s = max(0.0, a_s - b_s)
-    gap_l = max(0.0, a_l - b_l)
-    feats = {
-        "after": float(after or 0),
-        "has_after": 1.0 if after else 0.0,
-        "conf_short": float(conf_s or 0.0),
-        "conf_long":  float(conf_l or 0.0),
-        "gap_short":  float(gap_s),
-        "gap_long":   float(gap_l),
-        "samples_short": float(samples_s or 0),
-        "base_len": float(len(base or [])),
-        "pat_GEN":   1.0 if (pattern_key or "").upper().startswith("GEN") else 0.0,
-        "pat_KWOK":  1.0 if (pattern_key or "").upper().startswith("KWOK") else 0.0,
-        "pat_SSH":   1.0 if (pattern_key or "").upper().startswith("SSH") else 0.0,
-        "pat_SEQ":   1.0 if (pattern_key or "").upper().startswith("SEQ") else 0.0,
-        "pat_ODD":   1.0 if (pattern_key or "").upper()=="ODD" else 0.0,
-        "pat_EVEN":  1.0 if (pattern_key or "").upper()=="EVEN" else 0.0,
+def build_features(after: Optional[int], base: List[int], pattern_key: str,
+                   conf_s: float, conf_l: float, post_s: Dict[int,float], post_l: Dict[int,float],
+                   samples_s: int) -> Dict[str,float]:
+    a_s,b_s = _top2(post_s); a_l,b_l = _top2(post_l)
+    return {
+        "after": float(after or 0), "has_after": 1.0 if after else 0.0,
+        "conf_short": float(conf_s or 0.0), "conf_long": float(conf_l or 0.0),
+        "gap_short": max(0.0, a_s-b_s), "gap_long": max(0.0, a_l-b_l),
+        "samples_short": float(samples_s or 0), "base_len": float(len(base or [])),
+        "pat_GEN": 1.0 if pattern_key.upper().startswith("GEN") else 0.0,
+        "pat_KWOK":1.0 if pattern_key.upper().startswith("KWOK") else 0.0,
+        "pat_SSH": 1.0 if pattern_key.upper().startswith("SSH") else 0.0,
+        "pat_SEQ": 1.0 if pattern_key.upper().startswith("SEQ") else 0.0,
+        "pat_ODD": 1.0 if pattern_key.upper()=="ODD" else 0.0,
+        "pat_EVEN":1.0 if pattern_key.upper()=="EVEN" else 0.0,
     }
-    return feats
 
-def expand_candidate_features(base_feats: Dict[str,float], cand: int,
-                              post_s: Dict[int,float], post_l: Dict[int,float]) -> Dict[str,float]:
-    x = dict(base_feats)
-    x.update({
-        "cand": float(cand),
-        "post_s": float(post_s.get(cand, 0.0)),
-        "post_l": float(post_l.get(cand, 0.0)),
-    })
-    return x
-
-def ml_score_candidates(candidates: List[int],
-                        after: Optional[int],
-                        base: List[int],
-                        pattern_key: str,
-                        conf_s: float, conf_l: float,
-                        post_s: Dict[int,float], post_l: Dict[int,float],
-                        samples_s: int) -> Tuple[Optional[int], Dict[int,float], float]:
-    model = get_model_for_pattern(pattern_key)
-    if model is None:
+def ml_score(candidates: List[int],
+             after: Optional[int], base: List[int], pattern_key: str,
+             conf_s: float, conf_l: float, post_s: Dict[int,float], post_l: Dict[int,float],
+             samples_s: int) -> Tuple[Optional[int], Dict[int,float], float]:
+    if not _MODELS:
         return None, {}, 0.0
-    base_feats = build_features_for_candidates(after, base, conf_s, conf_l, post_s, post_l, samples_s, pattern_key)
+    feats_common = build_features(after, base, pattern_key, conf_s, conf_l, post_s, post_l, samples_s)
+    keys = sorted(feats_common.keys())
     X, order = [], []
     for c in candidates:
-        feats = expand_candidate_features(base_feats, c, post_s, post_l)
-        keys = sorted(feats.keys())
-        X.append([feats[k] for k in keys])
-        order.append((c, keys))
-    try:
-        proba = model.predict_proba(X)
-        if len(proba.shape) == 2 and proba.shape[1] >= 2:
-            p_green = [float(p[1]) for p in proba]
-        else:
-            p_green = [float(p[0]) for p in proba]
-    except Exception as e:
-        print(f"[ML] predict_proba falhou: {e}")
+        x = dict(feats_common); x.update({"cand": float(c), "post_s": float(post_s.get(c,0.0)), "post_l": float(post_l.get(c,0.0))})
+        X.append([x[k] for k in sorted(x.keys())]); order.append(c)
+
+    # escolhe modelo do padrão ou GLOBAL
+    mdl = _MODELS.get(pattern_key.split("-")[0].upper()) or _MODELS.get("GLOBAL")
+    if mdl is None:
         return None, {}, 0.0
-    proba_by_cand = {order[i][0]: p_green[i] for i in range(len(order))}
-    top = sorted(proba_by_cand.items(), key=lambda kv: kv[1], reverse=True)[:2]
-    if not top:
-        return None, proba_by_cand, 0.0
-    best_cand, best_p = top[0]
-    second_p = top[1][1] if len(top)>1 else 0.0
-    gap = max(0.0, best_p - second_p)
-    if best_p >= ML_MIN_PROBA and gap >= ML_GAP_MIN:
-        return best_cand, proba_by_cand, gap
-    return None, proba_by_cand, gap
+    try:
+        proba = mdl.predict_proba(X)
+        p_green = [float(p[1]) if len(p)>=2 else float(p[0]) for p in proba]
+        by_cand = {order[i]: p_green[i] for i in range(len(order))}
+        top = sorted(by_cand.items(), key=lambda kv: kv[1], reverse=True)[:2]
+        if not top: return None, by_cand, 0.0
+        best, p1 = top[0]; p2 = top[1][1] if len(top)>1 else 0.0
+        gap = max(0.0, p1-p2)
+        if p1 >= ML_MIN_PROBA and gap >= ML_GAP_MIN:
+            return best, by_cand, gap
+        return None, by_cand, gap
+    except Exception as e:
+        print(f"[ML] predict_proba erro: {e}")
+        return None, {}, 0.0
 
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
@@ -430,8 +389,7 @@ def get_open_pending() -> Optional[sqlite3.Row]:
     return row
 
 def _seen_list(row: sqlite3.Row) -> List[str]:
-    seen = (row["seen"] or "").strip()
-    return [s for s in seen.split("-") if s]
+    return [s for s in (row["seen"] or "").strip().split("-") if s]
 
 def _set_seen(row_id:int, seen_list:List[str]):
     _exec_write("UPDATE pending SET seen=? WHERE id=?", ("-".join(seen_list[:3]), row_id))
@@ -458,7 +416,6 @@ def _close_now(row: sqlite3.Row, suggested:int, final_seen:List[str]):
                 ("-".join(final_seen[:3]), now_ts(), outcome, stage_lbl, int(row["id"])))
     bump_score(outcome.upper())
 
-    # rotula no ml_log (se existir)
     try:
         _exec_write("""
             UPDATE ml_log
@@ -498,7 +455,7 @@ def _maybe_close_by_final_timeout():
         return _close_now(row, int(row["suggested"] or 0), seen_list)
     return None
 
-# ========= Relatório 5 em 5 minutos =========
+# ========= Reporter & Reset =========
 def _report_snapshot(last_secs:int=300) -> Dict[str,int]:
     since = now_ts() - max(60, int(last_secs))
     rows = _query_all("""
@@ -532,7 +489,7 @@ def _day_mood(acc: float) -> str:
 async def _reporter_loop():
     while True:
         try:
-            snap = _report_snapshot(300)
+            snap = _report_snapshot(REPORT_EVERY_SEC)
             gtot = snap["g0"] + snap["g1"] + snap["g2"]
             ltot = snap["l0"] + snap["l1"] + snap["l2"]
             txt = (
@@ -551,9 +508,7 @@ async def _reporter_loop():
             print(f"[RELATORIO] erro: {e}")
         await asyncio.sleep(REPORT_EVERY_SEC)
 
-# ========= Reset diário =========
 async def _daily_reset_loop():
-    tz = None
     try:
         tz = ZoneInfo(RESET_TZ)
     except Exception:
@@ -563,59 +518,85 @@ async def _daily_reset_loop():
             now = datetime.now(tz)
             tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             await asyncio.sleep(max(1.0, (tomorrow - now).total_seconds()))
-            reset_score()
+            _exec_write("INSERT OR REPLACE INTO score (id, green, loss) VALUES (1,0,0)")
             tzname = getattr(tz, "key", "UTC")
             await tg_send_text(TARGET_CHANNEL, f"🕛 <b>Reset diário (00:00 {tzname})</b>\n📊 Placar zerado para o novo dia.")
         except Exception as e:
             print(f"[RESET] erro: {e}")
             await asyncio.sleep(60)
 
-# ========= Auto-train loop =========
-def _count_labeled() -> int:
+# ========= Treino on-boot (opcional) =========
+def _has_labels() -> bool:
     try:
-        row = _query_all("SELECT COUNT(*) AS c FROM ml_log WHERE label IS NOT NULL")
-        return int(row[0]["c"] if row else 0)
+        con = _connect(); cur = con.cursor()
+        r = cur.execute("SELECT COUNT(1) FROM ml_log WHERE label IS NOT NULL").fetchone()
+        con.close()
+        return bool(r and int(r[0]) > 0)
     except Exception:
-        return 0
+        return False
 
-async def _auto_train_loop():
-    while True:
-        try:
-            if AUTO_TRAIN:
-                labeled = _count_labeled()
-                if labeled >= TRAIN_MIN_LABELS:
-                    print(f"[AUTO_TRAIN] iniciando treino — rotulados={labeled}")
-                    proc = await asyncio.create_subprocess_exec(
-                        "python", "train_ml_per_pattern.py",
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT
-                    )
-                    out = await proc.communicate()
-                    try:
-                        msg = out[0].decode("utf-8", errors="ignore") if out and out[0] else ""
-                        print("[AUTO_TRAIN] Output:\n", msg[:4000])
-                    except Exception:
-                        pass
-                    # hot-reload: próxima predição vai ver mtime novo do model_*.pkl
-                else:
-                    print(f"[AUTO_TRAIN] pulado: rotulados={labeled} < {TRAIN_MIN_LABELS}")
-        except Exception as e:
-            print(f"[AUTO_TRAIN] erro: {e}")
-        await asyncio.sleep(max(60, TRAIN_EVERY_MIN*60))
+def _train_now():
+    # treinamento simples tipo "GLOBAL" + por padrão quando há dados suficientes
+    try:
+        con = _connect(); con.row_factory = sqlite3.Row
+        rows = con.execute("""
+            SELECT
+                m.pending_id, m.after, m.base, m.pattern_key,
+                m.conf_short, m.conf_long, m.gap_short, m.gap_long, m.samples_short,
+                m.chosen, m.label, m.stage, m.outcome,
+                p.last_post_short, p.last_post_long, p.suggested, p.outcome AS p_outcome, p.seen
+        FROM ml_log m LEFT JOIN pending p ON p.id = m.pending_id
+        WHERE m.label IS NOT NULL
+        """).fetchall()
+        con.close()
+        import numpy as np
+        from sklearn.ensemble import RandomForestClassifier
+        X, y = [], []
+        for r in rows:
+            try:
+                base = json.loads(r["base"]) if r["base"] else []
+                post_s = json.loads(r["last_post_short"]) if r["last_post_short"] else {}
+                post_l = json.loads(r["last_post_long"]) if r["last_post_long"] else {}
+            except Exception:
+                base, post_s, post_l = [], {}, {}
+            cand = int(r["chosen"]) if r["chosen"] is not None else None
+            if cand is None: continue
+            feats = build_features(int(r["after"] or 0) or None, base, (r["pattern_key"] or "GEN"),
+                                   float(r["conf_short"] or 0.0), float(r["conf_long"] or 0.0),
+                                   post_s, post_l, int(r["samples_short"] or 0))
+            feats.update({"cand": float(cand), "post_s": float(post_s.get(cand,0.0)), "post_l": float(post_l.get(cand,0.0))})
+            keys = sorted(feats.keys())
+            X.append([feats[k] for k in keys]); y.append(int(r["label"]))
+        if len(X) >= max(200, MIN_SAMPLES_PER_PATTERN) and len(set(y)) >= 2:
+            clf = RandomForestClassifier(
+                n_estimators=400, max_depth=None, min_samples_split=4, min_samples_leaf=2,
+                class_weight="balanced_subsample", n_jobs=-1, random_state=42
+            ).fit(X, y)
+            os.makedirs(MODEL_DIR, exist_ok=True)
+            import joblib; joblib.dump(clf, os.path.join(MODEL_DIR, "model_GLOBAL.pkl"))
+            with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
+                json.dump({"models":{"GLOBAL":{"path":os.path.join(MODEL_DIR,"model_GLOBAL.pkl"),"samples":len(X)}}}, f, indent=2, ensure_ascii=False)
+            print("[TRAIN] ✅ Treino GLOBAL salvo.")
+        else:
+            print("[TRAIN] ⚠️ Sem dados suficientes ainda para treino automático.")
+    except Exception as e:
+        print(f"[TRAIN] erro: {e}")
 
 # ========= Rotas =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "guardiao-auto-bot (GEN híbrido + estratégia + timeout 45s + relatório 5min + ML + auto-train)"}
+    return {"ok": True, "service": "guardiao-auto-bot (hybrid+ml)"}
 
 @app.on_event("startup")
 async def _boot_tasks():
+    load_models()
+    if TRAIN_ON_START and _has_labels():
+        _train_now()
+        load_models()
     try: asyncio.create_task(_reporter_loop())
     except Exception as e: print(f"[START] reporter error: {e}")
     try: asyncio.create_task(_daily_reset_loop())
     except Exception as e: print(f"[START] reset error: {e}")
-    try: asyncio.create_task(_auto_train_loop())
-    except Exception as e: print(f"[START] auto-train error: {e}")
 
 @app.get("/health")
 async def health():
@@ -691,19 +672,17 @@ async def webhook(token: str, request: Request):
     base        = parsed["base"] or [1,2,3,4]
     pattern_key = parsed["pattern_key"] or "GEN"
 
-    # 1) decisão híbrida (original)
+    # 1) híbrido
     best_h, conf_s, conf_l, samples_s, post_s, post_l = choose_single_number_hybrid(after, base)
-
-    # 2) decisão ML (se houver modelo por padrão)
-    best_ml, proba_by_cand, ml_gap = ml_score_candidates(base, after, base, pattern_key, conf_s, conf_l, post_s, post_l, samples_s)
+    # 2) ML
+    best_ml, proba_by_cand, ml_gap = ml_score(base, after, base, pattern_key, conf_s, conf_l, post_s, post_l, samples_s)
 
     # 3) ensemble
-    chosen = None
-    chosen_by = None
-    if ENSEMBLE_MODE == "ml_only":
-        if best_ml is not None:
-            chosen, chosen_by = best_ml, "ml"
-    elif ENSEMBLE_MODE == "blend":
+    chosen = None; chosen_by = None
+    mode = ENSEMBLE_MODE.lower()
+    if mode == "ml_only":
+        if best_ml is not None: chosen, chosen_by = best_ml, "ml"
+    elif mode == "blend":
         if (best_h is not None) and (best_ml is not None) and (best_h == best_ml):
             chosen, chosen_by = best_h, "ensemble"
         elif (best_h is None) and (best_ml is not None):
@@ -712,7 +691,7 @@ async def webhook(token: str, request: Request):
             chosen, chosen_by = best_h, "hybrid"
         elif (best_h is not None) and (best_ml is not None) and (best_h != best_ml):
             chosen, chosen_by = best_h, "hybrid"
-    else:  # "gate" (conservador)
+    else:  # gate
         if best_h is not None:
             if best_ml is not None and best_ml != best_h:
                 p_h = proba_by_cand.get(best_h, 0.0)
@@ -729,9 +708,8 @@ async def webhook(token: str, request: Request):
     if chosen is None:
         return {"ok": True, "skipped_low_conf_or_disagree": True}
 
-    # 4) abre pendência + log de ML
+    # 4) abre pendência + log
     open_pending(chosen, conf_s, conf_l, post_s, post_l, base, pattern_key)
-
     try:
         gap_s_vals = sorted(post_s.values(), reverse=True)
         gap_l_vals = sorted(post_l.values(), reverse=True)
@@ -747,12 +725,10 @@ async def webhook(token: str, request: Request):
               json.dumps(base or []),
               str(pattern_key or "GEN"),
               float(conf_s), float(conf_l),
-              float(max(0.0, gap_s)),
-              float(max(0.0, gap_l)),
+              float(max(0.0, gap_s)), float(max(0.0, gap_l)),
               int(samples_s or 0),
               json.dumps({int(k): float(v) for k,v in (proba_by_cand or {}).items()}),
-              int(chosen),
-              str(chosen_by or "hybrid")))
+              int(chosen), str(chosen_by or "hybrid")))
     except Exception as e:
         print(f"[ML] log insert fail: {e}")
 
