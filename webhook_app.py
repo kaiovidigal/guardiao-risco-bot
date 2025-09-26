@@ -119,7 +119,7 @@ def _connect() -> sqlite3.Connection:
 
 def _column_exists(con: sqlite3.Connection, table: str, col: str) -> bool:
     r = con.execute(f"PRAGMA table_info({table})").fetchall()
-    return any((row["name"] if isinstance(row, sqlite3.Row) else row[1]) == col for col in r)
+    return any((row["name"] if isinstance(row, sqlite3.Row) else row[1]) == col for row in r)
 
 @contextmanager
 def _tx():
@@ -432,8 +432,8 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
         if len(ctx1)==1: s += W1 * _prob_from_ngrams(ctx1[:-1], c)
         if len(ctx4)==4: s += FEED_BETA * WF4 * _feedback_prob(4, ctx4[:-1], c)
         if len(ctx3)==3: s += FEED_BETA * WF3 * _feedback_prob(3, ctx3[:-1], c)
-        if len(ctx2)==2: s += FEED_BETA * WF2 * _feedback_prob(2, ctx2[:-1}, c)
-        if len(ctx1)==1: s += FEED_BETA * WF1 * _feedback_prob(1, ctx1[:-1}, c)
+        if len(ctx2)==2: s += FEED_BETA * WF2 * _feedback_prob(2, ctx2[:-1], c)
+        if len(ctx1)==1: s += FEED_BETA * WF1 * _feedback_prob(1, ctx1[:-1], c)
         scores[c] = s
     tot = sum(scores.values()) or 1e-9
     return {k: v/tot for k,v in scores.items()}
