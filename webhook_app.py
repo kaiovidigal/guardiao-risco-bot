@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.4.1 (com GEN_AUTO)
+webhook_app.py — v4.4.1 (cadeia ativável)
 - Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
-- "ANALISANDO": aprende sequência e pode adiantar fechamento
-- GEN_AUTO: abre sozinho quando achar uma sequência no texto (mesmo sem 'ENTRADA CONFIRMADA')
+- "ANALISANDO": aprende sequência, pode abrir e pode adiantar fechamento
 - Placar zera todo dia às 00:00 (fuso TZ_NAME, default America/Sao_Paulo)
+- (NOVO) CHAIN_ON: após fechar, abre automaticamente um novo sinal
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
-                  TZ_NAME, GEN_AUTO
+                  TZ_NAME, CHAIN_ON
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 import os, re, time, sqlite3, math, json
@@ -38,7 +38,6 @@ SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtr
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip() in ("1","true","True","yes","YES")
 BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip() in ("1","true","True","yes","YES")
-GEN_AUTO       = os.getenv("GEN_AUTO", "1").strip() in ("1","true","True","yes","YES")  # <— NOVO
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ===== LLM (IA local tipo ChatGPT) =====
@@ -48,6 +47,9 @@ LLM_CTX_TOKENS = int(os.getenv("LLM_CTX_TOKENS", "2048"))
 LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
 LLM_TEMP       = float(os.getenv("LLM_TEMP", "0.2"))
 LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.95"))
+
+# ===== Encadeamento (novo) =====
+CHAIN_ON       = os.getenv("CHAIN_ON", "1").strip() in ("1","true","True","yes","YES")
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
@@ -117,7 +119,7 @@ def _connect() -> sqlite3.Connection:
 
 def _column_exists(con: sqlite3.Connection, table: str, col: str) -> bool:
     r = con.execute(f"PRAGMA table_info({table})").fetchall()
-    return any((row["name"] if isinstance(row, sqlite3.Row) else row[1]) == col for row in r)
+    return any((row["name"] if isinstance(row, sqlite3.Row) else row[1]) == col for col in r)
 
 @contextmanager
 def _tx():
@@ -430,8 +432,8 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
         if len(ctx1)==1: s += W1 * _prob_from_ngrams(ctx1[:-1], c)
         if len(ctx4)==4: s += FEED_BETA * WF4 * _feedback_prob(4, ctx4[:-1], c)
         if len(ctx3)==3: s += FEED_BETA * WF3 * _feedback_prob(3, ctx3[:-1], c)
-        if len(ctx2)==2: s += FEED_BETA * WF2 * _feedback_prob(2, ctx2[:-1], c)
-        if len(ctx1)==1: s += FEED_BETA * WF1 * _feedback_prob(1, ctx1[:-1], c)
+        if len(ctx2)==2: s += FEED_BETA * WF2 * _feedback_prob(2, ctx2[:-1}, c)
+        if len(ctx1)==1: s += FEED_BETA * WF1 * _feedback_prob(1, ctx1[:-1}, c)
         scores[c] = s
     tot = sum(scores.values()) or 1e-9
     return {k: v/tot for k,v in scores.items()}
@@ -628,52 +630,6 @@ def parse_analise_seq(text: str) -> List[int]:
         return []
     return [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
 
-# ======== GEN AUTO (aprender/abrir a partir de sequência mesmo sem "ENTRADA") ========
-GEN_SEQ_FALLBACK_RX = re.compile(r"Sequ[eê]ncia\s*:\s*([^\n\r]+)", re.I)
-GEN_PIPE_SEQ_RX     = re.compile(r"(?:^|\b)([1-4](?:\s*[\|\-,\s]\s*[1-4]){1,10})")
-def _only_1234_list(s: str) -> List[int]:
-    t = _normalize_keycaps(s or "")
-    return [int(x) for x in re.findall(r"[1-4]", t)]
-
-def _extract_seq_any(text: str) -> List[int]:
-    t = _normalize_keycaps(text or "")
-    m = GEN_SEQ_FALLBACK_RX.search(t)
-    if m:
-        seq = _only_1234_list(m.group(1))
-        if seq:
-            return seq
-    m2 = GEN_PIPE_SEQ_RX.search(t)
-    if m2:
-        seq = _only_1234_list(m2.group(1))
-        if seq:
-            return seq
-    return []
-
-async def _maybe_open_gen_auto(text: str):
-    """Aprende sequência e abre sugestão mesmo sem ENTRADA CONFIRMADA."""
-    seq = _extract_seq_any(text)
-    if not seq:
-        return {"ok": True, "gen_auto": "no_seq"}
-    append_seq(seq)  # aprende padrão
-    if get_open_pending():
-        return {"ok": True, "gen_auto": "pending_open"}
-    mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
-    after = int(mafter.group(1)) if mafter else None
-    best, conf, samples, post, gap, reason = choose_single_number(after)
-    ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
-    opened = _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4)
-    if not opened:
-        return {"ok": True, "gen_auto": "race_lost"}
-    aft_txt = f" após {after}" if after else ""
-    txt = (
-        f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
-        f"🧩 <b>Padrão:</b> GEN{aft_txt} (auto)\n"
-        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-        f"🧠 <b>Modo:</b> {reason}"
-    )
-    await tg_send_text(TARGET_CHANNEL, txt)
-    return {"ok": True, "posted_auto": True, "best": best}
-
 # ========= Pending helpers =========
 def get_open_pending() -> Optional[sqlite3.Row]:
     con = _connect()
@@ -852,6 +808,27 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     except Exception:
         pass
 
+# ========= Helpers de abertura automática (cadeia) =========
+async def _open_suggestion(after: Optional[int], origin_tag: str):
+    """Abre a sugestão com o motor atual, se não houver pendência."""
+    if get_open_pending():
+        return {"ok": True, "skipped": "pending_open"}
+
+    best, conf, samples, post, gap, reason = choose_single_number(after)
+    ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
+    if not _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
+        return {"ok": True, "skipped": "race_lost"}
+
+    aft_txt = f" após {after}" if after else ""
+    txt = (
+        f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
+        f"🧩 <b>Padrão:</b> GEN{aft_txt} ({origin_tag})\n"
+        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
+        f"🧠 <b>Modo:</b> {reason}"
+    )
+    await tg_send_text(TARGET_CHANNEL, txt)
+    return {"ok": True, "posted": True, "best": best}
+
 # ========= Rotas =========
 @app.get("/")
 async def root():
@@ -901,15 +878,23 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 0) ANALISANDO — aprender e ADIANTAR FECHAMENTO (sem abrir/fechar por si só)
+    # 0) ANALISANDO — aprende, pode abrir, e pode adiantar/fechar
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
         seq = parse_analise_seq(text)
         if seq:
             append_seq(seq)  # aprende padrão
+
+            # (novo) se não houver pendência, abre a partir do ANALISANDO
+            if not get_open_pending():
+                mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
+                after = int(mafter.group(1)) if mafter else None
+                r_open = await _open_suggestion(after, origin_tag="analise")
+                if r_open.get("posted"):
+                    return r_open
+
+            # se houver pendência, tentar adiantar e fechar
             pend = get_open_pending()
             if pend:
-                # usar até completar 3 observados
-                to_add = []
                 cur_seen = _seen_list(pend)
                 need = 3 - len(cur_seen)
                 if need > 0:
@@ -925,6 +910,11 @@ async def webhook(token: str, request: Request):
                             final_seen = "-".join(cur_seen[:3])
                             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                             await tg_send_text(TARGET_CHANNEL, out_msg)
+                            # (novo) cadeia: abrir outro após fechar
+                            if CHAIN_ON:
+                                mafter2 = AFTER_RX.search(_normalize_keycaps(text or ""))
+                                after2 = int(mafter2.group(1)) if mafter2 else None
+                                return await _open_suggestion(after2, origin_tag="analise_after_close")
                             return {"ok": True, "closed_from_analise": True, "seen": final_seen}
         return {"ok": True, "analise_seen": len(seq)}
 
@@ -940,7 +930,7 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 2) Fechamentos do fonte (GREEN/LOSS)
+    # 2) Fechamentos do fonte (GREEN/LOSS) — fecha e (opcional) abre novo em cadeia
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
@@ -956,18 +946,18 @@ async def webhook(token: str, request: Request):
                 final_seen = "-".join(seen_list[:3])
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                 await tg_send_text(TARGET_CHANNEL, out_msg)
+
+                # (novo) cadeia: abre um novo logo após fechar
+                if CHAIN_ON:
+                    mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
+                    after = int(mafter.group(1)) if mafter else None
+                    return await _open_suggestion(after, origin_tag="after_close")
                 return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
-    # 3) Nova ENTRADA CONFIRMADA (Fluxo estrito)
+    # 3) Nova ENTRADA CONFIRMADA (Fluxo estrito) — abre; fechamento na próxima msg
     parsed = parse_entry_text(text)
     if not parsed:
-        # >>> NOVO: se não reconheceu entrada/fechamento, tentar GEN_AUTO <<<
-        if GEN_AUTO:
-            r = await _maybe_open_gen_auto(text)
-            if DEBUG_MSG and r.get("gen_auto") in ("no_seq", "pending_open"):
-                await tg_send_text(TARGET_CHANNEL, f"DEBUG: GEN_AUTO={r.get('gen_auto')}")
-            return r
         if DEBUG_MSG:
             await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
@@ -993,7 +983,7 @@ async def webhook(token: str, request: Request):
     after = parsed["after"]
     best, conf, samples, post, gap, reason = choose_single_number(after)
 
-    # Abertura (ALWAYS_ENTER=True)
+    # Abertura
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
     opened = _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4)
     if not opened:
