@@ -71,7 +71,7 @@ H_MAX       = 0.85
 FREQ_WINDOW = 120
 
 # ======== Cooldown após RED (sem cortar fluxo) ========
-COOLDOWN_N     = 3
+COOLDOWN_N     = 4
 CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
@@ -79,7 +79,7 @@ CD_GAP_BOOST   = 0.03
 ALWAYS_ENTER = True
 
 # ======== Online Learning (feedback) ========
-FEED_BETA   = 0.45
+FEED_BETA   = 0.40
 FEED_POS    = 0.70
 FEED_NEG    = 1.20
 FEED_DECAY  = 0.995
