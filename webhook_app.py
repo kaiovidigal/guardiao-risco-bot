@@ -829,7 +829,7 @@ async def _open_suggestion(after: Optional[int], origin_tag: str):
     if not _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
         return {"ok": True, "skipped": "race_lost"}
 
-    aft_txt = f" após {after}" if after else ""
+    aft_txt = f" após {after}" if after else " após último"
 ls = _get_loss_streak()
 txt = (
     f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
