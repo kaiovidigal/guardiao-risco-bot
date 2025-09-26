@@ -117,9 +117,11 @@ def _connect() -> sqlite3.Connection:
     con.execute("PRAGMA busy_timeout=10000;")
     return con
 
-def _column_exists(con: sqlite3.Connection, table: str, col: str) -> bool:
-    r = con.execute(f"PRAGMA table_info({table})").fetchall()
-    return any((row["name"] if isinstance(row, sqlite3.Row) else row[1]) == col for row in r)
+def _ensure_column(con: sqlite3.Connection, table: str, col: str, decl: str):
+    rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+    names = {(r["name"] if isinstance(r, sqlite3.Row) else r[1]) for r in rows}
+    if col not in names:
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 @contextmanager
 def _tx():
@@ -156,10 +158,17 @@ def migrate_db():
         open INTEGER DEFAULT 1,
         seen TEXT,
         opened_at INTEGER,
-        "after" INTEGER,
+        after INTEGER,
         ctx1 TEXT, ctx2 TEXT, ctx3 TEXT, ctx4 TEXT,
         wait_notice_sent INTEGER DEFAULT 0
     )""")
+    _ensure_column(con, "pending", "after", "INTEGER")
+    _ensure_column(con, "pending", "ctx1", "TEXT")
+    _ensure_column(con, "pending", "ctx2", "TEXT")
+    _ensure_column(con, "pending", "ctx3", "TEXT")
+    _ensure_column(con, "pending", "ctx4", "TEXT")
+    _ensure_column(con, "pending", "wait_notice_sent", "INTEGER DEFAULT 0")
+
     # score
     cur.execute("""CREATE TABLE IF NOT EXISTS score (
         id INTEGER PRIMARY KEY CHECK (id=1),
@@ -169,16 +178,19 @@ def migrate_db():
     row = con.execute("SELECT 1 FROM score WHERE id=1").fetchone()
     if not row:
         cur.execute("INSERT INTO score (id, green, loss) VALUES (1,0,0)")
+
     # feedback
     cur.execute("""CREATE TABLE IF NOT EXISTS feedback (
         n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
         PRIMARY KEY (n, ctx, nxt)
     )""")
+
     # processed (dedupe)
     cur.execute("""CREATE TABLE IF NOT EXISTS processed (
         update_id TEXT PRIMARY KEY,
         seen_at   INTEGER NOT NULL
     )""")
+
     # state
     cur.execute("""CREATE TABLE IF NOT EXISTS state (
         id INTEGER PRIMARY KEY CHECK (id=1),
@@ -189,7 +201,8 @@ def migrate_db():
     row = con.execute("SELECT 1 FROM state WHERE id=1").fetchone()
     if not row:
         cur.execute("INSERT INTO state (id, cooldown_left, loss_streak, last_reset_ymd) VALUES (1,0,0,'')")
-    # expert weights (4 especialistas p/ LLM)
+
+    # expert weights
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
         w1 REAL NOT NULL,
@@ -199,12 +212,10 @@ def migrate_db():
     )""")
     row = con.execute("SELECT 1 FROM expert_w WHERE id=1").fetchone()
     if not row:
-        cur.execute("INSERT INTO expert_w (id, w1, w2, w3, w4) VALUES (1, 1.0, 1.0, 1.0, 1.0)")
+        cur.execute("INSERT INTO expert_w (id, w1, w2, w3, w4) VALUES (1,1.0,1.0,1.0,1.0)")
     else:
-        try:
-            con.execute("ALTER TABLE expert_w ADD COLUMN w4 REAL NOT NULL DEFAULT 1.0")
-        except sqlite3.OperationalError:
-            pass
+        _ensure_column(con, "expert_w", "w4", "REAL NOT NULL DEFAULT 1.0")
+
     con.commit(); con.close()
 migrate_db()
 
@@ -622,7 +633,6 @@ def parse_close_numbers(text: str) -> List[int]:
     return [int(x) for x in nums][:3]
 
 def parse_analise_seq(text: str) -> List[int]:
-    """Extrai sequência 1..4 de mensagens 'ANALISANDO'."""
     if not ANALISANDO_RX.search(_normalize_keycaps(text or "")):
         return []
     mseq = SEQ_RX.search(_normalize_keycaps(text or ""))
@@ -884,7 +894,7 @@ async def webhook(token: str, request: Request):
         if seq:
             append_seq(seq)  # aprende padrão
 
-            # (novo) se não houver pendência, abre a partir do ANALISANDO
+            # se não houver pendência, pode abrir a partir do ANALISANDO
             if not get_open_pending():
                 mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
                 after = int(mafter.group(1)) if mafter else None
@@ -910,7 +920,6 @@ async def webhook(token: str, request: Request):
                             final_seen = "-".join(cur_seen[:3])
                             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                             await tg_send_text(TARGET_CHANNEL, out_msg)
-                            # (novo) cadeia: abrir outro após fechar
                             if CHAIN_ON:
                                 mafter2 = AFTER_RX.search(_normalize_keycaps(text or ""))
                                 after2 = int(mafter2.group(1)) if mafter2 else None
@@ -930,7 +939,7 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
         return {"ok": True, "noted": "g2"}
 
-    # 2) Fechamentos do fonte (GREEN/LOSS) — fecha e (opcional) abre novo em cadeia
+    # 2) Fechamentos do fonte (GREEN/LOSS)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
@@ -946,8 +955,6 @@ async def webhook(token: str, request: Request):
                 final_seen = "-".join(seen_list[:3])
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                 await tg_send_text(TARGET_CHANNEL, out_msg)
-
-                # (novo) cadeia: abre um novo logo após fechar
                 if CHAIN_ON:
                     mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
                     after = int(mafter.group(1)) if mafter else None
@@ -955,14 +962,14 @@ async def webhook(token: str, request: Request):
                 return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
-    # 3) Nova ENTRADA CONFIRMADA (Fluxo estrito) — abre; fechamento na próxima msg
+    # 3) Nova ENTRADA CONFIRMADA (Fluxo estrito)
     parsed = parse_entry_text(text)
     if not parsed:
         if DEBUG_MSG:
             await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
-    # se existir pendência e estiver incompleta, NÃO abre novo (sem avisos)
+    # se existir pendência incompleta, NÃO abre novo
     pend = get_open_pending()
     if pend:
         seen_list = _seen_list(pend)
