@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.4.1 (cadeia ativável)
+webhook_app.py — v4.4.1 (cadeia ativável) — FIX
 - Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
 - "ANALISANDO": aprende sequência, pode abrir e pode adiantar fechamento
@@ -824,19 +824,23 @@ async def _open_suggestion(after: Optional[int], origin_tag: str):
     if get_open_pending():
         return {"ok": True, "skipped": "pending_open"}
 
+    # roda o motor e calcula contexto
     best, conf, samples, post, gap, reason = choose_single_number(after)
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
+
+    # abre pendência de forma transacional
     if not _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
         return {"ok": True, "skipped": "race_lost"}
 
+    # (FIX) tudo abaixo faz parte da função (indentação correta)
     aft_txt = f" após {after}" if after else ""
-
-txt = (
-    f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
-    f"🧩 <b>Padrão:</b> GEN{aft_txt} ({reason})\n"
-    f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-    f"🧠 <b>Modo:</b> IA | <b>streak RED:</b> {ls}"
-)
+    ls = _get_loss_streak()
+    txt = (
+        f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
+        f"🧩 <b>Padrão:</b> GEN{aft_txt} ({reason})\n"
+        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
+        f"🧠 <b>Modo:</b> IA | <b>streak RED:</b> {ls}"
+    )
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best}
 
@@ -856,6 +860,7 @@ async def health():
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
+    # aceita apenas /webhook/WEBHOOK_TOKEN (ex.: /webhook/meusegredo123)
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
