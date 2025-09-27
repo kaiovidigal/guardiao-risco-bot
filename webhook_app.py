@@ -65,13 +65,13 @@ W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 
 # ======== Gates (não bloqueiam abertura) ========
-CONF_MIN    = 0.14
-GAP_MIN     = 0.12
+CONF_MIN    = 0.70
+GAP_MIN     = 0.13
 H_MAX       = 0.85
-FREQ_WINDOW = 100
+FREQ_WINDOW = 90
 
 # ======== Cooldown após RED (sem cortar fluxo) ========
-COOLDOWN_N     = 4
+COOLDOWN_N     = 5
 CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
@@ -80,7 +80,7 @@ ALWAYS_ENTER = True
 
 # ======== Online Learning (feedback) ========
 FEED_BETA   = 0.40
-FEED_POS    = 0.70
+FEED_POS    = 0.60
 FEED_NEG    = 1.20
 FEED_DECAY  = 0.995
 WF4, WF3, WF2, WF1 = W4, W3, W2, W1
