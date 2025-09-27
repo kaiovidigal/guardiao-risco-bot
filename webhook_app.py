@@ -919,22 +919,24 @@ async def _open_suggestion(after: Optional[int], origin_tag: str):
     if get_open_pending():
         return {"ok": True, "skipped": "pending_open"}
 
-    # v4.4.x retorna (best, conf, samples, post, gap, reason)
+    # v4.4.x — retorna (best, conf, samples, post, gap, reason)
     best, conf, samples, post, gap, reason = choose_single_number(after)
 
     # salva os contextos usados na decisão
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
-            if not _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
+    if not _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
         return {"ok": True, "skipped": "race_lost"}
 
-    # --- tudo abaixo agora está dentro da função ---
+    # --- tudo abaixo precisa estar INDENTADO dentro da função ---
     aft_txt = f" após {after}" if after else ""
-    ls = _get_loss_streak()
+    ls = _get_loss_streak()  # pega a streak de REDs para exibir
+
     txt = (
         f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
-        f"🧩 <b>Padrão:</b> GEN{aft_txt} ({reason})\n"
+        f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-        f"🧠 <b>Modo:</b> IA | <b>streak RED:</b> {ls}"
+        f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}\n"
+        f"🔗 <i>origem: {origin_tag}</i>"
     )
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best}
