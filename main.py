@@ -4,31 +4,29 @@
 # e expõe /set_webhook para configurar o webhook no Telegram.
 
 import os
-import json
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Query
 
 app = FastAPI(title="telegram-webhook-min", version="1.0.0")
 
-# --- Env vars obrigatórias/úteis ---
+# --- Variáveis de ambiente ---
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()  # ex.: "meusegredo123"
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # ex.: "-1003052132833" (opcional: se vazio, aceita todos)
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()  # ex.: "-1002796105884" (recomendado)
+WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "meusegredo123").strip()
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()   # opcional
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip()   # obrigatório
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
 if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 if not TARGET_CHANNEL:
-    # dá pra funcionar sem, mas quase sempre você quer um destino
     raise RuntimeError("Defina TARGET_CHANNEL no ambiente (ex.: -1002796105884).")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ---------- Utils ----------
 async def tg_send_text(chat_id: str, text: str):
-    """Envia texto simples (HTML) pro Telegram."""
+    """Envia texto simples pro Telegram."""
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -71,7 +69,6 @@ async def set_webhook(host: str = Query(..., description="Ex.: https://guardiao-
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
-        # token errado => 403
         raise HTTPException(status_code=403, detail="Forbidden (bad token)")
 
     try:
@@ -79,28 +76,22 @@ async def telegram_webhook(token: str, request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Você verá o update nos logs do Render (útil pra depurar)
-    # print(json.dumps(update, ensure_ascii=False))
+    # debug nos logs
+    print("📩 Recebido:", update)
 
-    # Pegamos texto de "message" ou "channel_post"
     msg = update.get("channel_post") or update.get("message") or {}
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
 
-    # Se SOURCE_CHANNEL estiver setado, só aceita post desse channel
     if SOURCE_CHANNEL and chat_id != SOURCE_CHANNEL:
         return {"ok": True, "ignored": "not-from-source", "chat_id": chat_id}
 
-    # Texto ou caption (para mídia)
     text = (msg.get("text") or msg.get("caption") or "").strip()
     if not text:
-        # Se quiser, você pode tratar fotos/documentos aqui também.
         return {"ok": True, "skipped": "no-text"}
 
-    # Repassa para TARGET_CHANNEL
     try:
         await tg_send_text(TARGET_CHANNEL, text)
         return {"ok": True, "relayed_to": TARGET_CHANNEL}
     except httpx.HTTPError as e:
-        # Se o bot não é admin do canal destino, isso vai falhar
         raise HTTPException(status_code=500, detail=f"Telegram send failed: {e}")
