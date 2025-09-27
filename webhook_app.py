@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.5.1-g6 (7 especialistas + cadeia + anti-tilt)
-- Fluxo estrito (1 pendência por vez) + Anti-tilt sem cortar sinais
+webhook_app.py — v4.4.1 (cadeia ativável)
+- Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
-- 3 novos especialistas: repetição, paridade/vizinhança, gap/atraso
-- "ANALISANDO": aprende sequência, pode adiantar fechamento (nunca abre novo se já houver pendência)
+- "ANALISANDO": aprende sequência, pode abrir e pode adiantar fechamento
 - Placar zera todo dia às 00:00 (fuso TZ_NAME, default America/Sao_Paulo)
-- CHAIN_ON: após fechar, abre automaticamente um novo sinal (só depois do fechamento)
-- Suporte até G6 (7 observações: G0..G6)
+- (NOVO) CHAIN_ON: após fechar, abre automaticamente um novo sinal
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
                   TZ_NAME, CHAIN_ON
-
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 import os, re, time, sqlite3, math, json
@@ -27,7 +24,7 @@ TZ_NAME = os.getenv("TZ_NAME", "America/Sao_Paulo").strip()
 try:
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo(TZ_NAME)
-except ImportError:
+except Exception:
     _TZ = timezone.utc
 
 import httpx
@@ -36,23 +33,23 @@ from fastapi import FastAPI, Request, HTTPException
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()  # postar
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()  # origem (se vazio, não filtra)
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
-DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip().lower() in ("1","true","yes")
-BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip().lower() in ("1","true","yes")
+DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip() in ("1","true","True","yes","YES")
+BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip() in ("1","true","True","yes","YES")
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ===== LLM (IA local tipo ChatGPT) =====
-LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip().lower() in ("1","true","yes")
+LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip() in ("1","true","True","yes","YES")
 LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "models/phi-3-mini.gguf").strip()
 LLM_CTX_TOKENS = int(os.getenv("LLM_CTX_TOKENS", "2048"))
 LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
 LLM_TEMP       = float(os.getenv("LLM_TEMP", "0.2"))
 LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.95"))
 
-# ===== Encadeamento =====
-CHAIN_ON       = os.getenv("CHAIN_ON", "1").strip().lower() in ("1","true","yes")
+# ===== Encadeamento (novo) =====
+CHAIN_ON       = os.getenv("CHAIN_ON", "1").strip() in ("1","true","True","yes","YES")
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
@@ -60,23 +57,17 @@ if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
 # ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.5.1-g6")
+app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.1")
 
 # ========= Parâmetros =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
-# Novos pesos (observacionais)
-W5, W6, W7 = 0.10, 0.10, 0.10
-OBS_TIMEOUT_SEC = 240  # timeout: se faltar 1 observação, completa e fecha
-
-# ======== Limites de gales/observações ========
-MAX_G   = 6                 # até G6
-OBS_MAX = MAX_G + 1         # nº total de observações (G0..G6) = 7
+OBS_TIMEOUT_SEC = 240  # fecha por timeout só se já houver 2 observados
 
 # ======== Gates (não bloqueiam abertura) ========
 CONF_MIN    = 0.70
-GAP_MIN     = 0.12
-H_MAX       = 0.80
+GAP_MIN     = 0.13
+H_MAX       = 0.85
 FREQ_WINDOW = 90
 
 # ======== Cooldown após RED (sem cortar fluxo) ========
@@ -85,11 +76,11 @@ CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
 # ======== Modo "sempre entrar" ========
-ALWAYS_ENTER = True  # fluxo estrito = 1 pendência por vez, sem cortar sinal
+ALWAYS_ENTER = True
 
 # ======== Online Learning (feedback) ========
 FEED_BETA   = 0.40
-FEED_POS    = 0.70
+FEED_POS    = 0.60
 FEED_NEG    = 1.20
 FEED_DECAY  = 0.995
 WF4, WF3, WF2, WF1 = W4, W3, W2, W1
@@ -128,7 +119,7 @@ def _connect() -> sqlite3.Connection:
 
 def _ensure_column(con: sqlite3.Connection, table: str, col: str, decl: str):
     rows = con.execute(f"PRAGMA table_info({table})").fetchall()
-    names = {r["name"] for r in rows}
+    names = {(r["name"] if isinstance(r, sqlite3.Row) else r[1]) for r in rows}
     if col not in names:
         con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
@@ -167,7 +158,7 @@ def migrate_db():
         open INTEGER DEFAULT 1,
         seen TEXT,
         opened_at INTEGER,
-        "after" INTEGER,
+        after INTEGER,
         ctx1 TEXT, ctx2 TEXT, ctx3 TEXT, ctx4 TEXT,
         wait_notice_sent INTEGER DEFAULT 0
     )""")
@@ -222,11 +213,8 @@ def migrate_db():
     row = con.execute("SELECT 1 FROM expert_w WHERE id=1").fetchone()
     if not row:
         cur.execute("INSERT INTO expert_w (id, w1, w2, w3, w4) VALUES (1,1.0,1.0,1.0,1.0)")
-    # garante novas colunas p/ 7 especialistas
-    _ensure_column(con, "expert_w", "w4", "REAL NOT NULL DEFAULT 1.0")
-    _ensure_column(con, "expert_w", "w5", "REAL NOT NULL DEFAULT 1.0")
-    _ensure_column(con, "expert_w", "w6", "REAL NOT NULL DEFAULT 1.0")
-    _ensure_column(con, "expert_w", "w7", "REAL NOT NULL DEFAULT 1.0")
+    else:
+        _ensure_column(con, "expert_w", "w4", "REAL NOT NULL DEFAULT 1.0")
 
     con.commit(); con.close()
 migrate_db()
@@ -438,7 +426,7 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]
         i = idxs[-1]
-        ctx1 = tail[i:i+1]
+        ctx1 = tail[max(0,i):i+1]
         ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
         ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
         ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
@@ -460,59 +448,6 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
         scores[c] = s
     tot = sum(scores.values()) or 1e-9
     return {k: v/tot for k,v in scores.items()}
-
-# ========= NOVOS ESPECIALISTAS (5, 6, 7) =========
-def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
-    s = sum(d.values()) or 1e-9
-    return {k: v/s for k,v in d.items()}
-
-def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
-    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    win = tail[-k:] if len(tail) >= k else tail
-    tot = max(1, len(win))
-    return _norm_dict({c: win.count(c)/tot for c in [1,2,3,4]})
-
-def _repetition_expert(tail: List[int]) -> Dict[int, float]:
-    probs = {1:0.25,2:0.25,3:0.25,4:0.25}
-    if len(tail) < 3: return probs
-    last3 = tail[-3:]
-    # padrão A-B-A → favorece B
-    if last3[0] == last3[2]:
-        probs[last3[1]] += 0.10
-    # exemplo específico (ajuste leve)
-    if tail[-3:] == [1,2,1]:
-        probs[3] += 0.20; probs[4] += 0.20
-    return _norm_dict(probs)
-
-def _parity_freq_expert(tail: List[int]) -> Dict[int, float]:
-    probs = {1:0.25,2:0.25,3:0.25,4:0.25}
-    if not tail: return probs
-    win = tail[-20:] if len(tail) >= 20 else tail
-    odd = sum(1 for x in win if x in (1,3))
-    even = len(win) - odd
-    # pares dominando → favorece ímpares
-    if even > odd + 3:
-        probs[1] += 0.10; probs[3] += 0.10
-        probs[2] -= 0.10; probs[4] -= 0.10
-    elif odd > even + 3:
-        probs[2] += 0.10; probs[4] += 0.10
-        probs[1] -= 0.10; probs[3] -= 0.10
-    return _norm_dict(probs)
-
-def _gap_analysis_expert(tail: List[int]) -> Dict[int, float]:
-    probs = {1:0.25,2:0.25,3:0.25,4:0.25}
-    if len(tail) < 50: return probs
-    win = tail[-50:]
-    last_idx = {1:None,2:None,3:None,4:None}
-    for i in range(len(win)-1, -1, -1):
-        n = win[i]
-        if last_idx[n] is None:
-            last_idx[n] = i
-    gaps = {k: (len(win)-1 - v if v is not None else len(win)) for k,v in last_idx.items()}
-    most_overdue = max(gaps, key=gaps.get)
-    if gaps[most_overdue] > 10:
-        probs[most_overdue] += 0.20
-    return _norm_dict(probs)
 
 # ========= LLM local (Especialista 4) =========
 try:
@@ -578,40 +513,46 @@ def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
     except Exception:
         return {}
 
-# ========= Ensemble (Hedge) — 7 especialistas =========
+# ========= Ensemble (Hedge) — 4 especialistas =========
+def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
+    s = sum(d.values()) or 1e-9
+    return {k: v/s for k,v in d.items()}
+
+def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
+    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    win = tail[-k:] if len(tail) >= k else tail
+    tot = max(1, len(win))
+    return _norm_dict({c: win.count(c)/tot for c in [1,2,3,4]})
+
 def _get_expert_w():
     con = _connect()
-    row = con.execute("SELECT w1,w2,w3,w4,w5,w6,w7 FROM expert_w WHERE id=1").fetchone()
+    row = con.execute("SELECT w1,w2,w3,w4 FROM expert_w WHERE id=1").fetchone()
     con.close()
-    if not row: return (1.0,1.0,1.0,1.0,1.0,1.0,1.0)
-    return (float(row["w1"]), float(row["w2"]), float(row["w3"]),
-            float(row["w4"]), float(row["w5"]), float(row["w6"]), float(row["w7"]))
+    if not row: return (1.0, 1.0, 1.0, 1.0)
+    return float(row["w1"]), float(row["w2"]), float(row["w3"]), float(row["w4"])
 
-def _set_expert_w(w1, w2, w3, w4, w5, w6, w7):
-    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=?, w4=?, w5=?, w6=?, w7=? WHERE id=1",
-                (float(w1), float(w2), float(w3), float(w4), float(w5), float(w6), float(w7)))
+def _set_expert_w(w1, w2, w3, w4):
+    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=?, w4=? WHERE id=1",
+                (float(w1), float(w2), float(w3), float(w4)))
 
-def _hedge_blend7(p1, p2, p3, p4, p5, p6, p7):
-    w1, w2, w3, w4, w5, w6, w7 = _get_expert_w()
-    S = (w1 + w2 + w3 + w4 + w5 + w6 + w7) or 1e-9
-    ws = [w1/S, w2/S, w3/S, w4/S, w5/S, w6/S, w7/S]
-    blended = {c: ws[0]*p1.get(c,0)+ws[1]*p2.get(c,0)+ws[2]*p3.get(c,0)+ws[3]*p4.get(c,0)+ws[4]*p5.get(c,0)+ws[5]*p6.get(c,0)+ws[6]*p7.get(c,0) for c in [1,2,3,4]}
+def _hedge_blend4(p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float], p4:Dict[int,float]):
+    w1, w2, w3, w4 = _get_expert_w()
+    S = (w1 + w2 + w3 + w4) or 1e-9
+    w1, w2, w3, w4 = (w1/S, w2/S, w3/S, w4/S)
+    blended = {c: w1*p1.get(c,0)+w2*p2.get(c,0)+w3*p3.get(c,0)+w4*p4.get(c,0) for c in [1,2,3,4]}
     s2 = sum(blended.values()) or 1e-9
-    return {k: v/s2 for k,v in blended.items()}, tuple(ws)
+    return {k: v/s2 for k,v in blended.items()}, (w1,w2,w3,w4)
 
-def _hedge_update7(true_c:int, p1, p2, p3, p4, p5, p6, p7):
-    w1, w2, w3, w4, w5, w6, w7 = _get_expert_w()
+def _hedge_update4(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float], p4:Dict[int,float]):
+    w1, w2, w3, w4 = _get_expert_w()
+    l = lambda p: 1.0 - p.get(true_c, 0.0)
     from math import exp
-    def loss(p): return 1.0 - p.get(true_c, 0.0)
-    w1 *= exp(-HEDGE_ETA * loss(p1))
-    w2 *= exp(-HEDGE_ETA * loss(p2))
-    w3 *= exp(-HEDGE_ETA * loss(p3))
-    w4 *= exp(-HEDGE_ETA * loss(p4))
-    w5 *= exp(-HEDGE_ETA * loss(p5))
-    w6 *= exp(-HEDGE_ETA * loss(p6))
-    w7 *= exp(-HEDGE_ETA * loss(p7))
-    S = (w1 + w2 + w3 + w4 + w5 + w6 + w7) or 1e-9
-    _set_expert_w(w1/S, w2/S, w3/S, w4/S, w5/S, w6/S, w7/S)
+    w1n = w1 * exp(-HEDGE_ETA * (1.0 - l(p1)))
+    w2n = w2 * exp(-HEDGE_ETA * (1.0 - l(p2)))
+    w3n = w3 * exp(-HEDGE_ETA * (1.0 - l(p3)))
+    w4n = w4 * exp(-HEDGE_ETA * (1.0 - l(p4)))
+    S = (w1n + w2n + w3n + w4n) or 1e-9
+    _set_expert_w(w1n/S, w2n/S, w3n/S, w4n/S)
 
 # ========= Anti-tilt (sem reduzir sinais) =========
 def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
@@ -633,16 +574,11 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
 
 def choose_single_number(after: Optional[int]):
     tail = get_tail(400)
-    post_e1 = _post_from_tail(tail, after)          # n-grama + feedback
-    post_e2 = _post_freq_k(tail, K_SHORT)           # freq curta
-    post_e3 = _post_freq_k(tail, K_LONG)            # freq longa
+    post_e1 = _post_from_tail(tail, after)         # n-grama + feedback
+    post_e2 = _post_freq_k(tail, K_SHORT)          # freq curta
+    post_e3 = _post_freq_k(tail, K_LONG)           # freq longa
     post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}  # IA local
-    # Novos especialistas
-    post_e5 = _repetition_expert(tail)
-    post_e6 = _parity_freq_expert(tail)
-    post_e7 = _gap_analysis_expert(tail)
-
-    post, _ = _hedge_blend7(post_e1, post_e2, post_e3, post_e4, post_e5, post_e6, post_e7)
+    post, (w1,w2,w3,w4) = _hedge_blend4(post_e1, post_e2, post_e3, post_e4)
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     top2 = ranking[:2]
     gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
@@ -653,19 +589,15 @@ def choose_single_number(after: Optional[int]):
     conf = float(post_adj[best])
     r2 = sorted(post_adj.items(), key=lambda kv: kv[1], reverse=True)[:2]
     gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
-    return best, conf, timeline_size(), post_adj, gap2, reason, ls
+    return best, conf, timeline_size(), post_adj, gap2, reason
 
 # ========= Parse (com keycaps e ANALISANDO) =========
-ENTRY_RX       = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-SEQ_RX         = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-AFTER_RX       = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-ANALISANDO_RX  = re.compile(r"\bANALISANDO\b", re.I)
+ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
+SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-GALE3_RX = re.compile(r"Estamos\s+no\s*3[ºo]\s*gale", re.I)
-GALE4_RX = re.compile(r"Estamos\s+no\s*4[ºo]\s*gale", re.I)
-GALE5_RX = re.compile(r"Estamos\s+no\s*5[ºo]\s*gale", re.I)
-GALE6_RX = re.compile(r"Estamos\s+no\s*6[ºo]\s*gale", re.I)
+ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
 
 GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
 LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
@@ -696,9 +628,9 @@ def parse_close_numbers(text: str) -> List[int]:
     if groups:
         last = groups[-1]
         nums = re.findall(r"[1-4]", _normalize_keycaps(last))
-        return [int(x) for x in nums][:OBS_MAX]
+        return [int(x) for x in nums][:3]
     nums = ANY_14_RX.findall(t)
-    return [int(x) for x in nums][:OBS_MAX]
+    return [int(x) for x in nums][:3]
 
 def parse_analise_seq(text: str) -> List[int]:
     if not ANALISANDO_RX.search(_normalize_keycaps(text or "")):
@@ -726,21 +658,20 @@ def _seen_list(row: sqlite3.Row) -> List[str]:
 def _seen_append(row: sqlite3.Row, new_items: List[str]):
     cur_seen = _seen_list(row)
     for it in new_items:
-        if len(cur_seen) >= OBS_MAX: break
+        if len(cur_seen) >= 3: break
         if it not in cur_seen:
             cur_seen.append(it)
-    seen_txt = "-".join(cur_seen[:OBS_MAX])
+    seen_txt = "-".join(cur_seen[:3])
     with _tx() as con:
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
 
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
-    """Retorna (outcome, labelG) considerando até G6 (OBS_MAX=7)."""
     if not obs:
-        return ("LOSS", f"G{MAX_G}")
-    for k in range(min(len(obs), OBS_MAX)):
-        if obs[k] == suggested:
-            return ("GREEN", f"G{k}")
-    return ("LOSS", f"G{MAX_G}")
+        return ("LOSS", "G2")
+    if len(obs) >= 1 and obs[0] == suggested: return ("GREEN", "G0")
+    if len(obs) >= 2 and obs[1] == suggested: return ("GREEN", "G1")
+    if len(obs) >= 3 and obs[2] == suggested: return ("GREEN", "G2")
+    return ("LOSS", "G2")
 
 def _ngram_snapshot_text(suggested: int) -> str:
     tail = get_tail(400)
@@ -756,10 +687,115 @@ def _ngram_snapshot_text(suggested: int) -> str:
     line2 = f"🔎 E1(n-gram+fb): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}"
     return line1 + "\n\n" + line2
 
-def _format_seen(lst: List[str]) -> str:
-    return "-".join(lst[:OBS_MAX]) if lst else ""
+def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
+    our_num_display = suggested if outcome.upper()=="GREEN" else "X"
 
-def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1, ctx2, ctx3, ctx4) -> bool:
+    with _tx() as con:
+        con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
+
+    bump_score(outcome.upper())
+
+    try:
+        if outcome.upper() == "LOSS":
+            _set_cooldown(COOLDOWN_N)
+            _bump_loss_streak(reset=False)
+        else:
+            _dec_cooldown()
+            _bump_loss_streak(reset=True)
+    except Exception:
+        pass
+
+    # Feedback e timeline
+    try:
+        ctxs = []
+        for ncol in ("ctx1","ctx2","ctx3","ctx4"):
+            v = (row[ncol] or "").strip()
+            ctx = [int(x) for x in v.split(",") if x.strip().isdigit()]
+            ctxs.append(ctx)
+        ctx1, ctx2, ctx3, ctx4 = ctxs
+
+        if outcome.upper() == "GREEN":
+            stage_weight = {"G0": 1.00, "G1": 0.65, "G2": 0.40}.get(stage_lbl, 0.50)
+            delta = FEED_POS * stage_weight
+            for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
+                if len(ctx)>=1:
+                    _feedback_upsert(n, _ctx_to_key(ctx[:-1]), suggested, delta)
+        else:
+            true_first = None
+            try:
+                true_first = next(int(x) for x in final_seen.split("-") if x.isdigit())
+            except StopIteration:
+                pass
+            for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
+                if len(ctx)>=1:
+                    _feedback_upsert(n, _ctx_to_key(ctx[:-1]), suggested, -1.5*FEED_NEG)
+                    if true_first is not None:
+                        _feedback_upsert(n, _ctx_to_key(ctx[:-1]), true_first, +1.2*FEED_POS)
+
+        # timeline a partir do fechamento
+        obs_add = [int(x) for x in final_seen.split("-") if x.isdigit()]
+        append_seq(obs_add)
+    except Exception:
+        pass
+
+    # Hedge update — 4 especialistas
+    try:
+        true_first = None
+        try:
+            true_first = next(int(x) for x in final_seen.split("-") if x.isdigit())
+        except StopIteration:
+            pass
+        if true_first is not None:
+            tail_now = get_tail(400)
+            post_e1 = _post_from_tail(tail_now, after=None)
+            post_e2 = _post_freq_k(tail_now, K_SHORT)
+            post_e3 = _post_freq_k(tail_now, K_LONG)
+            post_e4 = _llm_probs_from_tail(tail_now) or {1:0.25,2:0.25,3:0.25,4:0.25}
+            _hedge_update4(true_first, post_e1, post_e2, post_e3, post_e4)
+    except Exception:
+        pass
+
+    snapshot = _ngram_snapshot_text(int(suggested))
+    msg = (
+        f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} "
+        f"<b>{outcome.upper()}</b> — finalizado "
+        f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={final_seen}).\n"
+        f"📊 Geral: {score_text()}\n\n"
+        f"{snapshot}"
+    )
+    return msg
+
+def _maybe_close_by_timeout():
+    """Se passou muito tempo e temos EXATAMENTE 2 observados, completa com X e fecha."""
+    row = get_open_pending()
+    if not row: return None
+    opened_at = int(row["opened_at"] or row["created_at"] or now_ts())
+    if now_ts() - opened_at < OBS_TIMEOUT_SEC:
+        return None
+    seen_list = _seen_list(row)
+    if len(seen_list) == 2:
+        seen_list.append("X")
+        final_seen = "-".join(seen_list[:3])
+        suggested = int(row["suggested"] or 0)
+        obs_nums = [int(x) for x in seen_list if x.isdigit()]
+        outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
+        return _close_with_outcome(row, outcome, final_seen, stage_lbl, suggested)
+    return None
+
+def close_pending(outcome:str):
+    """Força fechar preenchendo X até 3 observados (não usada no fluxo normal)."""
+    row = get_open_pending()
+    if not row: return
+    seen_list = _seen_list(row)
+    while len(seen_list) < 3:
+        seen_list.append("X")
+    final_seen = "-".join(seen_list[:3])
+    suggested = int(row["suggested"] or 0)
+    obs_nums = [int(x) for x in seen_list if x.isdigit()]
+    outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
+    return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
+
+def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1,ctx2,ctx3,ctx4) -> bool:
     """Abertura transacional: só abre se não existir pendência aberta."""
     with _tx() as con:
         row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
@@ -782,161 +818,25 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     except Exception:
         pass
 
-def _feedback_apply_on_close(row: sqlite3.Row, outcome: str, final_seen: str, suggested: int):
-    """Atualiza feedback/hedge/timeline ao fechar."""
-    try:
-        # Extrai contextos salvos na abertura
-        ctxs = []
-        for ncol in ("ctx1","ctx2","ctx3","ctx4"):
-            v = (row[ncol] or "").strip()
-            ctx = [int(x) for x in v.split(",") if x.strip().isdigit()]
-            ctxs.append(ctx)
-        ctx1, ctx2, ctx3, ctx4 = ctxs
-
-        if outcome.upper() == "GREEN":
-            try:
-                obs_nums = [int(x) for x in final_seen.split("-") if x.isdigit()]
-            except Exception:
-                obs_nums = []
-            k_hit = None
-            for k, n in enumerate(obs_nums[:OBS_MAX]):
-                if n == suggested:
-                    k_hit = k; break
-            stage_weight = {
-                0: 1.00, 1: 0.85, 2: 0.70, 3: 0.55, 4: 0.45, 5: 0.35, 6: 0.25
-            }.get(k_hit if k_hit is not None else MAX_G, 0.50)
-            delta = FEED_POS * stage_weight
-            for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
-                if len(ctx)>=1:
-                    _feedback_upsert(n, _ctx_to_key(ctx[:-1]), suggested, delta)
-        else:
-            try:
-                true_first = next(int(x) for x in final_seen.split("-") if x.isdigit())
-            except StopIteration:
-                true_first = None
-            for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
-                if len(ctx)>=1:
-                    _feedback_upsert(n, _ctx_to_key(ctx[:-1]), suggested, -1.5*FEED_NEG)
-                    if true_first is not None:
-                        _feedback_upsert(n, _ctx_to_key(ctx[:-1]), true_first, +1.2*FEED_POS)
-
-        # timeline a partir do fechamento
-        obs_add = [int(x) for x in final_seen.split("-") if x.isdigit()]
-        append_seq(obs_add)
-    except Exception:
-        pass
-
-    # Hedge update — 7 especialistas
-    try:
-        true_first = None
-        try:
-            true_first = next(int(x) for x in final_seen.split("-") if x.isdigit())
-        except StopIteration:
-            pass
-        if true_first is not None:
-            tail_now = get_tail(400)
-            e1 = _post_from_tail(tail_now, after=None)
-            e2 = _post_freq_k(tail_now, K_SHORT)
-            e3 = _post_freq_k(tail_now, K_LONG)
-            e4 = _llm_probs_from_tail(tail_now) or {1:0.25,2:0.25,3:0.25,4:0.25}
-            e5 = _repetition_expert(tail_now)
-            e6 = _parity_freq_expert(tail_now)
-            e7 = _gap_analysis_expert(tail_now)
-            _hedge_update7(true_first, e1,e2,e3,e4,e5,e6,e7)
-    except Exception:
-        pass
-
-def _compose_close_msg(outcome: str, stage_lbl: str, suggested: int, final_seen: str) -> str:
-    our_num_display = suggested if outcome.upper()=="GREEN" else "X"
-    snapshot = _ngram_snapshot_text(int(suggested))
-    return (
-        f"{'🟢' if outcome.upper()=='GREEN' else '🔴'} "
-        f"<b>{outcome.upper()}</b> — finalizado "
-        f"(<b>{stage_lbl}</b>, nosso={our_num_display}, observados={final_seen}).\n"
-        f"📊 Geral: {score_text()}\n\n"
-        f"{snapshot}"
-    )
-
-def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
-    # fecha na base
-    with _tx() as con:
-        con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
-
-    # atualiza placar e estados
-    bump_score(outcome.upper())
-    try:
-        if outcome.upper() == "LOSS":
-            _set_cooldown(COOLDOWN_N)
-            _bump_loss_streak(reset=False)
-        else:
-            _dec_cooldown()
-            _bump_loss_streak(reset=True)
-    except Exception:
-        pass
-
-    # feedback/hedge/timeline
-    _feedback_apply_on_close(row, outcome, final_seen, suggested)
-
-    # mensagem
-    return _compose_close_msg(outcome, stage_lbl, suggested, final_seen)
-
-def _maybe_close_by_timeout():
-    """
-    Se passou muito tempo e temos EXATAMENTE OBS_MAX-1 observados, completa com X e fecha.
-    (ex.: para G6, OBS_MAX=7 → se houver 6 observados e o 7º não vier, completa)
-    """
-    row = get_open_pending()
-    if not row: return None
-    opened_at = int(row["opened_at"] or row["created_at"] or now_ts())
-    if now_ts() - opened_at < OBS_TIMEOUT_SEC:
-        return None
-    seen_list = _seen_list(row)
-    if len(seen_list) == OBS_MAX - 1:
-        seen_list.append("X")
-        final_seen = _format_seen(seen_list)
-        suggested = int(row["suggested"] or 0)
-        obs_nums = [int(x) for x in seen_list if x.isdigit()]
-        outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-        return _close_with_outcome(row, outcome, final_seen, stage_lbl, suggested)
-    return None
-
-def close_pending():
-    """Força fechar preenchendo X até OBS_MAX observações."""
-    row = get_open_pending()
-    if not row: return
-    seen_list = _seen_list(row)
-    while len(seen_list) < OBS_MAX:
-        seen_list.append("X")
-    final_seen = _format_seen(seen_list)
-    suggested = int(row["suggested"] or 0)
-    obs_nums = [int(x) for x in seen_list if x.isdigit()]
-    outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
-    return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
-
 # ========= Helpers de abertura automática (cadeia) =========
 async def _open_suggestion(after: Optional[int], origin_tag: str):
     """Abre a sugestão com o motor atual, se não houver pendência."""
     if get_open_pending():
         return {"ok": True, "skipped": "pending_open"}
 
-    # v4.4.x: retorna (best, conf, samples, post, gap, reason)
     best, conf, samples, post, gap, reason = choose_single_number(after)
-
-    # salva os contextos usados na decisão
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
     if not _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
         return {"ok": True, "skipped": "race_lost"}
 
-    # --- tudo abaixo precisa estar DENTRO da função (indentado) ---
     aft_txt = f" após {after}" if after else ""
-    ls = _get_loss_streak()  # pega a streak de REDs para debug
 
-    txt = (
-        f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
-        f"🧩 <b>Padrão:</b> GEN{aft_txt} ({reason})\n"
-        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-        f"🧠 <b>Modo:</b> IA | <b>streak RED:</b> {ls}"
-    )
+txt = (
+    f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
+    f"🧩 <b>Padrão:</b> GEN{aft_txt} ({reason})\n"
+    f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
+    f"🧠 <b>Modo:</b> IA | <b>streak RED:</b> {ls}"
+)
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best}
 
@@ -956,10 +856,8 @@ async def health():
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
-    # ✅ só valida o segredo do caminho
     if token != WEBHOOK_TOKEN:
-    raise HTTPException(status_code=403, detail="Forbidden")
-    ...
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     check_and_maybe_reset_score()
 
@@ -971,7 +869,7 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "skipped": "duplicate_update"}
     _mark_processed(upd_id)
 
-    # timeout pode fechar pendência antiga (apenas se faltar 1 observação)
+    # timeout pode fechar pendência antiga (apenas se já houver 2 observados)
     timeout_msg = _maybe_close_by_timeout()
     if timeout_msg:
         await tg_send_text(TARGET_CHANNEL, timeout_msg)
@@ -991,68 +889,73 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 0) ANALISANDO — aprende, pode adiantar e fechar; nunca abre novo SE já houver pendência
+    # 0) ANALISANDO — aprende, pode abrir, e pode adiantar/fechar
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
         seq = parse_analise_seq(text)
         if seq:
             append_seq(seq)  # aprende padrão
 
+            # se não houver pendência, pode abrir a partir do ANALISANDO
+            if not get_open_pending():
+                mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
+                after = int(mafter.group(1)) if mafter else None
+                r_open = await _open_suggestion(after, origin_tag="analise")
+                if r_open.get("posted"):
+                    return r_open
+
+            # se houver pendência, tentar adiantar e fechar
             pend = get_open_pending()
             if pend:
-                # tentar adiantar/fechar
                 cur_seen = _seen_list(pend)
-                need = OBS_MAX - len(cur_seen)
+                need = 3 - len(cur_seen)
                 if need > 0:
                     to_add = [str(n) for n in seq[:need]]
                     if to_add:
                         _seen_append(pend, to_add)
                         pend = get_open_pending()
                         cur_seen = _seen_list(pend)
-                        if len(cur_seen) >= OBS_MAX:
+                        if len(cur_seen) >= 3:
                             suggested = int(pend["suggested"] or 0)
                             obs_nums = [int(x) for x in cur_seen if x.isdigit()]
                             outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-                            final_seen = _format_seen(cur_seen)
+                            final_seen = "-".join(cur_seen[:3])
                             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                             await tg_send_text(TARGET_CHANNEL, out_msg)
-                            # CHAIN_ON: abrir novo APÓS fechar
                             if CHAIN_ON:
                                 mafter2 = AFTER_RX.search(_normalize_keycaps(text or ""))
                                 after2 = int(mafter2.group(1)) if mafter2 else None
                                 return await _open_suggestion(after2, origin_tag="analise_after_close")
                             return {"ok": True, "closed_from_analise": True, "seen": final_seen}
-            else:
-                # sem pendência → pode abrir
-                mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
-                after = int(mafter.group(1)) if mafter else None
-                return await _open_suggestion(after, origin_tag="analise")
         return {"ok": True, "analise_seen": len(seq)}
 
     # 1) Gales (informativo)
-    for rx, stage_n in [(GALE1_RX,1),(GALE2_RX,2),(GALE3_RX,3),(GALE4_RX,4),(GALE5_RX,5),(GALE6_RX,6)]:
-        if rx.search(text):
-            if get_open_pending():
-                set_stage(stage_n)
-                await tg_send_text(TARGET_CHANNEL, f"🔁 Estamos no <b>{stage_n}° gale (G{stage_n})</b>")
-            return {"ok": True, "noted": f"g{stage_n}"}
+    if GALE1_RX.search(text):
+        if get_open_pending():
+            set_stage(1)
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
+        return {"ok": True, "noted": "g1"}
+    if GALE2_RX.search(text):
+        if get_open_pending():
+            set_stage(2)
+            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
+        return {"ok": True, "noted": "g2"}
 
-    # 2) Fechamentos do fonte (GREEN/LOSS) — usa números entre parênteses, até OBS_MAX
+    # 2) Fechamentos do fonte (GREEN/LOSS)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            nums = parse_close_numbers(text)
+            nums = parse_close_numbers(text)  # pode ter 1, 2 ou 3
             if nums:
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
             seen_list = _seen_list(pend) if pend else []
-            if pend and len(seen_list) >= OBS_MAX:
+            if pend and len(seen_list) >= 3:
                 suggested = int(pend["suggested"] or 0)
                 obs_nums = [int(x) for x in seen_list if x.isdigit()]
                 outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-                final_seen = _format_seen(seen_list)
+                final_seen = "-".join(seen_list[:3])
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                 await tg_send_text(TARGET_CHANNEL, out_msg)
-                # CHAIN_ON: abrir novo APÓS fechar
                 if CHAIN_ON:
                     mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
                     after = int(mafter.group(1)) if mafter else None
@@ -1067,20 +970,17 @@ async def webhook(token: str, request: Request):
             await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
-    # se existir pendência e estiver incompleta, NÃO abre novo
+    # se existir pendência incompleta, NÃO abre novo
     pend = get_open_pending()
     if pend:
         seen_list = _seen_list(pend)
-        if len(seen_list) >= OBS_MAX:
+        if len(seen_list) >= 3:
             suggested = int(pend["suggested"] or 0)
             obs_nums = [int(x) for x in seen_list if x.isdigit()]
             outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-            final_seen = _format_seen(seen_list)
+            final_seen = "-".join(seen_list[:3])
             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
             await tg_send_text(TARGET_CHANNEL, out_msg)
-            if CHAIN_ON:
-                after_chain = parsed["after"]
-                return await _open_suggestion(after_chain, origin_tag="entry_after_close")
         else:
             return {"ok": True, "kept_open_waiting_close": True}
 
@@ -1089,7 +989,7 @@ async def webhook(token: str, request: Request):
     if seq: append_seq(seq)
 
     after = parsed["after"]
-    best, conf, samples, post, gap, reason, ls = choose_single_number(after)
+    best, conf, samples, post, gap, reason = choose_single_number(after)
 
     # Abertura
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
@@ -1100,6 +1000,7 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "skipped": "pending_already_open"}
 
     aft_txt = f" após {after}" if after else ""
+    ls = _get_loss_streak()
     txt = (
         f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
         f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
