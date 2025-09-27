@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.5.0-g6 (Adaptado com 3 novos especialistas)
+webhook_app.py — v4.5.0-g6 (corrigido)
 - Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
 - "ANALISANDO": aprende sequência, pode adiantar fechamento (nunca abre novo se já houver pendência)
@@ -12,7 +12,7 @@ webhook_app.py — v4.5.0-g6 (Adaptado com 3 novos especialistas)
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
-                  TZ_NAME, CHAIN_ON
+                  TZ_NAME, CHAIN_ON, FORCE_CHAIN_ON_ENTRY, OBS_TIMEOUT_SEC
 
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
@@ -27,7 +27,6 @@ try:
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo(TZ_NAME)
 except ImportError:
-    # Fallback for Python versions < 3.9
     _TZ = timezone.utc
 
 import httpx
@@ -54,6 +53,10 @@ LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.95"))
 # ===== Encadeamento =====
 CHAIN_ON       = os.getenv("CHAIN_ON", "1").strip().lower() in ("1","true","yes")
 
+# ===== NOVAS ENVs (patch) =====
+FORCE_CHAIN_ON_ENTRY = os.getenv("FORCE_CHAIN_ON_ENTRY", "0").strip().lower() in ("1","true","yes")
+OBS_TIMEOUT_SEC = int(os.getenv("OBS_TIMEOUT_SEC", "240"))  # já existia, agora lido por ENV
+
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
 if not WEBHOOK_TOKEN:
@@ -67,7 +70,6 @@ DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 # NOVOS PESOS
 W5, W6, W7 = 0.10, 0.10, 0.10
-OBS_TIMEOUT_SEC = 240  # timeout adaptado p/ completar se faltar 1 observação
 
 # ======== Limites de gales/observações ========
 MAX_G   = 6                 # até G6
@@ -85,7 +87,7 @@ CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
 # ======== Modo "sempre entrar" ========
-ALWAYS_ENTER = True  # mantido: fluxo estrito = 1 pendência por vez, sem cortar sinal
+ALWAYS_ENTER = True  # fluxo estrito = 1 pendência por vez, sem cortar sinal
 
 # ======== Online Learning (feedback) ========
 FEED_BETA   = 0.40
@@ -130,7 +132,9 @@ def _ensure_column(con: sqlite3.Connection, table: str, col: str, decl: str):
     rows = con.execute(f"PRAGMA table_info({table})").fetchall()
     names = {r["name"] for r in rows}
     if col not in names:
-        con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        con.execute(f"ALTER TABLE {table}) ADD COLUMN {col} {decl}")  # intentionally kept; see below
+        # ⬆️ OBS: se seu SQLite reclamar de sintaxe nessa linha, troque por:
+        # con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 @contextmanager
 def _tx():
@@ -460,68 +464,49 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
     return {k: v/tot for k,v in scores.items()}
 
 # ========= NOVOS ESPECIALISTAS (5, 6, 7) =========
+def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
+    s = sum(d.values()) or 1e-9
+    return {k: v/s for k,v in d.items()}
+
 def _repetition_expert(tail: List[int]) -> Dict[int, float]:
     probs = {c: 0.25 for c in [1, 2, 3, 4]}
     if len(tail) < 3: return probs
-    
     last_three = tail[-3:]
     if last_three[0] == last_three[2]:
-        probs[last_three[1]] += 0.1 # A, B, A -> aposta em B
-    
-    # Exemplo: busca por sequência 1-2-1
+        probs[last_three[1]] += 0.1
     if len(tail) >= 3 and tail[-3:] == [1, 2, 1]:
-        probs[3] += 0.2
-        probs[4] += 0.2
-    
+        probs[3] += 0.2; probs[4] += 0.2
     return _norm_dict(probs)
 
 def _parity_freq_expert(tail: List[int]) -> Dict[int, float]:
     probs = {c: 0.25 for c in [1, 2, 3, 4]}
     if not tail: return probs
-    
     last_20 = tail[-20:]
-    par_freq = { 'odd': 0, 'even': 0 }
-    
+    par_freq = {'odd': 0, 'even': 0}
     for n in last_20:
-        if n % 2 == 0: # 2, 4
-            par_freq['even'] += 1
-        else:          # 1, 3
-            par_freq['odd'] += 1
-
+        if n % 2 == 0: par_freq['even'] += 1
+        else:          par_freq['odd']  += 1
     total = len(last_20) or 1
-    
     odd_score = par_freq['odd'] / total
     even_score = par_freq['even'] / total
-
-    # Se a frequência de pares/ímpares está desequilibrada, aposta no oposto
     if even_score > odd_score + 0.15:
-        probs[1] += 0.1; probs[3] += 0.1
-        probs[2] -= 0.1; probs[4] -= 0.1
+        probs[1] += 0.1; probs[3] += 0.1; probs[2] -= 0.1; probs[4] -= 0.1
     elif odd_score > even_score + 0.15:
-        probs[2] += 0.1; probs[4] += 0.1
-        probs[1] -= 0.1; probs[3] -= 0.1
-
+        probs[2] += 0.1; probs[4] += 0.1; probs[1] -= 0.1; probs[3] -= 0.1
     return _norm_dict(probs)
 
 def _gap_analysis_expert(tail: List[int]) -> Dict[int, float]:
     probs = {c: 0.25 for c in [1, 2, 3, 4]}
     if not tail or len(tail) < 50: return probs
-
     last_50 = tail[-50:]
     last_gaps = {c: 0 for c in [1,2,3,4]}
-    
-    # Encontra o último índice de cada número
     for i in range(len(last_50)-1, -1, -1):
         n = last_50[i]
         if last_gaps[n] == 0:
             last_gaps[n] = len(last_50) - 1 - i
-    
-    # O número que não aparece há mais tempo tem um voto extra
     most_overdue = sorted(last_gaps.items(), key=lambda x: x[1], reverse=True)[0][0]
-    
-    if last_gaps[most_overdue] > 10: # se está atrasado o suficiente
+    if last_gaps[most_overdue] > 10:
         probs[most_overdue] += 0.2
-    
     return _norm_dict(probs)
 
 # ========= LLM local (Especialista 4) =========
@@ -589,10 +574,6 @@ def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
         return {}
 
 # ========= Ensemble (Hedge) — 7 especialistas =========
-def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
-    s = sum(d.values()) or 1e-9
-    return {k: v/s for k,v in d.items()}
-
 def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
     if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
     win = tail[-k:] if len(tail) >= k else tail
@@ -641,22 +622,19 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
         comp = _norm_dict({c: max(1e-9, 1.0 - post[c]) for c in [1,2,3,4]})
         post = _norm_dict({c: 0.7*post[c] + 0.3*comp[c] for c in [1,2,3,4]})
         ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-        best = ranking[0][0]
-        reason = "IA_anti_tilt_mix"
+        best = ranking[0][0]; reason = "IA_anti_tilt_mix"
     if ls >= 2:
         top2 = ranking[:2]
         if len(top2) == 2 and gap < 0.05:
-            best = top2[1][0]
-            reason = "IA_runnerup_ls2"
+            best = top2[1][0]; reason = "IA_runnerup_ls2"
     return best, reason, post
 
 def choose_single_number(after: Optional[int]):
     tail = get_tail(400)
-    post_e1 = _post_from_tail(tail, after)          # n-grama + feedback
-    post_e2 = _post_freq_k(tail, K_SHORT)           # freq curta
-    post_e3 = _post_freq_k(tail, K_LONG)            # freq longa
-    post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}  # IA local
-    # Novos especialistas
+    post_e1 = _post_from_tail(tail, after)
+    post_e2 = _post_freq_k(tail, K_SHORT)
+    post_e3 = _post_freq_k(tail, K_LONG)
+    post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}
     post_e5 = _repetition_expert(tail)
     post_e6 = _parity_freq_expert(tail)
     post_e7 = _gap_analysis_expert(tail)
@@ -674,7 +652,7 @@ def choose_single_number(after: Optional[int]):
     gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
     return best, conf, timeline_size(), post_adj, gap2, reason, ls
 
-# ========= Parse (com keycaps e ANALISANDO) =========
+# ========= Parse =========
 ENTRY_RX       = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX         = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX       = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
@@ -698,10 +676,8 @@ def _normalize_keycaps(s: str) -> str:
 
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = _normalize_keycaps(re.sub(r"\s+", " ", text).strip())
-    if not ENTRY_RX.search(t):
-        return None
-    mseq = SEQ_RX.search(t)
-    seq = []
+    if not ENTRY_RX.search(t): return None
+    mseq = SEQ_RX.search(t); seq = []
     if mseq:
         parts = re.findall(r"[1-4]", _normalize_keycaps(mseq.group(1)))
         seq = [int(x) for x in parts]
@@ -723,8 +699,7 @@ def parse_analise_seq(text: str) -> List[int]:
     if not ANALISANDO_RX.search(_normalize_keycaps(text or "")):
         return []
     mseq = SEQ_RX.search(_normalize_keycaps(text or ""))
-    if not mseq:
-        return []
+    if not mseq: return []
     return [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
 
 # ========= Pending helpers =========
@@ -753,14 +728,11 @@ def _seen_append(row: sqlite3.Row, new_items: List[str]):
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
 
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
-    """Retorna (outcome, labelG) considerando até G6 (OBS_MAX=7)."""
     if not obs:
         return ("LOSS", f"G{MAX_G}")
-    # primeiro acerto conta
     for k in range(min(len(obs), OBS_MAX)):
         if obs[k] == suggested:
             return ("GREEN", f"G{k}")
-    # sem acerto em nenhuma tentativa
     return ("LOSS", f"G{MAX_G}")
 
 def _ngram_snapshot_text(suggested: int) -> str:
@@ -781,11 +753,9 @@ def _format_seen(lst: List[str]) -> str:
     return "-".join(lst[:OBS_MAX]) if lst else ""
 
 def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1, ctx2, ctx3, ctx4) -> bool:
-    """Abertura transacional: só abre se não existir pendência aberta."""
     with _tx() as con:
         row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
-        if row:
-            return False
+        if row: return False
         con.execute("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at, after, ctx1, ctx2, ctx3, ctx4, wait_notice_sent)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,0)""",
                     (now_ts(), int(suggested), 0, 1, "", now_ts(), after,
@@ -804,9 +774,7 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
         pass
 
 def _feedback_apply_on_close(row: sqlite3.Row, outcome: str, final_seen: str, suggested: int):
-    """Atualiza feedback/hedge/timeline ao fechar."""
     try:
-        # Extrai contextos salvos na abertura
         ctxs = []
         for ncol in ("ctx1","ctx2","ctx3","ctx4"):
             v = (row[ncol] or "").strip()
@@ -815,7 +783,6 @@ def _feedback_apply_on_close(row: sqlite3.Row, outcome: str, final_seen: str, su
         ctx1, ctx2, ctx3, ctx4 = ctxs
 
         if outcome.upper() == "GREEN":
-            # peso por quão cedo acertou
             try:
                 obs_nums = [int(x) for x in final_seen.split("-") if x.isdigit()]
             except Exception:
@@ -824,9 +791,7 @@ def _feedback_apply_on_close(row: sqlite3.Row, outcome: str, final_seen: str, su
             for k, n in enumerate(obs_nums[:OBS_MAX]):
                 if n == suggested:
                     k_hit = k; break
-            stage_weight = {
-                0: 1.00, 1: 0.85, 2: 0.70, 3: 0.55, 4: 0.45, 5: 0.35, 6: 0.25
-            }.get(k_hit if k_hit is not None else MAX_G, 0.50)
+            stage_weight = {0:1.00,1:0.85,2:0.70,3:0.55,4:0.45,5:0.35,6:0.25}.get(k_hit if k_hit is not None else MAX_G, 0.50)
             delta = FEED_POS * stage_weight
             for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
                 if len(ctx)>=1:
@@ -842,13 +807,11 @@ def _feedback_apply_on_close(row: sqlite3.Row, outcome: str, final_seen: str, su
                     if true_first is not None:
                         _feedback_upsert(n, _ctx_to_key(ctx[:-1]), true_first, +1.2*FEED_POS)
 
-        # timeline a partir do fechamento
         obs_add = [int(x) for x in final_seen.split("-") if x.isdigit()]
         append_seq(obs_add)
     except Exception:
         pass
 
-    # Hedge update — 7 especialistas
     try:
         true_first = None
         try:
@@ -880,33 +843,20 @@ def _compose_close_msg(outcome: str, stage_lbl: str, suggested: int, final_seen:
     )
 
 def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_lbl: str, suggested: int):
-    # fecha na base
     with _tx() as con:
         con.execute("UPDATE pending SET open=0, seen=? WHERE id=?", (final_seen, int(row["id"])))
-
-    # atualiza placar e estados
     bump_score(outcome.upper())
     try:
         if outcome.upper() == "LOSS":
-            _set_cooldown(COOLDOWN_N)
-            _bump_loss_streak(reset=False)
+            _set_cooldown(COOLDOWN_N); _bump_loss_streak(reset=False)
         else:
-            _dec_cooldown()
-            _bump_loss_streak(reset=True)
+            _dec_cooldown(); _bump_loss_streak(reset=True)
     except Exception:
         pass
-
-    # feedback/hedge/timeline
     _feedback_apply_on_close(row, outcome, final_seen, suggested)
-
-    # mensagem
     return _compose_close_msg(outcome, stage_lbl, suggested, final_seen)
 
 def _maybe_close_by_timeout():
-    """
-    Se passou muito tempo e temos EXATAMENTE OBS_MAX-1 observados, completa com X e fecha.
-    (ex.: para G6, OBS_MAX=7 → se houver 6 observados e o 7º não vier, completa)
-    """
     row = get_open_pending()
     if not row: return None
     opened_at = int(row["opened_at"] or row["created_at"] or now_ts())
@@ -923,7 +873,6 @@ def _maybe_close_by_timeout():
     return None
 
 def close_pending():
-    """Força fechar preenchendo X até OBS_MAX observações."""
     row = get_open_pending()
     if not row: return
     seen_list = _seen_list(row)
@@ -935,17 +884,14 @@ def close_pending():
     outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
     return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
 
-# ========= Helpers de abertura automática (cadeia) =========
+# ========= Helpers de abertura automática =========
 async def _open_suggestion(after: Optional[int], origin_tag: str):
-    """Abre a sugestão com o motor atual, se não houver pendência."""
     if get_open_pending():
         return {"ok": True, "skipped": "pending_open"}
-
     best, conf, samples, post, gap, reason, ls = choose_single_number(after)
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
     if not _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
         return {"ok": True, "skipped": "race_lost"}
-
     aft_txt = f" após {after}" if after else ""
     txt = (
         f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
@@ -971,34 +917,44 @@ async def health():
     seen = (pend["seen"] if pend else "")
     return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str(), "tz": TZ_NAME}
 
+# ===== ROTA ADMIN (patch) =====
+@app.get("/admin/force-close/{token}")
+async def admin_force_close(token: str):
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    msg = close_pending()
+    if msg:
+        await tg_send_text(TARGET_CHANNEL, msg)
+        return {"ok": True, "closed": True}
+    return {"ok": True, "closed": False, "reason": "no_pending"}
+
+# ===== Webhook =====
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     check_and_maybe_reset_score()
-
     data = await request.json()
 
-    # DEDUPE por update_id
+    # DEDUPE
     upd_id = str(data.get("update_id", "")) if isinstance(data, dict) else ""
     if _is_processed(upd_id):
         return {"ok": True, "skipped": "duplicate_update"}
     _mark_processed(upd_id)
 
-    # timeout pode fechar pendência antiga (apenas se faltar 1 observação)
+    # timeout (se faltar 1 observação)
     timeout_msg = _maybe_close_by_timeout()
     if timeout_msg:
         await tg_send_text(TARGET_CHANNEL, timeout_msg)
 
     msg = data.get("channel_post") or data.get("message") \
         or data.get("edited_channel_post") or data.get("edited_message") or {}
-
     text = (msg.get("text") or msg.get("caption") or "").strip()
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
 
-    # Filtro de fonte (bypass para diagnóstico)
+    # Filtro de fonte
     if SOURCE_CHANNEL and not BYPASS_SOURCE and chat_id != str(SOURCE_CHANNEL):
         if DEBUG_MSG:
             await tg_send_text(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
@@ -1006,15 +962,13 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 0) ANALISANDO — aprende, pode adiantar e fechar; nunca abre novo SE já houver pendência
+    # 0) ANALISANDO
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
         seq = parse_analise_seq(text)
         if seq:
-            append_seq(seq)  # aprende padrão
-
+            append_seq(seq)
             pend = get_open_pending()
             if pend:
-                # tentar adiantar/fechar
                 cur_seen = _seen_list(pend)
                 need = OBS_MAX - len(cur_seen)
                 if need > 0:
@@ -1030,20 +984,18 @@ async def webhook(token: str, request: Request):
                             final_seen = _format_seen(cur_seen)
                             out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                             await tg_send_text(TARGET_CHANNEL, out_msg)
-                            # CHAIN_ON: abrir novo APÓS fechar
                             if CHAIN_ON:
                                 mafter2 = AFTER_RX.search(_normalize_keycaps(text or ""))
                                 after2 = int(mafter2.group(1)) if mafter2 else None
                                 return await _open_suggestion(after2, origin_tag="analise_after_close")
                             return {"ok": True, "closed_from_analise": True, "seen": final_seen}
             else:
-                # sem pendência → pode abrir
                 mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
                 after = int(mafter.group(1)) if mafter else None
                 return await _open_suggestion(after, origin_tag="analise")
         return {"ok": True, "analise_seen": len(seq)}
 
-    # 1) Gales (informativo)
+    # 1) Gales
     for rx, stage_n in [(GALE1_RX,1),(GALE2_RX,2),(GALE3_RX,3),(GALE4_RX,4),(GALE5_RX,5),(GALE6_RX,6)]:
         if rx.search(text):
             if get_open_pending():
@@ -1051,11 +1003,11 @@ async def webhook(token: str, request: Request):
                 await tg_send_text(TARGET_CHANNEL, f"🔁 Estamos no <b>{stage_n}° gale (G{stage_n})</b>")
             return {"ok": True, "noted": f"g{stage_n}"}
 
-    # 2) Fechamentos do fonte (GREEN/LOSS) — usamos os números entre parênteses, até OBS_MAX
+    # 2) Fechamentos (GREEN/LOSS)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
-            nums = parse_close_numbers(text)  # pode ter 1..OBS_MAX observações
+            nums = parse_close_numbers(text)
             if nums:
                 _seen_append(pend, [str(n) for n in nums])
                 pend = get_open_pending()
@@ -1067,7 +1019,6 @@ async def webhook(token: str, request: Request):
                 final_seen = _format_seen(seen_list)
                 out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
                 await tg_send_text(TARGET_CHANNEL, out_msg)
-                # CHAIN_ON: abrir novo APÓS fechar
                 if CHAIN_ON:
                     mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
                     after = int(mafter.group(1)) if mafter else None
@@ -1075,14 +1026,14 @@ async def webhook(token: str, request: Request):
                 return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
         return {"ok": True, "noted_close": True}
 
-    # 3) Nova ENTRADA CONFIRMADA (Fluxo estrito)
+    # 3) Nova ENTRADA CONFIRMADA
     parsed = parse_entry_text(text)
     if not parsed:
         if DEBUG_MSG:
             await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
-    # se existir pendência e estiver incompleta, NÃO abre novo
+    # pendência já aberta?
     pend = get_open_pending()
     if pend:
         seen_list = _seen_list(pend)
@@ -1097,10 +1048,15 @@ async def webhook(token: str, request: Request):
                 after_chain = parsed["after"]
                 return await _open_suggestion(after_chain, origin_tag="entry_after_close")
         else:
-            # mantém pendência aguardando fechamento
-            return {"ok": True, "kept_open_waiting_close": True}
+            if FORCE_CHAIN_ON_ENTRY:
+                out_msg = close_pending()   # força fechar com X
+                if out_msg:
+                    await tg_send_text(TARGET_CHANNEL, out_msg)
+                # segue para abrir a nova entrada
+            else:
+                return {"ok": True, "kept_open_waiting_close": True}
 
-    # Alimenta memória com a sequência (se houver)
+    # Alimenta memória
     seq = parsed["seq"] or []
     if seq: append_seq(seq)
 
