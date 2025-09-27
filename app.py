@@ -163,3 +163,7 @@ async def telegram_webhook(request: Request):
     if DEBUG:
         await tg_send_text(TARGET_CHANNEL, "DEBUG: mensagem ignorada (sem regra).")
     return {"ok": True, "skipped": "no_rule"}
+    @app.post("/webhook")
+async def telegram_webhook(request: Request):
+    ...
+    
