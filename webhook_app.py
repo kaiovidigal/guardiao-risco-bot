@@ -957,7 +957,7 @@ async def health():
 
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
-    if token not in (TG_BOT_TOKEN, WEBHOOK_TOKEN):
+    if token != WEBHOOK_TOKEN:
     raise HTTPException(status_code=403, detail="Forbidden")
 
     check_and_maybe_reset_score()
