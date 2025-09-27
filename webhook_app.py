@@ -26,7 +26,8 @@ TZ_NAME = os.getenv("TZ_NAME", "America/Sao_Paulo").strip()
 try:
     from zoneinfo import ZoneInfo
     _TZ = ZoneInfo(TZ_NAME)
-except Exception:
+except ImportError:
+    # Fallback for Python versions < 3.9
     _TZ = timezone.utc
 
 import httpx
@@ -38,12 +39,12 @@ WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
-DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip() in ("1","true","True","yes","YES")
-BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip() in ("1","true","True","yes","YES")
+DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip().lower() in ("1","true","yes")
+BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip().lower() in ("1","true","yes")
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ===== LLM (IA local tipo ChatGPT) =====
-LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip() in ("1","true","True","yes","YES")
+LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip().lower() in ("1","true","yes")
 LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "models/phi-3-mini.gguf").strip()
 LLM_CTX_TOKENS = int(os.getenv("LLM_CTX_TOKENS", "2048"))
 LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
@@ -51,7 +52,7 @@ LLM_TEMP       = float(os.getenv("LLM_TEMP", "0.2"))
 LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.95"))
 
 # ===== Encadeamento =====
-CHAIN_ON       = os.getenv("CHAIN_ON", "1").strip() in ("1","true","True","yes","YES")
+CHAIN_ON       = os.getenv("CHAIN_ON", "1").strip().lower() in ("1","true","yes")
 
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
@@ -125,7 +126,7 @@ def _connect() -> sqlite3.Connection:
 
 def _ensure_column(con: sqlite3.Connection, table: str, col: str, decl: str):
     rows = con.execute(f"PRAGMA table_info({table})").fetchall()
-    names = {(r["name"] if isinstance(r, sqlite3.Row) else r[1]) for r in rows}
+    names = {r["name"] for r in rows}
     if col not in names:
         con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
@@ -164,9 +165,7 @@ def migrate_db():
         open INTEGER DEFAULT 1,
         seen TEXT,
         opened_at INTEGER,
-        "after" INTEGER,
-        ctx1 TEXT, ctx2 TEXT, ctx3 TEXT, ctx4 TEXT,
-        wait_notice_sent INTEGER DEFAULT 0
+        "after" INTEGER
     )""")
     _ensure_column(con, "pending", "after", "INTEGER")
     _ensure_column(con, "pending", "ctx1", "TEXT")
@@ -432,7 +431,7 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]
         i = idxs[-1]
-        ctx1 = tail[max(0,i):i+1]
+        ctx1 = tail[i:i+1]
         ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
         ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
         ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
@@ -598,9 +597,10 @@ def choose_single_number(after: Optional[int]):
     return best, conf, timeline_size(), post_adj, gap2, reason, ls
 
 # ========= Parse (com keycaps e ANALISANDO) =========
-ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+ENTRY_RX       = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
+SEQ_RX         = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+AFTER_RX       = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+ANALISANDO_RX  = re.compile(r"\bANALISANDO\b", re.I)
 GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
 GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
 GALE3_RX = re.compile(r"Estamos\s+no\s*3[ºo]\s*gale", re.I)
@@ -695,7 +695,7 @@ def _ngram_snapshot_text(suggested: int) -> str:
     p3 = pct(post.get(3, 0.0)); p4 = pct(post.get(4, 0.0))
     conf = pct(post.get(int(suggested), 0.0))
     amostra = timeline_size()
-        line1 = f"📈 Amostra: {amostra} • Conf: {conf}"
+    line1 = f"📈 Amostra: {amostra} • Conf: {conf}"
     line2 = f"🔎 E1(n-gram+fb): 1 {p1} | 2 {p2} | 3 {p3} | 4 {p4}"
     return line1 + "\n\n" + line2
 
@@ -926,7 +926,7 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "skipped": "sem_texto"}
 
     # 0) ANALISANDO — aprende, pode adiantar e fechar; nunca abre novo SE já houver pendência
-    if re.search(r"\bANALISANDO\b", _normalize_keycaps(text)):
+    if ANALISANDO_RX.search(_normalize_keycaps(text)):
         seq = parse_analise_seq(text)
         if seq:
             append_seq(seq)  # aprende padrão
