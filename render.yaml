@@ -6,29 +6,25 @@ services:
     startCommand: uvicorn webhook_app:app --host 0.0.0.0 --port $PORT
     disk:
       name: guardiao-dados
-      mountPath: /data
+      mountPath: /var/data
       sizeGB: 1
     envVars:
       - key: DB_PATH
-        value: /data/data.db
+        value: /var/data/data.db
       - key: WEBHOOK_TOKEN
         value: meusegredo123
       - key: TG_BOT_TOKEN
-        value: "coloque_aqui"
-      - key: PUBLIC_CHANNEL
-        value: "coloque_aqui"
-
-  - type: web
-    name: guardiao-backup
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn backup_app:app --host 0.0.0.0 --port $PORT
-    disk:
-      name: guardiao-dados
-      mountPath: /data
-      sizeGB: 1
-    envVars:
-      - key: DB_PATH
-        value: /data/data.db
-      - key: BACKUP_KEY
-        value: meusegredo123
+        value: 8316698154:AAH38hz2RbR0DtfalMNuXdGsh4UghDeztK4   # coloque o seu real
+      - key: TARGET_CHANNEL
+        value: "-1002796105884"                                  # canal onde o bot posta
+      - key: SOURCE_CHANNEL
+        value: "-1002816058717"                                  # canal fonte (opcional)
+      - key: TZ_NAME
+        value: America/Sao_Paulo
+      - key: DEBUG_MSG
+        value: "1"                                               # log de diagnóstico
+      - key: BYPASS_SOURCE
+        value: "0"                                               # use "1" para testes sem filtrar fonte
+      # (opcionais do LLM local, pode remover se não usa)
+      - key: LLM_ENABLED
+        value: "0"
