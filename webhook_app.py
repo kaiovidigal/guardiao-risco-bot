@@ -32,7 +32,7 @@ from fastapi import FastAPI, Request, HTTPException
 
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
+WEBHOOK_TOKEN = "meusegredo123"
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
