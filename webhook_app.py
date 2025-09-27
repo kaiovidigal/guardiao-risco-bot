@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.5.0-g6
+webhook_app.py — v4.5.0-g6 (Adaptado com 3 novos especialistas)
 - Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
 - IA local (LLM) como 4º especialista (opcional)
 - "ANALISANDO": aprende sequência, pode adiantar fechamento (nunca abre novo se já houver pendência)
@@ -65,6 +65,8 @@ app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.5.0-g6")
 # ========= Parâmetros =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
+# NOVOS PESOS
+W5, W6, W7 = 0.10, 0.10, 0.10
 OBS_TIMEOUT_SEC = 240  # timeout adaptado p/ completar se faltar 1 observação
 
 # ======== Limites de gales/observações ========
@@ -220,6 +222,9 @@ def migrate_db():
         cur.execute("INSERT INTO expert_w (id, w1, w2, w3, w4) VALUES (1,1.0,1.0,1.0,1.0)")
     else:
         _ensure_column(con, "expert_w", "w4", "REAL NOT NULL DEFAULT 1.0")
+        _ensure_column(con, "expert_w", "w5", "REAL NOT NULL DEFAULT 1.0")
+        _ensure_column(con, "expert_w", "w6", "REAL NOT NULL DEFAULT 1.0")
+        _ensure_column(con, "expert_w", "w7", "REAL NOT NULL DEFAULT 1.0")
 
     con.commit(); con.close()
 migrate_db()
@@ -454,6 +459,71 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
     tot = sum(scores.values()) or 1e-9
     return {k: v/tot for k,v in scores.items()}
 
+# ========= NOVOS ESPECIALISTAS (5, 6, 7) =========
+def _repetition_expert(tail: List[int]) -> Dict[int, float]:
+    probs = {c: 0.25 for c in [1, 2, 3, 4]}
+    if len(tail) < 3: return probs
+    
+    last_three = tail[-3:]
+    if last_three[0] == last_three[2]:
+        probs[last_three[1]] += 0.1 # A, B, A -> aposta em B
+    
+    # Exemplo: busca por sequência 1-2-1
+    if len(tail) >= 3 and tail[-3:] == [1, 2, 1]:
+        probs[3] += 0.2
+        probs[4] += 0.2
+    
+    return _norm_dict(probs)
+
+def _parity_freq_expert(tail: List[int]) -> Dict[int, float]:
+    probs = {c: 0.25 for c in [1, 2, 3, 4]}
+    if not tail: return probs
+    
+    last_20 = tail[-20:]
+    par_freq = { 'odd': 0, 'even': 0 }
+    
+    for n in last_20:
+        if n % 2 == 0: # 2, 4
+            par_freq['even'] += 1
+        else:          # 1, 3
+            par_freq['odd'] += 1
+
+    total = len(last_20) or 1
+    
+    odd_score = par_freq['odd'] / total
+    even_score = par_freq['even'] / total
+
+    # Se a frequência de pares/ímpares está desequilibrada, aposta no oposto
+    if even_score > odd_score + 0.15:
+        probs[1] += 0.1; probs[3] += 0.1
+        probs[2] -= 0.1; probs[4] -= 0.1
+    elif odd_score > even_score + 0.15:
+        probs[2] += 0.1; probs[4] += 0.1
+        probs[1] -= 0.1; probs[3] -= 0.1
+
+    return _norm_dict(probs)
+
+def _gap_analysis_expert(tail: List[int]) -> Dict[int, float]:
+    probs = {c: 0.25 for c in [1, 2, 3, 4]}
+    if not tail or len(tail) < 50: return probs
+
+    last_50 = tail[-50:]
+    last_gaps = {c: 0 for c in [1,2,3,4]}
+    
+    # Encontra o último índice de cada número
+    for i in range(len(last_50)-1, -1, -1):
+        n = last_50[i]
+        if last_gaps[n] == 0:
+            last_gaps[n] = len(last_50) - 1 - i
+    
+    # O número que não aparece há mais tempo tem um voto extra
+    most_overdue = sorted(last_gaps.items(), key=lambda x: x[1], reverse=True)[0][0]
+    
+    if last_gaps[most_overdue] > 10: # se está atrasado o suficiente
+        probs[most_overdue] += 0.2
+    
+    return _norm_dict(probs)
+
 # ========= LLM local (Especialista 4) =========
 try:
     from llama_cpp import Llama
@@ -518,7 +588,7 @@ def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
     except Exception:
         return {}
 
-# ========= Ensemble (Hedge) — 4 especialistas =========
+# ========= Ensemble (Hedge) — 7 especialistas =========
 def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
     s = sum(d.values()) or 1e-9
     return {k: v/s for k,v in d.items()}
@@ -531,33 +601,36 @@ def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
 
 def _get_expert_w():
     con = _connect()
-    row = con.execute("SELECT w1,w2,w3,w4 FROM expert_w WHERE id=1").fetchone()
+    row = con.execute("SELECT w1,w2,w3,w4,w5,w6,w7 FROM expert_w WHERE id=1").fetchone()
     con.close()
-    if not row: return (1.0, 1.0, 1.0, 1.0)
-    return float(row["w1"]), float(row["w2"]), float(row["w3"]), float(row["w4"])
+    if not row: return (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    return float(row["w1"]), float(row["w2"]), float(row["w3"]), float(row["w4"]), float(row["w5"]), float(row["w6"]), float(row["w7"])
 
-def _set_expert_w(w1, w2, w3, w4):
-    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=?, w4=? WHERE id=1",
-                (float(w1), float(w2), float(w3), float(w4)))
+def _set_expert_w(w1, w2, w3, w4, w5, w6, w7):
+    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=?, w4=?, w5=?, w6=?, w7=? WHERE id=1",
+                (float(w1), float(w2), float(w3), float(w4), float(w5), float(w6), float(w7)))
 
-def _hedge_blend4(p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float], p4:Dict[int,float]):
-    w1, w2, w3, w4 = _get_expert_w()
-    S = (w1 + w2 + w3 + w4) or 1e-9
-    w1, w2, w3, w4 = (w1/S, w2/S, w3/S, w4/S)
-    blended = {c: w1*p1.get(c,0)+w2*p2.get(c,0)+w3*p3.get(c,0)+w4*p4.get(c,0) for c in [1,2,3,4]}
+def _hedge_blend7(p1, p2, p3, p4, p5, p6, p7):
+    w1, w2, w3, w4, w5, w6, w7 = _get_expert_w()
+    S = (w1 + w2 + w3 + w4 + w5 + w6 + w7) or 1e-9
+    w1, w2, w3, w4, w5, w6, w7 = (w1/S, w2/S, w3/S, w4/S, w5/S, w6/S, w7/S)
+    blended = {c: w1*p1.get(c,0)+w2*p2.get(c,0)+w3*p3.get(c,0)+w4*p4.get(c,0)+w5*p5.get(c,0)+w6*p6.get(c,0)+w7*p7.get(c,0) for c in [1,2,3,4]}
     s2 = sum(blended.values()) or 1e-9
-    return {k: v/s2 for k,v in blended.items()}, (w1,w2,w3,w4)
+    return {k: v/s2 for k,v in blended.items()}, (w1,w2,w3,w4,w5,w6,w7)
 
-def _hedge_update4(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float], p4:Dict[int,float]):
-    w1, w2, w3, w4 = _get_expert_w()
+def _hedge_update7(true_c:int, p1, p2, p3, p4, p5, p6, p7):
+    w1, w2, w3, w4, w5, w6, w7 = _get_expert_w()
     l = lambda p: 1.0 - p.get(true_c, 0.0)
     from math import exp
-    w1n = w1 * exp(-HEDGE_ETA * (1.0 - l(p1)))
-    w2n = w2 * exp(-HEDGE_ETA * (1.0 - l(p2)))
-    w3n = w3 * exp(-HEDGE_ETA * (1.0 - l(p3)))
-    w4n = w4 * exp(-HEDGE_ETA * (1.0 - l(p4)))
-    S = (w1n + w2n + w3n + w4n) or 1e-9
-    _set_expert_w(w1n/S, w2n/S, w3n/S, w4n/S)
+    w1n = w1 * exp(-HEDGE_ETA * l(p1))
+    w2n = w2 * exp(-HEDGE_ETA * l(p2))
+    w3n = w3 * exp(-HEDGE_ETA * l(p3))
+    w4n = w4 * exp(-HEDGE_ETA * l(p4))
+    w5n = w5 * exp(-HEDGE_ETA * l(p5))
+    w6n = w6 * exp(-HEDGE_ETA * l(p6))
+    w7n = w7 * exp(-HEDGE_ETA * l(p7))
+    S = (w1n + w2n + w3n + w4n + w5n + w6n + w7n) or 1e-9
+    _set_expert_w(w1n/S, w2n/S, w3n/S, w4n/S, w5n/S, w6n/S, w7n/S)
 
 # ========= Anti-tilt (sem reduzir sinais) =========
 def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
@@ -579,11 +652,16 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
 
 def choose_single_number(after: Optional[int]):
     tail = get_tail(400)
-    post_e1 = _post_from_tail(tail, after)         # n-grama + feedback
-    post_e2 = _post_freq_k(tail, K_SHORT)          # freq curta
-    post_e3 = _post_freq_k(tail, K_LONG)           # freq longa
+    post_e1 = _post_from_tail(tail, after)          # n-grama + feedback
+    post_e2 = _post_freq_k(tail, K_SHORT)           # freq curta
+    post_e3 = _post_freq_k(tail, K_LONG)            # freq longa
     post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}  # IA local
-    post, (w1,w2,w3,w4) = _hedge_blend4(post_e1, post_e2, post_e3, post_e4)
+    # Novos especialistas
+    post_e5 = _repetition_expert(tail)
+    post_e6 = _parity_freq_expert(tail)
+    post_e7 = _gap_analysis_expert(tail)
+
+    post, (w1,w2,w3,w4,w5,w6,w7) = _hedge_blend7(post_e1, post_e2, post_e3, post_e4, post_e5, post_e6, post_e7)
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     top2 = ranking[:2]
     gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
@@ -770,7 +848,7 @@ def _feedback_apply_on_close(row: sqlite3.Row, outcome: str, final_seen: str, su
     except Exception:
         pass
 
-    # Hedge update — 4 especialistas
+    # Hedge update — 7 especialistas
     try:
         true_first = None
         try:
@@ -783,7 +861,10 @@ def _feedback_apply_on_close(row: sqlite3.Row, outcome: str, final_seen: str, su
             post_e2 = _post_freq_k(tail_now, K_SHORT)
             post_e3 = _post_freq_k(tail_now, K_LONG)
             post_e4 = _llm_probs_from_tail(tail_now) or {1:0.25,2:0.25,3:0.25,4:0.25}
-            _hedge_update4(true_first, post_e1, post_e2, post_e3, post_e4)
+            post_e5 = _repetition_expert(tail_now)
+            post_e6 = _parity_freq_expert(tail_now)
+            post_e7 = _gap_analysis_expert(tail_now)
+            _hedge_update7(true_first, post_e1, post_e2, post_e3, post_e4, post_e5, post_e6, post_e7)
     except Exception:
         pass
 
