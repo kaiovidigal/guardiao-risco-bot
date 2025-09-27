@@ -958,7 +958,7 @@ async def health():
 async def webhook(token: str, request: Request):
     # ✅ só valida o segredo do caminho
     if token != WEBHOOK_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    raise HTTPException(status_code=403, detail="Forbidden")
     ...
 
     check_and_maybe_reset_score()
