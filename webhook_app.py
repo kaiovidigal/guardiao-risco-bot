@@ -6,14 +6,12 @@ webhook_app.py — G0 only — 10 especialistas (E1..E10)
 - Aprende com "ANALISANDO" (Sequência)
 - Dedupe por update_id (tabela processed)
 - Filtro de origem (SOURCE_CHANNEL) opcional
-- Abre sugestão, fecha com 1º observado (G0) e publica 🟢/🔴 + snapshot
+- Abre sugestão, fecha com 1º observado (G0) e publica 🟢/🔴 em reply à sugestão
 - (Opcional) abre novo sinal imediatamente após fechar (OPEN_AFTER_CLOSE=on)
 - DB SQLite com WAL + busy_timeout
-- Configuração via ENV (ver docstring)
-
-Rotas:
-  GET  /health
-  POST /webhook/{WEBHOOK_TOKEN}
+- Configuração via ENV:
+  TG_BOT_TOKEN, WEBHOOK_TOKEN, TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE, TZ_NAME
+  CONF_MIN, GAP_MIN, ENSEMBLE_TEMP, META_TEMP, HISTORY_WINDOW, NGRAM_DECAY, FEEDBACK_DECAY, FEEDBACK_REINFORCE, OPEN_AFTER_CLOSE
 """
 
 import os, re, time, sqlite3, math, json
@@ -31,13 +29,13 @@ DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip().lower() in ("1","true","yes
 BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip().lower() in ("1","true","yes")
 TZ_NAME        = os.getenv("TZ_NAME", "America/Sao_Paulo").strip()
 
-# Ajustes (todos opcionais)
-CONF_MIN        = float(os.getenv("CONF_MIN", "0.00"))      # não bloqueia; informativo
-GAP_MIN         = float(os.getenv("GAP_MIN", "0.00"))       # não bloqueia; informativo
-ENSEMBLE_TEMP   = float(os.getenv("ENSEMBLE_TEMP", "0.75")) # t do softmax do ensemble
-META_TEMP       = float(os.getenv("META_TEMP", "0.60"))     # t do meta-sharpen
-HISTORY_WINDOW  = int(os.getenv("HISTORY_WINDOW", "400"))   # janela de histórico
-NGRAM_DECAY     = float(os.getenv("NGRAM_DECAY", "0.980"))  # decaimento n-gram
+# Ajustes (todos opcionais) — informativos/algorítmicos
+CONF_MIN        = float(os.getenv("CONF_MIN", "0.00"))
+GAP_MIN         = float(os.getenv("GAP_MIN", "0.00"))
+ENSEMBLE_TEMP   = float(os.getenv("ENSEMBLE_TEMP", "0.75"))
+META_TEMP       = float(os.getenv("META_TEMP", "0.60"))
+HISTORY_WINDOW  = int(os.getenv("HISTORY_WINDOW", "400"))
+NGRAM_DECAY     = float(os.getenv("NGRAM_DECAY", "0.980"))
 FEEDBACK_DECAY  = float(os.getenv("FEEDBACK_DECAY", "0.995"))
 FEEDBACK_REINFORCE = float(os.getenv("FEEDBACK_REINFORCE", "0.80"))
 OPEN_AFTER_CLOSE   = os.getenv("OPEN_AFTER_CLOSE", "on").strip().lower() in ("1","true","yes","on")
@@ -50,7 +48,7 @@ if not WEBHOOK_TOKEN:
 # ========= Web =========
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-app = FastAPI(title="guardiao-g0-10x", version="1.0.0")
+app = FastAPI(title="guardiao-g0-10x", version="1.1.0")
 
 # ========= Timezone =========
 try:
@@ -126,19 +124,25 @@ def _ensure_tables():
         n INTEGER NOT NULL, ctx TEXT NOT NULL, nxt INTEGER NOT NULL, w REAL NOT NULL,
         PRIMARY KEY (n, ctx, nxt)
     )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS score(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        green INTEGER DEFAULT 0,
+        loss  INTEGER DEFAULT 0
+    )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS pending(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at INTEGER,
         suggested INTEGER,
         open INTEGER DEFAULT 1,
         seen TEXT,
-        opened_at INTEGER
+        opened_at INTEGER,
+        suggest_msg_id INTEGER
     )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS score(
-        id INTEGER PRIMARY KEY CHECK(id=1),
-        green INTEGER DEFAULT 0,
-        loss  INTEGER DEFAULT 0
-    )""")
+    # migração leve (ignora erro se já existir)
+    try:
+        cur.execute("ALTER TABLE pending ADD COLUMN suggest_msg_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
     if not cur.execute("SELECT 1 FROM score WHERE id=1").fetchone():
         cur.execute("INSERT INTO score(id,green,loss) VALUES(1,0,0)")
     con.commit(); con.close()
@@ -265,8 +269,8 @@ def _open_pending(suggested:int) -> bool:
     with _tx() as con:
         row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
         if row: return False
-        con.execute("""INSERT INTO pending (created_at, suggested, open, seen, opened_at)
-                       VALUES (?,?,?,?,?)""", (now_ts(), int(suggested), 1, "", now_ts()))
+        con.execute("""INSERT INTO pending (created_at, suggested, open, seen, opened_at, suggest_msg_id)
+                       VALUES (?,?,?,?,?,NULL)""", (now_ts(), int(suggested), 1, "", now_ts()))
         return True
 
 def _append_seen(row: sqlite3.Row, nums: List[int]):
@@ -278,6 +282,12 @@ def _append_seen(row: sqlite3.Row, nums: List[int]):
     seen_txt = "-".join(cur[:1])
     with _tx() as con:
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
+
+def _save_suggest_msg_id(msg_id: Optional[int]):
+    if msg_id is None: return
+    with _tx() as con:
+        con.execute("UPDATE pending SET suggest_msg_id=? WHERE open=1 ORDER BY id DESC LIMIT 1",
+                    (int(msg_id),))
 
 def _ngram_snapshot_text(suggested:int) -> str:
     tail = get_tail(HISTORY_WINDOW)
@@ -309,7 +319,6 @@ def _close_if_ready():
             _feedback_upsert(2, _ctx_key(tail[-1:]), true1, +float(FEEDBACK_REINFORCE))
         except Exception:
             pass
-        # GREEN/LOSS + snapshot
         suggested = int(row["suggested"] or 0)
         our_disp = suggested if suggested == int(parts[0]) else "X"
         outcome  = "GREEN" if suggested == int(parts[0]) else "LOSS"
@@ -320,21 +329,40 @@ def _close_if_ready():
             f"(G0, nosso={our_disp}, observados={parts[0]}).\n"
             f"📊 Geral: {score_text()}\n\n{snap}"
         )
-        return {"closed": True, "seen": parts[0], "msg": msg, "suggested": suggested}
+        # pegar a msg da sugestão para fazer reply
+        reply_to = None
+        try:
+            con = _connect()
+            r2 = con.execute("SELECT suggest_msg_id FROM pending WHERE id=?", (int(row["id"]),)).fetchone()
+            con.close()
+            reply_to = int(r2["suggest_msg_id"] or 0) if r2 and r2["suggest_msg_id"] else None
+        except Exception:
+            pass
+        return {"closed": True, "seen": parts[0], "msg": msg, "suggested": suggested, "reply_to": reply_to}
     return None
 
 # ========= Telegram =========
 TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-async def tg_send_text(chat_id: str, text: str, parse: str = "HTML"):
-    if not TG_BOT_TOKEN: return
+async def tg_send_text(chat_id: str, text: str, parse: str = "HTML", reply_to: int = None):
+    """Envia mensagem; se reply_to for dado, responde àquela msg. Retorna message_id ou None."""
+    if not TG_BOT_TOKEN: return None
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse,
+        "disable_web_page_preview": True
+    }
+    if reply_to is not None:
+        payload["reply_to_message_id"] = int(reply_to)
+        payload["allow_sending_without_reply"] = True
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            await client.post(f"{TELEGRAM_API}/sendMessage",
-                              json={"chat_id": chat_id, "text": text, "parse_mode": parse,
-                                    "disable_web_page_preview": True})
+            resp = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+            data = resp.json()
+            return (data.get("result") or {}).get("message_id")
     except Exception:
-        pass
+        return None
 
 # ========= Parsers =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
@@ -384,7 +412,7 @@ def _post_ngram_feedback(tail: List[int], after: Optional[int]) -> Dict[int,floa
     if not tail: return {c:0.25 for c in CANDS}
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]; i = idxs[-1]
-        ctxs = [tail[max(0,i-3):i+1], tail[max(0,i-2):i+1], tail[max(0,i-1):i+1], tail[i:i+1)]
+        ctxs = [tail[max(0,i-3):i+1], tail[max(0,i-2):i+1], tail[max(0,i-1):i+1], tail[i:i+1]]
     else:
         ctxs = [tail[-4:], tail[-3:], tail[-2:], tail[-1:]]
     W4,W3,W2,W1 = 0.42,0.30,0.18,0.10
@@ -482,7 +510,7 @@ def _ensemble_10(tail: List[int], after: Optional[int]) -> Tuple[int, Dict[int,f
     posts["E09_recency"]  = _post_recency_penalty(tail)
     posts["E10_meta"]     = _post_meta_sharpen(list(posts.values()))
 
-    weights = {k: 1.0 for k in posts.keys()}  # pesos homogêneos (simples/estável)
+    weights = {k: 1.0 for k in posts.keys()}  # homogêneo/estável
 
     agg = {c:0.0 for c in CANDS}
     for name, dist in posts.items():
@@ -541,23 +569,23 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 1) “ANALISANDO”: aprende
+    # 1) “ANALISANDO”: aprende e pode abrir se não houver pendência
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
         seq = parse_analise_seq(text)
         if seq: append_seq(seq)
-        # se não houver pendência aberta, pode abrir sinal
         if not get_open_pending():
             mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
             after = int(mafter.group(1)) if mafter else None
             best, conf, gap, _, _ = choose_g0(after)
             if _open_pending(best):
-                await tg_send_text(
+                msg_id = await tg_send_text(
                     TARGET_CHANNEL,
                     (f"🤖 <b>IA SUGERE — {best}</b>\n"
                      f"🧩 <b>Padrão:</b> GEN (after_close)\n"
                      f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{len(get_tail(HISTORY_WINDOW))} | <b>gap≈</b>{gap*100:.1f}pp\n"
                      f"🧠 <b>Modo:</b> E10_meta")
                 )
+                _save_suggest_msg_id(msg_id)
                 return {"ok": True, "posted": True, "best": best, "conf": conf}
         return {"ok": True, "analise": len(seq)}
 
@@ -568,26 +596,24 @@ async def webhook(token: str, request: Request):
             nums = parse_close_numbers(text)  # só 1
             if nums:
                 _append_seen(pend, nums)
-
-            # fecha, publica RESULTADO primeiro, depois (opcional) abre novo
             r = _close_if_ready()
             if r and r.get("closed"):
-                # 1) publicar PRIMEIRO o resultado detalhado
-                await tg_send_text(TARGET_CHANNEL, r["msg"])
-
-                # 2) opcional: abrir o próximo após fechar
+                # (1) resultado em reply à sugestão correspondente
+                await tg_send_text(TARGET_CHANNEL, r["msg"], reply_to=r.get("reply_to"))
+                # (2) opcional: abrir já o próximo após fechar
                 if OPEN_AFTER_CLOSE:
                     m_after = AFTER_RX.search(_normalize_keycaps(text or ""))
                     after = int(m_after.group(1)) if m_after else None
                     best2, conf2, gap2, _, _ = choose_g0(after)
                     if _open_pending(best2):
-                        await tg_send_text(
+                        msg_id2 = await tg_send_text(
                             TARGET_CHANNEL,
                             (f"🤖 <b>IA SUGERE — {best2}</b>\n"
                              f"🧩 <b>Padrão:</b> GEN (after_close)\n"
                              f"📊 <b>Conf:</b> {conf2*100:.2f}% | <b>Amostra≈</b>{len(get_tail(HISTORY_WINDOW))} | <b>gap≈</b>{gap2*100:.1f}pp\n"
                              f"🧠 <b>Modo:</b> E10_meta")
                         )
+                        _save_suggest_msg_id(msg_id2)
                 return {"ok": True, "closed": True, "seen": r["seen"]}
         return {"ok": True, "noted_close": True}
 
@@ -607,13 +633,14 @@ async def webhook(token: str, request: Request):
 
     if not get_open_pending():
         if _open_pending(best):
-            await tg_send_text(
+            msg_id3 = await tg_send_text(
                 TARGET_CHANNEL,
                 (f"🤖 <b>IA SUGERE — {best}</b>\n"
                  f"🧩 <b>Padrão:</b> GEN\n"
                  f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{len(get_tail(HISTORY_WINDOW))} | <b>gap≈</b>{gap*100:.1f}pp\n"
                  f"🧠 <b>Modo:</b> E10_meta")
             )
+            _save_suggest_msg_id(msg_id3)
             return {"ok": True, "posted": True, "best": best, "conf": conf}
 
     return {"ok": True, "skipped": "pending_already_open"}
