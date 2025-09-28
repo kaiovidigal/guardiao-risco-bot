@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-webhook_app.py — G0 only — 20 especialistas (E1..E20)
+webhook_app.py — G0 only — 20 especialistas (E1..E20) + encadeamento
 - Sem gales (G1..G6): decisão única (G0) por consenso de 20 especialistas
-- Configurações embutidas (sem ENV)
-- Dedupe por update_id (tabela processed)
-- Filtro por SOURCE_CHANNEL
-- Encaminha SUGESTÃO para TARGET_CHANNEL
-- Fecha pendências só com o primeiro observado (G0), sem lógica de G1/G2
-- DB SQLite robusto com WAL + busy_timeout
+- 20 especialistas combinados + meta
+- Mensagem rica: "IA SUGERE — X após Y", Conf, Amostra, gap
+- Fechamento automático no 1º observado
+- CHAIN_ON: após fechar, abre e envia novo sinal
+- Config fixa (sem ENV), filtro por SOURCE_CHANNEL, dedupe por update_id
+- DB SQLite robusto (WAL + busy_timeout)
 
 Rotas:
   GET  /                -> ok
@@ -32,6 +32,7 @@ TZ_NAME        = "America/Sao_Paulo"
 
 DEBUG_MSG      = False     # enviar mensagens de debug no canal destino
 BYPASS_SOURCE  = False     # se True, não filtra SOURCE_CHANNEL
+CHAIN_ON       = True      # abre automaticamente novo sinal após fechar (G0)
 
 # ========= Imports web =========
 import httpx
@@ -45,7 +46,7 @@ except Exception:
     _TZ = timezone.utc
 
 # ========= App =========
-app = FastAPI(title="guardiao-g0-20x", version="1.0.0")
+app = FastAPI(title="guardiao-g0-20x", version="1.1.0")
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -118,6 +119,12 @@ def _ensure_tables():
     )""")
     con.commit(); con.close()
 _ensure_tables()
+
+def timeline_size() -> int:
+    con = _connect()
+    row = con.execute("SELECT COUNT(*) AS c FROM timeline").fetchone()
+    con.close()
+    return int(row["c"] or 0)
 
 def _is_processed(upd_id: str) -> bool:
     if not upd_id: return False
@@ -307,7 +314,6 @@ CANDS = [1,2,3,4]
 def _post_ngram_feedback(tail: List[int], after: Optional[int]) -> Dict[int,float]:
     # usa 1..4-gram + feedback nas janelas
     if not tail: return {c:0.25 for c in CANDS}
-    ctxs = []
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]
         i = idxs[-1]
@@ -515,7 +521,7 @@ def _ensemble_20(tail: List[int], after: Optional[int]) -> Tuple[int, Dict[int,f
     meta = _post_meta_sharpen(list(posts.values()))
     posts["E20_meta"] = meta
 
-    # pesos iniciais (podem ser todos 1.0 para neutralidade)
+    # pesos iniciais (todos 1.0 por padrão)
     weights = {k: 1.0 for k in posts.keys()}
 
     agg = {c:0.0 for c in CANDS}
@@ -534,6 +540,34 @@ def choose_g0(after: Optional[int]) -> Tuple[int, float, Dict[int,float], Dict[s
     best, post, posts_all = _ensemble_20(tail, after)
     conf = float(post.get(best, 0.0))
     return best, conf, post, posts_all
+
+def _gap_top2(dist: Dict[int,float]) -> float:
+    if not dist: return 0.0
+    top = sorted(dist.items(), key=lambda kv: kv[1], reverse=True)
+    if len(top) < 2:
+        return float(top[0][1]) if top else 0.0
+    return float(top[0][1] - top[1][1])
+
+async def _announce_suggestion(best:int, conf:float, after:Optional[int], origin:str, dist:Dict[int,float]):
+    aft_txt = f" após {after}" if after else ""
+    gap = _gap_top2(dist)
+    samples = timeline_size()
+    txt = (
+        f"🤖 <b>IA SUGERE</b> — <b>{best}</b>{aft_txt}\n"
+        f"🧩 <b>Padrão:</b> GEN ({origin})\n"
+        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
+        f"🧠 <b>Modo:</b> E20_meta"
+    )
+    await tg_send_text(TARGET_CHANNEL, txt)
+
+async def _open_and_announce(after: Optional[int], origin: str="entrada"):
+    # não abre se já houver pendência
+    if get_open_pending(): return {"ok": True, "skipped": "pending_open"}
+    best, conf, post, _ = choose_g0(after)
+    if _open_pending(best):
+        await _announce_suggestion(best, conf, after, origin, post)
+        return {"ok": True, "posted": True, "best": best, "conf": conf}
+    return {"ok": True, "skipped": "race_lost"}
 
 # ========= Rotas =========
 @app.get("/")
@@ -580,24 +614,18 @@ async def webhook(request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 1) “ANALISANDO”: aprende a sequência (memória) e pode sugerir
+    # 1) “ANALISANDO”: aprende e pode abrir
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
         seq = parse_analise_seq(text)
         if seq: append_seq(seq)
-        # abre sugestão se não houver pendência
         if not get_open_pending():
             mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
             after = int(mafter.group(1)) if mafter else None
-            best, conf, post, _ = choose_g0(after)
-            if _open_pending(best):
-                await tg_send_text(
-                    TARGET_CHANNEL,
-                    f"🤖 <b>IA (G0)</b> sugere <b>{best}</b> • Conf≈<b>{conf*100:.1f}%</b>"
-                )
-                return {"ok": True, "posted": True, "best": best, "conf": conf}
+            r = await _open_and_announce(after, origin="analise")
+            if r.get("posted"): return r
         return {"ok": True, "analise": len(seq)}
 
-    # 2) Fechamento (GREEN/LOSS) — G0 só usa o 1º número visto
+    # 2) Fechamento (GREEN/LOSS) — G0 usa o 1º observado e encadeia
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
@@ -607,6 +635,9 @@ async def webhook(request: Request):
             r = _close_if_ready()
             if r and r.get("closed"):
                 await tg_send_text(TARGET_CHANNEL, f"📌 Fechado (G0) — observado <b>{r['seen']}</b>.")
+                # encadeia novo sinal (after=None)
+                if CHAIN_ON:
+                    await _open_and_announce(after=None, origin="after_close")
                 return {"ok": True, "closed": True, "seen": r["seen"]}
         return {"ok": True, "noted_close": True}
 
@@ -622,15 +653,9 @@ async def webhook(request: Request):
     if seq: append_seq(seq)
 
     after = parsed["after"]
-    best, conf, post, _ = choose_g0(after)
-
     if not get_open_pending():
-        if _open_pending(best):
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"🤖 <b>IA (G0)</b> sugere <b>{best}</b> • Conf≈<b>{conf*100:.1f}%</b>"
-            )
-            return {"ok": True, "posted": True, "best": best, "conf": conf}
+        r = await _open_and_announce(after, origin="entrada")
+        if r.get("posted"): return r
 
     # se já tem pendência aberta, só retorna
     return {"ok": True, "skipped": "pending_already_open"}
