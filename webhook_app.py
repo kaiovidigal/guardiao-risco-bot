@@ -1,47 +1,51 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-webhook_app.py — v4.4.1 (cadeia ativável) — G6 READY
-- Fluxo estrito + Anti-tilt sem reduzir sinais + robustez de canal
-- IA local (LLM) como 4º especialista (opcional)
-- "ANALISANDO": aprende sequência, pode abrir e pode adiantar fechamento
-- Placar zera todo dia às 00:00 (fuso TZ_NAME, default America/Sao_Paulo)
-- (NOVO) CHAIN_ON: após fechar, abre automaticamente um novo sinal
-- (NOVO) Suporte até G6 (MAX_GALE = 6 => até 7 observações)
 
-ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
-ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
-                  LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
-                  TZ_NAME, CHAIN_ON
-Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
+webhook_app.py — v5.0 (G6 + Ensemble E1..E7)
+
+Principais recursos:
+- G0..G6 (até 7 observações por sinal)
+- Ensemble com 7 especialistas (n-grama, freq curta/longa, IA local, Fibonacci-recency, Markov(1), anti-tilt inverso)
+- Fluxo estrito + cadeia (abre novo após fechar) + anti-tilt
+- Reset diário do placar (TZ configurável)
+- Dedupe por update_id
+- Filtro de SOURCE_CHANNEL (opcional)
+- Timeout completa com 'X' até MAX_OBS e fecha
+
+Config embutida (pode sobrescrever por ENV):
+  TG_BOT_TOKEN (str)   - token do bot
+  WEBHOOK_TOKEN (str)  - token da rota /webhook/{token}
+  TARGET_CHANNEL (str) - canal de destino
+  SOURCE_CHANNEL (str) - canal fonte (se vazio, não filtra)
+  DB_PATH (str)        - caminho do banco sqlite
+  TZ_NAME (str)        - fuso (default America/Sao_Paulo)
+  CHAIN_ON (bool)      - abre novo sinal após fechar
+  LLM_*                - ver abaixo
+
+Endpoint:
+  GET  /health
+  POST /webhook/{WEBHOOK_TOKEN}
+"""
+
 import os, re, time, sqlite3, math, json
 from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
-# ---- timezone (reset diário) ----
-TZ_NAME = os.getenv("TZ_NAME", "America/Sao_Paulo").strip()
-try:
-    from zoneinfo import ZoneInfo
-    _TZ = ZoneInfo(TZ_NAME)
-except Exception:
-    _TZ = timezone.utc
-
-import httpx
-from fastapi import FastAPI, Request, HTTPException
-
-# ========= ENV =========
-TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
-WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
+# ===================== CONFIG PADRÃO (pode sobrescrever por ENV) =====================
+TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "8315698154:AAH38hr2RbR0DtfalMNuXdGsh4UghDeztK4").strip()
+WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "meusegredo123").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "-1002810508717").strip()   # deixe "" para não filtrar
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
+TZ_NAME        = os.getenv("TZ_NAME", "America/Sao_Paulo").strip()
+CHAIN_ON       = os.getenv("CHAIN_ON", "1").strip() in ("1","true","True","yes","YES")
+
 DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip() in ("1","true","True","yes","YES")
 BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip() in ("1","true","True","yes","YES")
-TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ===== LLM (IA local tipo ChatGPT) =====
+# ===== LLM (IA local) =====
 LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip() in ("1","true","True","yes","YES")
 LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "models/phi-3-mini.gguf").strip()
 LLM_CTX_TOKENS = int(os.getenv("LLM_CTX_TOKENS", "2048"))
@@ -49,48 +53,52 @@ LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
 LLM_TEMP       = float(os.getenv("LLM_TEMP", "0.2"))
 LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.95"))
 
-# ===== Encadeamento (novo) =====
-CHAIN_ON       = os.getenv("CHAIN_ON", "1").strip() in ("1","true","True","yes","YES")
+import httpx
+from fastapi import FastAPI, Request, HTTPException
 
+# ========= Checks básicos =========
 if not TG_BOT_TOKEN:
-    raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
+    raise RuntimeError("TG_BOT_TOKEN não definido.")
 if not WEBHOOK_TOKEN:
-    raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
+    raise RuntimeError("WEBHOOK_TOKEN não definido.")
 
-# ========= App =========
-app = FastAPI(title="guardiao-auto-bot (GEN webhook)", version="4.4.1")
+TELEGRAM_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ========= Parâmetros =========
+# ---- timezone ----
+try:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo(TZ_NAME)
+except Exception:
+    _TZ = timezone.utc
+
+# ======== Config de gales/observações ========
+MAX_GALES = 6                   # G0..G6
+MAX_OBS   = 1 + MAX_GALES       # 7 observações
+OBS_TIMEOUT_SEC = 240
+
+# ========= Parâmetros do modelo/base =========
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 
-# ======== Gales (até G6) ========
-MAX_GALE = 6                 # G0..G6 => 7 observações no máximo
-MAX_OBS  = MAX_GALE + 1      # quantidade de observações para encerrar à força
-OBS_TIMEOUT_SEC = 240        # fecha por timeout se não completar (mantido)
-
-# ======== Gates (não bloqueiam abertura) ========
+# Gates (não bloqueiam abertura; mantidos para compatibilidade)
 CONF_MIN    = 0.70
 GAP_MIN     = 0.13
 H_MAX       = 0.85
 FREQ_WINDOW = 90
 
-# ======== Cooldown após RED (sem cortar fluxo) ========
-COOLDOWN_N     = 6
+# Cooldown após RED (sem cortar fluxo)
+COOLDOWN_N     = 5
 CD_CONF_BOOST  = 0.04
 CD_GAP_BOOST   = 0.03
 
-# ======== Modo "sempre entrar" ========
-ALWAYS_ENTER = True
-
-# ======== Online Learning (feedback) ========
+# Online Learning (feedback)
 FEED_BETA   = 0.40
 FEED_POS    = 0.60
 FEED_NEG    = 1.20
 FEED_DECAY  = 0.995
 WF4, WF3, WF2, WF1 = W4, W3, W2, W1
 
-# ======== Ensemble Hedge ========
+# Ensemble Hedge
 HEDGE_ETA = 0.6
 K_SHORT   = 60
 K_LONG    = 300
@@ -107,10 +115,9 @@ def tz_today_ymd() -> str:
     dt = datetime.now(_TZ)
     return dt.strftime("%Y-%m-%d")
 
-def _entropy_norm(post: Dict[int, float]) -> float:
-    eps = 1e-12
-    H = -sum((p+eps) * math.log(p+eps, 4) for p in post.values())
-    return H
+def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
+    s = sum(d.values()) or 1e-9
+    return {k: v/s for k,v in d.items()}
 
 # ========= DB helpers =========
 def _connect() -> sqlite3.Connection:
@@ -207,19 +214,23 @@ def migrate_db():
     if not row:
         cur.execute("INSERT INTO state (id, cooldown_left, loss_streak, last_reset_ymd) VALUES (1,0,0,'')")
 
-    # expert weights
+    # expert weights (7 especialistas)
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
         w1 REAL NOT NULL,
         w2 REAL NOT NULL,
         w3 REAL NOT NULL,
-        w4 REAL NOT NULL
+        w4 REAL NOT NULL,
+        w5 REAL NOT NULL,
+        w6 REAL NOT NULL,
+        w7 REAL NOT NULL
     )""")
     row = con.execute("SELECT 1 FROM expert_w WHERE id=1").fetchone()
     if not row:
-        cur.execute("INSERT INTO expert_w (id, w1, w2, w3, w4) VALUES (1,1.0,1.0,1.0,1.0)")
+        cur.execute("INSERT INTO expert_w (id, w1, w2, w3, w4, w5, w6, w7) VALUES (1,1,1,1,1,1,1,1)")
     else:
-        _ensure_column(con, "expert_w", "w4", "REAL NOT NULL DEFAULT 1.0")
+        for col in ("w5","w6","w7"):
+            _ensure_column(con, "expert_w", col, "REAL NOT NULL DEFAULT 1.0")
 
     con.commit(); con.close()
 migrate_db()
@@ -231,8 +242,7 @@ def _exec_write(sql: str, params: tuple=()):
                 con.execute(sql, params)
             return
         except sqlite3.OperationalError as e:
-            emsg = str(e).lower()
-            if "locked" in emsg or "busy" in emsg:
+            if "locked" in str(e).lower() or "busy" in str(e).lower():
                 time.sleep(0.25*(attempt+1))
                 continue
             raise
@@ -407,27 +417,76 @@ def _feedback_prob(n:int, ctx: List[int], cand:int) -> float:
     tot = abs(tot)
     return max(0.0, w) / (tot if tot > 0 else 1e-9)
 
-def _decision_context(after: Optional[int]) -> Tuple[List[int], List[int], List[int], List[int]]:
-    tail = get_tail(400)
-    if tail and after is not None and after in tail:
-        idxs = [i for i,v in enumerate(tail) if v == after]
-        i = idxs[-1]
-        ctx1 = tail[max(0,i):i+1]
-        ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
-        ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
-        ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
-    else:
-        ctx4 = tail[-4:] if len(tail)>=4 else []
-        ctx3 = tail[-3:] if len(tail)>=3 else []
-        ctx2 = tail[-2:] if len(tail)>=2 else []
-        ctx1 = tail[-1:] if len(tail)>=1 else []
-    return ctx1, ctx2, ctx3, ctx4
+# ========= Especialista 4 (LLM local) =========
+try:
+    from llama_cpp import Llama
+    _LLM = None
+    def _llm_load():
+        global _LLM
+        if _LLM is None and LLM_ENABLED and os.path.exists(LLM_MODEL_PATH):
+            _LLM = Llama(
+                model_path=LLM_MODEL_PATH,
+                n_ctx=LLM_CTX_TOKENS,
+                n_threads=LLM_N_THREADS,
+                verbose=False
+            )
+        return _LLM
+except Exception:
+    _LLM = None
+    def _llm_load():
+        return None
+
+_LLM_SYSTEM = (
+    "Você é um assistente que prevê o próximo número de um stream discreto com classes {1,2,3,4}.\n"
+    "Responda APENAS um JSON com probabilidades normalizadas: {\"1\":p1,\"2\":p2,\"3\":p3,\"4\":p4}."
+)
+
+def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
+    llm = _llm_load()
+    if llm is None or not LLM_ENABLED:
+        return {}
+    win60  = tail[-60:] if len(tail) >= 60 else tail
+    win300 = tail[-300:] if len(tail) >= 300 else tail
+    def freq(win, n): return win.count(n)/max(1, len(win))
+    feats = {
+        "len": len(tail),
+        "last10": tail[-10:],
+        "freq60": {n: freq(win60, n) for n in (1,2,3,4)},
+        "freq300": {n: freq(win300, n) for n in (1,2,3,4)},
+    }
+    user = (
+        f"Historico_Recente={tail[-50:]}\n"
+        f"Feats={feats}\n"
+        "Devolva JSON: {\"1\":p1,\"2\":p2,\"3\":p3,\"4\":p4}"
+    )
+    try:
+        out = llm.create_chat_completion(
+            messages=[{"role":"system","content":_LLM_SYSTEM},{"role":"user","content":user}],
+            temperature=LLM_TEMP, top_p=LLM_TOP_P, max_tokens=128
+        )
+        text = out["choices"][0]["message"]["content"].strip()
+        m = re.search(r"\{.*\}", text, re.S)
+        jtxt = m.group(0) if m else text
+        data = json.loads(jtxt)
+        raw = {int(k): float(v) for k,v in data.items() if str(k) in ("1","2","3","4")}
+        S = sum(raw.values()) or 1e-9
+        return {k: max(0.0, v/S) for k,v in raw.items() if k in (1,2,3,4)}
+    except Exception:
+        return {}
+
+# ========= Especialistas adicionais (E5..E7) =========
+def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
+    if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    win = tail[-k:] if len(tail) >= k else tail
+    tot = max(1, len(win))
+    return _norm_dict({c: win.count(c)/tot for c in [1,2,3,4]})
 
 def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
     cands = [1,2,3,4]
     scores = {c: 0.0 for c in cands}
     if not tail:
         return {c: 0.25 for c in cands}
+    # contextos
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]
         i = idxs[-1]
@@ -454,161 +513,136 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
     tot = sum(scores.values()) or 1e-9
     return {k: v/tot for k,v in scores.items()}
 
-# ========= LLM local (Especialista 4) =========
-try:
-    from llama_cpp import Llama
-    _LLM = None
-    def _llm_load():
-        global _LLM
-        if _LLM is None and LLM_ENABLED and os.path.exists(LLM_MODEL_PATH):
-            _LLM = Llama(
-                model_path=LLM_MODEL_PATH,
-                n_ctx=LLM_CTX_TOKENS,
-                n_threads=LLM_N_THREADS,
-                verbose=False
-            )
-        return _LLM
-except Exception:
-    _LLM = None
-    def _llm_load():
-        return None
-
-_LLM_SYSTEM = (
-    "Você é um assistente que prevê o próximo número de um stream discreto com classes {1,2,3,4}.\n"
-    "Responda APENAS um JSON com as probabilidades normalizadas em porcentagem, "
-    "com esta forma exata: {\"1\":p1,\"2\":p2,\"3\":p3,\"4\":p4}. Sem texto extra."
-)
-
-def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
-    llm = _llm_load()
-    if llm is None or not LLM_ENABLED:
-        return {}
-    win60  = tail[-60:] if len(tail) >= 60 else tail
-    win300 = tail[-300:] if len(tail) >= 300 else tail
-    def freq(win, n): return win.count(n)/max(1, len(win))
-    feats = {
-        "len": len(tail),
-        "last10": tail[-10:],
-        "freq60": {n: freq(win60, n) for n in (1,2,3,4)},
-        "freq300": {n: freq(win300, n) for n in (1,2,3,4)},
-    }
-    user = (
-        f"Historico_Recente={tail[-50:]}\n"
-        f"Feats={feats}\n"
-        "Devolva JSON com as probabilidades (%) para o PRÓXIMO número. "
-        "Formato: {\"1\":p1,\"2\":p2,\"3\":p3,\"4\":p4}"
-    )
-    try:
-        out = llm.create_chat_completion(
-            messages=[
-                {"role":"system","content":_LLM_SYSTEM},
-                {"role":"user","content":user}
-            ],
-            temperature=LLM_TEMP,
-            top_p=LLM_TOP_P,
-            max_tokens=128
-        )
-        text = out["choices"][0]["message"]["content"].strip()
-        m = re.search(r"\{.*\}", text, re.S)
-        jtxt = m.group(0) if m else text
-        data = json.loads(jtxt)
-        raw = {int(k): float(v) for k,v in data.items() if str(k) in ("1","2","3","4")}
-        S = sum(raw.values()) or 1e-9
-        return {k: max(0.0, v/S) for k,v in raw.items() if k in (1,2,3,4)}
-    except Exception:
-        return {}
-
-# ========= Ensemble (Hedge) — 4 especialistas =========
-def _norm_dict(d: Dict[int,float]) -> Dict[int,float]:
-    s = sum(d.values()) or 1e-9
-    return {k: v/s for k,v in d.items()}
-
-def _post_freq_k(tail: List[int], k: int) -> Dict[int,float]:
+def _post_fibo_freq(tail: List[int], max_len:int=60) -> Dict[int,float]:
+    """E5: pesos de Fibonacci para dar mais força ao recente sem colapsar diversidade."""
     if not tail: return {1:0.25,2:0.25,3:0.25,4:0.25}
-    win = tail[-k:] if len(tail) >= k else tail
-    tot = max(1, len(win))
-    return _norm_dict({c: win.count(c)/tot for c in [1,2,3,4]})
+    win = tail[-max_len:] if len(tail) >= max_len else tail
+    # gera pesos fibo: 1,1,2,3,5,8...
+    fib = [1,1]
+    while len(fib) < len(win):
+        fib.append(fib[-1] + fib[-2])
+    # aplica do mais antigo pro mais novo
+    acc = {1:0.0,2:0.0,3:0.0,4:0.0}
+    for n, w in zip(win, fib[:len(win)]):
+        acc[int(n)] += float(w)
+    return _norm_dict(acc)
 
+def _post_markov1(tail: List[int]) -> Dict[int,float]:
+    """E6: cadeia de Markov de 1ª ordem: P(next|last)."""
+    if not tail:
+        return {1:0.25,2:0.25,3:0.25,4:0.25}
+    trans = {(a,b):0.0 for a in (1,2,3,4) for b in (1,2,3,4)}
+    for a,b in zip(tail[:-1], tail[1:]):
+        trans[(int(a), int(b))] += 1.0
+    last = int(tail[-1])
+    row = {b: trans[(last,b)] for b in (1,2,3,4)}
+    if sum(row.values()) <= 0:
+        return {1:0.25,2:0.25,3:0.25,4:0.25}
+    return _norm_dict(row)
+
+def _post_inverse_tilt(tail: List[int]) -> Dict[int,float]:
+    """E7: anti-tilt simples — reduz ligeiramente a probabilidade do último número e de empates estreitos."""
+    base = _post_freq_k(tail, K_SHORT)
+    if not tail: return base
+    last = int(tail[-1])
+    # empurra 10% do 'last' para os demais
+    give = min(0.10, base.get(last,0.0))
+    stay = max(0.0, base.get(last,0.0) - give)
+    others = [c for c in (1,2,3,4) if c != last]
+    for c in others:
+        base[c] = base.get(c,0.0) + give/len(others)
+    base[last] = stay
+    return _norm_dict(base)
+
+# ========= Ensemble 7 especialistas =========
 def _get_expert_w():
     con = _connect()
-    row = con.execute("SELECT w1,w2,w3,w4 FROM expert_w WHERE id=1").fetchone()
+    row = con.execute("SELECT w1,w2,w3,w4,w5,w6,w7 FROM expert_w WHERE id=1").fetchone()
     con.close()
-    if not row: return (1.0, 1.0, 1.0, 1.0)
-    return float(row["w1"]), float(row["w2"]), float(row["w3"]), float(row["w4"])
+    if not row: return (1,1,1,1,1,1,1)
+    return tuple(float(row[f"w{i}"]) for i in range(1,8))
 
-def _set_expert_w(w1, w2, w3, w4):
-    _exec_write("UPDATE expert_w SET w1=?, w2=?, w3=?, w4=? WHERE id=1",
-                (float(w1), float(w2), float(w3), float(w4)))
+def _set_expert_w(weights: List[float]):
+    assert len(weights) == 7
+    _exec_write("UPDATE expert_w SET w1=?,w2=?,w3=?,w4=?,w5=?,w6=?,w7=? WHERE id=1",
+                tuple(float(x) for x in weights))
 
-def _hedge_blend4(p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float], p4:Dict[int,float]):
-    w1, w2, w3, w4 = _get_expert_w()
-    S = (w1 + w2 + w3 + w4) or 1e-9
-    w1, w2, w3, w4 = (w1/S, w2/S, w3/S, w4/S)
-    blended = {c: w1*p1.get(c,0)+w2*p2.get(c,0)+w3*p3.get(c,0)+w4*p4.get(c,0) for c in [1,2,3,4]}
-    s2 = sum(blended.values()) or 1e-9
-    return {k: v/s2 for k,v in blended.items()}, (w1,w2,w3,w4)
+def _blend_probs(ps: List[Dict[int,float]], ws: List[float]) -> Dict[int,float]:
+    S = sum(ws) or 1e-9
+    ws = [w/S for w in ws]
+    acc = {1:0.0,2:0.0,3:0.0,4:0.0}
+    for p, w in zip(ps, ws):
+        for c in (1,2,3,4):
+            acc[c] += w * p.get(c, 0.0)
+    return _norm_dict(acc)
 
-def _hedge_update4(true_c:int, p1:Dict[int,float], p2:Dict[int,float], p3:Dict[int,float], p4:Dict[int,float]):
-    w1, w2, w3, w4 = _get_expert_w()
-    l = lambda p: 1.0 - p.get(true_c, 0.0)
+def _hedge_update(true_c:int, ps: List[Dict[int,float]], ws: List[float]) -> List[float]:
     from math import exp
-    w1n = w1 * exp(-HEDGE_ETA * (1.0 - l(p1)))
-    w2n = w2 * exp(-HEDGE_ETA * (1.0 - l(p2)))
-    w3n = w3 * exp(-HEDGE_ETA * (1.0 - l(p3)))
-    w4n = w4 * exp(-HEDGE_ETA * (1.0 - l(p4)))
-    S = (w1n + w2n + w3n + w4n) or 1e-9
-    _set_expert_w(w1n/S, w2n/S, w3n/S, w4n/S)
+    new = []
+    for w, p in zip(ws, ps):
+        l = 1.0 - p.get(true_c, 0.0)      # loss
+        new.append(w * exp(-HEDGE_ETA * (1.0 - l)))
+    S = sum(new) or 1e-9
+    return [x/S for x in new]
 
-# ========= Anti-tilt (sem reduzir sinais) =========
-def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
-    reason = "IA"
+def _decision_context(after: Optional[int]) -> Tuple[List[int], List[int], List[int], List[int]]:
+    tail = get_tail(400)
+    if tail and after is not None and after in tail:
+        idxs = [i for i,v in enumerate(tail) if v == after]
+        i = idxs[-1]
+        ctx1 = tail[max(0,i):i+1]
+        ctx2 = tail[max(0,i-1):i+1] if i-1>=0 else []
+        ctx3 = tail[max(0,i-2):i+1] if i-2>=0 else []
+        ctx4 = tail[max(0,i-3):i+1] if i-3>=0 else []
+    else:
+        ctx4 = tail[-4:] if len(tail)>=4 else []
+        ctx3 = tail[-3:] if len(tail)>=3 else []
+        ctx2 = tail[-2:] if len(tail)>=2 else []
+        ctx1 = tail[-1:] if len(tail)>=1 else []
+    return ctx1, ctx2, ctx3, ctx4
+
+def choose_single_number(after: Optional[int]):
+    tail = get_tail(400)
+    # especialistas
+    post_e1 = _post_from_tail(tail, after)                 # n-grama + feedback
+    post_e2 = _post_freq_k(tail, K_SHORT)                  # freq curta
+    post_e3 = _post_freq_k(tail, K_LONG)                   # freq longa
+    post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}  # IA
+    post_e5 = _post_fibo_freq(tail)                        # fibo-recency
+    post_e6 = _post_markov1(tail)                          # markov(1)
+    post_e7 = _post_inverse_tilt(tail)                     # anti-tilt inverso
+
+    ps = [post_e1, post_e2, post_e3, post_e4, post_e5, post_e6, post_e7]
+    ws = list(_get_expert_w())
+
+    post = _blend_probs(ps, ws)
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
+    top2 = ranking[:2]
+    gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
     best = ranking[0][0]
+    conf = float(post[best])
+    # leve anti-tilt interno se streak alto (mantido do projeto)
+    ls = _get_loss_streak()
     if ls >= 3:
         comp = _norm_dict({c: max(1e-9, 1.0 - post[c]) for c in [1,2,3,4]})
         post = _norm_dict({c: 0.7*post[c] + 0.3*comp[c] for c in [1,2,3,4]})
         ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
         best = ranking[0][0]
-        reason = "IA_anti_tilt_mix"
-    if ls >= 2:
-        top2 = ranking[:2]
-        if len(top2) == 2 and gap < 0.05:
-            best = top2[1][0]
-            reason = "IA_runnerup_ls2"
-    return best, reason, post
-
-def choose_single_number(after: Optional[int]):
-    tail = get_tail(400)
-    post_e1 = _post_from_tail(tail, after)         # n-grama + feedback
-    post_e2 = _post_freq_k(tail, K_SHORT)          # freq curta
-    post_e3 = _post_freq_k(tail, K_LONG)           # freq longa
-    post_e4 = _llm_probs_from_tail(tail) or {1:0.25,2:0.25,3:0.25,4:0.25}  # IA local
-    post, (w1,w2,w3,w4) = _hedge_blend4(post_e1, post_e2, post_e3, post_e4)
-    ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
-    top2 = ranking[:2]
-    gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
-    base_best = ranking[0][0]
-    conf = float(post[base_best])
-    ls = _get_loss_streak()
-    best, reason, post_adj = _streak_adjust_choice(post, gap, ls)
-    conf = float(post_adj[best])
-    r2 = sorted(post_adj.items(), key=lambda kv: kv[1], reverse=True)[:2]
+        conf = float(post[best])
+    r2 = sorted(post.items(), key=lambda kv: kv[1], reverse=True)[:2]
     gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
-    return best, conf, timeline_size(), post_adj, gap2, reason
+    return best, conf, timeline_size(), post, gap2, "ENSEMBLE7"
 
-# ========= Parse (com keycaps e ANALISANDO) =========
-ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
-SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
-AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
-GALE1_RX = re.compile(r"Estamos\s+no\s*1[ºo]\s*gale", re.I)
-GALE2_RX = re.compile(r"Estamos\s+no\s*2[ºo]\s*gale", re.I)
-GALE3_RX = re.compile(r"Estamos\s+no\s*3[ºo]\s*gale", re.I)
-GALE4_RX = re.compile(r"Estamos\s+no\s*4[ºo]\s*gale", re.I)
-GALE5_RX = re.compile(r"Estamos\s+no\s*5[ºo]\s*gale", re.I)
-GALE6_RX = re.compile(r"Estamos\s+no\s*6[ºo]\s*gale", re.I)
+# ========= Parse =========
+ENTRY_RX  = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
+SEQ_RX    = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
+AFTER_RX  = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
+ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
 
 GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
 LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
+
+GALE_RX  = re.compile(r"Estamos\s+no\s*([1-6])[ºo]\s*gale", re.I)
 
 PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
 ANY_14_RX      = re.compile(r"[1-4]")
@@ -636,7 +670,7 @@ def parse_close_numbers(text: str) -> List[int]:
     if groups:
         last = groups[-1]
         nums = re.findall(r"[1-4]", _normalize_keycaps(last))
-        return [int(x) for x in nums][:MAX_OBS]   # agora até 7
+        return [int(x) for x in nums][:MAX_OBS]
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:MAX_OBS]
 
@@ -666,15 +700,10 @@ def _seen_append(row: sqlite3.Row, new_items: List[str]):
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
 
 def _stage_from_observed(suggested: int, obs: List[int]) -> Tuple[str, str]:
-    """
-    obs = sequência de observados (ex.: [2,4,3, ...]) — tamanho até MAX_OBS
-    Retorna (outcome, stage): GREEN em G0..G6 se encontrou; senão LOSS em G6.
-    """
-    for idx, val in enumerate(obs[:MAX_OBS]):
-        if val == suggested:
-            return ("GREEN", f"G{idx}")  # idx=0 => G0, idx=1 => G1, ..., idx=6 => G6
-    # não bateu até o limite
-    return ("LOSS", f"G{MAX_GALE}")
+    for i, n in enumerate(obs[:MAX_OBS]):
+        if n == suggested:
+            return ("GREEN", f"G{i}")
+    return ("LOSS", f"G{MAX_GALES}")
 
 def _ngram_snapshot_text(suggested: int) -> str:
     tail = get_tail(400)
@@ -718,7 +747,7 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
         ctx1, ctx2, ctx3, ctx4 = ctxs
 
         if outcome.upper() == "GREEN":
-            stage_weight = {"G0": 1.00, "G1": 0.65, "G2": 0.40}.get(stage_lbl, 0.50)
+            stage_weight = {"G0": 1.00, "G1": 0.65, "G2": 0.40, "G3":0.28, "G4":0.20, "G5":0.15, "G6":0.12}.get(stage_lbl, 0.50)
             delta = FEED_POS * stage_weight
             for (n,ctx) in [(1,ctx1),(2,ctx2),(3,ctx3),(4,ctx4)]:
                 if len(ctx)>=1:
@@ -741,7 +770,7 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
     except Exception:
         pass
 
-    # Hedge update — 4 especialistas
+    # Hedge update — 7 especialistas
     try:
         true_first = None
         try:
@@ -750,11 +779,18 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
             pass
         if true_first is not None:
             tail_now = get_tail(400)
-            post_e1 = _post_from_tail(tail_now, after=None)
-            post_e2 = _post_freq_k(tail_now, K_SHORT)
-            post_e3 = _post_freq_k(tail_now, K_LONG)
-            post_e4 = _llm_probs_from_tail(tail_now) or {1:0.25,2:0.25,3:0.25,4:0.25}
-            _hedge_update4(true_first, post_e1, post_e2, post_e3, post_e4)
+            ps = [
+                _post_from_tail(tail_now, after=None),
+                _post_freq_k(tail_now, K_SHORT),
+                _post_freq_k(tail_now, K_LONG),
+                _llm_probs_from_tail(tail_now) or {1:0.25,2:0.25,3:0.25,4:0.25},
+                _post_fibo_freq(tail_now),
+                _post_markov1(tail_now),
+                _post_inverse_tilt(tail_now),
+            ]
+            ws = list(_get_expert_w())
+            ws2 = _hedge_update(true_first, ps, ws)
+            _set_expert_w(ws2)
     except Exception:
         pass
 
@@ -769,14 +805,13 @@ def _close_with_outcome(row: sqlite3.Row, outcome: str, final_seen: str, stage_l
     return msg
 
 def _maybe_close_by_timeout():
-    """Se passou tempo demais, completa com X até MAX_OBS e fecha."""
     row = get_open_pending()
     if not row: return None
     opened_at = int(row["opened_at"] or row["created_at"] or now_ts())
     if now_ts() - opened_at < OBS_TIMEOUT_SEC:
         return None
     seen_list = _seen_list(row)
-    if len(seen_list) < MAX_OBS:
+    if 0 < len(seen_list) < MAX_OBS:
         while len(seen_list) < MAX_OBS:
             seen_list.append("X")
         final_seen = "-".join(seen_list[:MAX_OBS])
@@ -787,7 +822,6 @@ def _maybe_close_by_timeout():
     return None
 
 def close_pending(outcome:str):
-    """Força fechar preenchendo X até MAX_OBS (não usada no fluxo normal)."""
     row = get_open_pending()
     if not row: return
     seen_list = _seen_list(row)
@@ -798,18 +832,6 @@ def close_pending(outcome:str):
     obs_nums = [int(x) for x in seen_list if x.isdigit()]
     outcome2, stage_lbl = _stage_from_observed(suggested, obs_nums)
     return _close_with_outcome(row, outcome2, final_seen, stage_lbl, suggested)
-
-def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1,ctx2,ctx3,ctx4) -> bool:
-    """Abertura transacional: só abre se não existir pendência aberta."""
-    with _tx() as con:
-        row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
-        if row:
-            return False
-        con.execute("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at, after, ctx1, ctx2, ctx3, ctx4, wait_notice_sent)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,0)""",
-                    (now_ts(), int(suggested), 0, 1, "", now_ts(), after,
-                     _ctx_to_key(ctx1), _ctx_to_key(ctx2), _ctx_to_key(ctx3), _ctx_to_key(ctx4)))
-        return True
 
 # ========= Telegram =========
 async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
@@ -822,12 +844,24 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML"):
     except Exception:
         pass
 
-# ========= Helpers de abertura automática (cadeia) =========
+# ========= Helpers de abertura (cadeia) =========
+def _ctx_to_key(ctx: List[int]) -> str:
+    return ",".join(str(x) for x in ctx) if ctx else ""
+
+def _open_pending_with_ctx(suggested:int, after:Optional[int], ctx1,ctx2,ctx3,ctx4) -> bool:
+    with _tx() as con:
+        row = con.execute("SELECT 1 FROM pending WHERE open=1 LIMIT 1").fetchone()
+        if row:
+            return False
+        con.execute("""INSERT INTO pending (created_at, suggested, stage, open, seen, opened_at, after, ctx1, ctx2, ctx3, ctx4, wait_notice_sent)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,0)""",
+                    (now_ts(), int(suggested), 0, 1, "", now_ts(), after,
+                     _ctx_to_key(ctx1), _ctx_to_key(ctx2), _ctx_to_key(ctx3), _ctx_to_key(ctx4)))
+        return True
+
 async def _open_suggestion(after: Optional[int], origin_tag: str):
-    """Abre a sugestão com o motor atual, se não houver pendência."""
     if get_open_pending():
         return {"ok": True, "skipped": "pending_open"}
-
     best, conf, samples, post, gap, reason = choose_single_number(after)
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
     if not _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
@@ -839,16 +873,18 @@ async def _open_suggestion(after: Optional[int], origin_tag: str):
         f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
         f"🧩 <b>Padrão:</b> GEN{aft_txt} ({origin_tag})\n"
         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-        f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}"
+        f"🧠 <b>Modo:</b> ENSEMBLE7 | <b>streak RED:</b> {ls}"
     )
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best}
 
-# ========= Rotas =========
+# ========= App =========
+app = FastAPI(title="guardiao-auto-bot (G6 + ENSEMBLE7)", version="5.0.0")
+
 @app.get("/")
 async def root():
     check_and_maybe_reset_score()
-    return {"ok": True, "service": "guardiao-auto-bot (GEN webhook)"}
+    return {"ok": True, "service": "guardiao-auto-bot (G6 + ENSEMBLE7)"}
 
 @app.get("/health")
 async def health():
@@ -858,6 +894,7 @@ async def health():
     seen = (pend["seen"] if pend else "")
     return {"ok": True, "db": DB_PATH, "pending_open": pend_open, "pending_seen": seen, "time": ts_str(), "tz": TZ_NAME}
 
+# ========= Handler principal =========
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
@@ -867,13 +904,13 @@ async def webhook(token: str, request: Request):
 
     data = await request.json()
 
-    # DEDUPE por update_id
+    # DEDUPE
     upd_id = str(data.get("update_id", "")) if isinstance(data, dict) else ""
     if _is_processed(upd_id):
         return {"ok": True, "skipped": "duplicate_update"}
     _mark_processed(upd_id)
 
-    # timeout pode fechar pendência antiga (preenche X até MAX_OBS)
+    # Timeout pode fechar pendências
     timeout_msg = _maybe_close_by_timeout()
     if timeout_msg:
         await tg_send_text(TARGET_CHANNEL, timeout_msg)
@@ -885,7 +922,7 @@ async def webhook(token: str, request: Request):
     chat = msg.get("chat") or {}
     chat_id = str(chat.get("id") or "")
 
-    # Filtro de fonte (bypass para diagnóstico)
+    # Filtro de origem
     if SOURCE_CHANNEL and not BYPASS_SOURCE and chat_id != str(SOURCE_CHANNEL):
         if DEBUG_MSG:
             await tg_send_text(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
@@ -893,13 +930,47 @@ async def webhook(token: str, request: Request):
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
+    # Reconhecer "Estamos no N° gale"
+    m_gale = GALE_RX.search(text)
+    if m_gale:
+        g = int(m_gale.group(1))
+        if get_open_pending():
+            set_stage(g)
+            await tg_send_text(TARGET_CHANNEL, f"🔁 Estamos no <b>{g}° gale (G{g})</b>")
+        return {"ok": True, "noted": f"g{g}"}
+
+    # Fechamentos do fonte (GREEN/LOSS)
+    if GREEN_RX.search(text) or LOSS_RX.search(text):
+        pend = get_open_pending()
+        if pend:
+            nums = parse_close_numbers(text)  # até MAX_OBS
+            if nums:
+                _seen_append(pend, [str(n) for n in nums])
+                pend = get_open_pending()
+            seen_list = _seen_list(pend) if pend else []
+            if pend and len(seen_list) >= MAX_OBS:
+                suggested = int(pend["suggested"] or 0)
+                obs_nums = [int(x) for x in seen_list if x.isdigit()]
+                outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
+                final_seen = "-".join(seen_list[:MAX_OBS])
+                out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
+                await tg_send_text(TARGET_CHANNEL, out_msg)
+                if CHAIN_ON:
+                    mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
+                    after = int(mafter.group(1)) if mafter else None
+                    return await _open_suggestion(after, origin_tag="after_close")
+                return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
+        return {"ok": True, "noted_close": True}
+
     # 0) ANALISANDO — aprende, pode abrir, e pode adiantar/fechar
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
-        seq = parse_analise_seq(text)
+        # aprender sequência
+        mseq = SEQ_RX.search(_normalize_keycaps(text or ""))
+        seq = [int(x) for x in re.findall(r"[1-4]", mseq.group(1))] if mseq else []
         if seq:
-            append_seq(seq)  # aprende padrão
+            append_seq(seq)
 
-            # se não houver pendência, pode abrir a partir do ANALISANDO
+            # se não houver pendência, abrir via analise
             if not get_open_pending():
                 mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
                 after = int(mafter.group(1)) if mafter else None
@@ -931,64 +1002,6 @@ async def webhook(token: str, request: Request):
                                 return await _open_suggestion(after2, origin_tag="analise_after_close")
                             return {"ok": True, "closed_from_analise": True, "seen": final_seen}
         return {"ok": True, "analise_seen": len(seq)}
-
-    # 1) Gales (informativo)
-    if GALE1_RX.search(text):
-        if get_open_pending():
-            set_stage(1)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>1° gale (G1)</b>")
-        return {"ok": True, "noted": "g1"}
-    if GALE2_RX.search(text):
-        if get_open_pending():
-            set_stage(2)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>2° gale (G2)</b>")
-        return {"ok": True, "noted": "g2"}
-    if GALE3_RX.search(text):
-        if get_open_pending():
-            set_stage(3)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>3° gale (G3)</b>")
-        return {"ok": True, "noted": "g3"}
-    if GALE4_RX.search(text):
-        if get_open_pending():
-            set_stage(4)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>4° gale (G4)</b>")
-        return {"ok": True, "noted": "g4"}
-    if GALE5_RX.search(text):
-        if get_open_pending():
-            set_stage(5)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>5° gale (G5)</b>")
-        return {"ok": True, "noted": "g5"}
-    if GALE6_RX.search(text):
-        if get_open_pending():
-            set_stage(6)
-            await tg_send_text(TARGET_CHANNEL, "🔁 Estamos no <b>6° gale (G6)</b>")
-        return {"ok": True, "noted": "g6"}
-
-    GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
-    LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
-
-    # 2) Fechamentos do fonte (GREEN/LOSS)
-    if GREEN_RX.search(text) or LOSS_RX.search(text):
-        pend = get_open_pending()
-        if pend:
-            nums = parse_close_numbers(text)  # agora aceita até MAX_OBS
-            if nums:
-                _seen_append(pend, [str(n) for n in nums])
-                pend = get_open_pending()
-            seen_list = _seen_list(pend) if pend else []
-            if pend and len(seen_list) >= MAX_OBS:
-                suggested = int(pend["suggested"] or 0)
-                obs_nums = [int(x) for x in seen_list if x.isdigit()]
-                outcome, stage_lbl = _stage_from_observed(suggested, obs_nums)
-                final_seen = "-".join(seen_list[:MAX_OBS])
-                out_msg = _close_with_outcome(pend, outcome, final_seen, stage_lbl, suggested)
-                await tg_send_text(TARGET_CHANNEL, out_msg)
-                if CHAIN_ON:
-                    mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
-                    after = int(mafter.group(1)) if mafter else None
-                    return await _open_suggestion(after, origin_tag="after_close")
-                return {"ok": True, "closed": outcome.lower(), "seen": final_seen}
-        return {"ok": True, "noted_close": True}
 
     # 3) Nova ENTRADA CONFIRMADA (Fluxo estrito)
     parsed = parse_entry_text(text)
@@ -1032,7 +1045,7 @@ async def webhook(token: str, request: Request):
         f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
         f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-        f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}"
+        f"🧠 <b>Modo:</b> ENSEMBLE7 | <b>streak RED:</b> {ls}"
     )
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples}
