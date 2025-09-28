@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-webhook_app.py — G0 only — 30 especialistas (E1..E30)
-- Sem gales: decisão única (G0) por consenso de 30 especialistas
-- Dedupe por update_id (tabela processed) — corrigido tuple (upd_id,)
-- Filtro por SOURCE_CHANNEL
-- Fechamento G0 com snapshot + aviso curto + novo sinal (after_close)
-- DB SQLite (WAL + busy_timeout)
+webhook_app.py — G0 only — 10 especialistas (E1..E10)
+- Fluxo G0 puro: decisão única (sem gales)
+- Aprende com "ANALISANDO" (Sequência)
+- Dedupe por update_id (tabela processed)
+- Filtro de origem (SOURCE_CHANNEL) opcional
+- Abre sugestão, fecha com 1º observado (G0) e publica 🟢/🔴 + snapshot
+- (Opcional) abre novo sinal imediatamente após fechar (OPEN_AFTER_CLOSE=on)
+- DB SQLite com WAL + busy_timeout
+- Configuração via ENV (ver docstring)
 
 Rotas:
-  GET  /                    -> ok
-  GET  /health              -> status
-  POST /webhook/meusegredo123  -> endpoint do Telegram
+  GET  /health
+  POST /webhook/{WEBHOOK_TOKEN}
 """
 
 import os, re, time, sqlite3, math, json
@@ -20,20 +21,36 @@ from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
-# ========= CONFIG FIXA =========
-TG_BOT_TOKEN   = "8315698154:AAH38hr2RbR0DtfalMNuXdGsh4UghDeztK4"
-WEBHOOK_TOKEN  = "meusegredo123"
-TARGET_CHANNEL = "-1002796105884"
-SOURCE_CHANNEL = "-1002810508717"
-DB_PATH        = "/var/data/data.db"
-TZ_NAME        = "America/Sao_Paulo"
+# ========= ENV =========
+TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
+WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
+SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # vazio = sem filtro
+DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
+DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip().lower() in ("1","true","yes")
+BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip().lower() in ("1","true","yes")
+TZ_NAME        = os.getenv("TZ_NAME", "America/Sao_Paulo").strip()
 
-DEBUG_MSG      = False
-BYPASS_SOURCE  = False
+# Ajustes (todos opcionais)
+CONF_MIN        = float(os.getenv("CONF_MIN", "0.00"))      # não bloqueia; informativo
+GAP_MIN         = float(os.getenv("GAP_MIN", "0.00"))       # não bloqueia; informativo
+ENSEMBLE_TEMP   = float(os.getenv("ENSEMBLE_TEMP", "0.75")) # t do softmax do ensemble
+META_TEMP       = float(os.getenv("META_TEMP", "0.60"))     # t do meta-sharpen
+HISTORY_WINDOW  = int(os.getenv("HISTORY_WINDOW", "400"))   # janela de histórico
+NGRAM_DECAY     = float(os.getenv("NGRAM_DECAY", "0.980"))  # decaimento n-gram
+FEEDBACK_DECAY  = float(os.getenv("FEEDBACK_DECAY", "0.995"))
+FEEDBACK_REINFORCE = float(os.getenv("FEEDBACK_REINFORCE", "0.80"))
+OPEN_AFTER_CLOSE   = os.getenv("OPEN_AFTER_CLOSE", "on").strip().lower() in ("1","true","yes","on")
 
-# ========= Imports web =========
+if not TG_BOT_TOKEN:
+    raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
+if not WEBHOOK_TOKEN:
+    raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
+
+# ========= Web =========
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+app = FastAPI(title="guardiao-g0-10x", version="1.0.0")
 
 # ========= Timezone =========
 try:
@@ -41,9 +58,6 @@ try:
     _TZ = ZoneInfo(TZ_NAME)
 except Exception:
     _TZ = timezone.utc
-
-# ========= App =========
-app = FastAPI(title="guardiao-g0-30x", version="1.2.0")
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -176,20 +190,23 @@ def append_seq(seq: List[int]):
                         (now_ts(), int(n)))
     _update_ngrams()
 
-def get_tail(limit:int=400) -> List[int]:
+def get_tail(limit:int=None) -> List[int]:
+    if limit is None: limit = HISTORY_WINDOW
     con = _connect()
-    rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
     con.close()
     return [int(r["number"]) for r in rows][::-1]
 
-def _update_ngrams(decay: float=0.985, max_n:int=5, window:int=400):
+def _update_ngrams(decay: float=None, max_n:int=5, window:int=None):
+    if decay is None: decay = NGRAM_DECAY
+    if window is None: window = HISTORY_WINDOW
     tail = get_tail(window)
     if len(tail) < 2: return
     with _tx() as con:
         for t in range(1, len(tail)):
             nxt = int(tail[t])
             dist = (len(tail)-1) - t
-            w = decay ** dist
+            w = float(decay) ** float(dist)
             for n in range(2, max_n+1):
                 if t-(n-1) < 0: break
                 ctx = tail[t-(n-1):t]
@@ -198,7 +215,7 @@ def _update_ngrams(decay: float=0.985, max_n:int=5, window:int=400):
                   INSERT INTO ngram (n, ctx, nxt, w)
                   VALUES (?,?,?,?)
                   ON CONFLICT(n, ctx, nxt) DO UPDATE SET w = w + excluded.w
-                """, (n, ctx_key, nxt, float(w)))
+                """, (n, ctx_key, nxt, w))
 
 def _prob_from_ngrams(ctx: List[int], cand: int) -> float:
     n = len(ctx) + 1
@@ -218,7 +235,7 @@ def _ctx_key(ctx: List[int]) -> str:
 
 def _feedback_upsert(n:int, ctx_key:str, nxt:int, delta:float):
     with _tx() as con:
-        con.execute("UPDATE feedback SET w = w * 0.998")
+        con.execute("UPDATE feedback SET w = w * ?", (float(FEEDBACK_DECAY),))
         con.execute("""
           INSERT INTO feedback (n, ctx, nxt, w)
           VALUES (?,?,?,?)
@@ -256,14 +273,14 @@ def _append_seen(row: sqlite3.Row, nums: List[int]):
     seen = (row["seen"] or "").strip()
     cur = [s for s in seen.split("-") if s]
     for n in nums:
-        if len(cur) >= 1: break  # G0 only
+        if len(cur) >= 1: break  # G0 only: só 1 observado
         cur.append(str(int(n)))
     seen_txt = "-".join(cur[:1])
     with _tx() as con:
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
 
 def _ngram_snapshot_text(suggested:int) -> str:
-    tail = get_tail(800)
+    tail = get_tail(HISTORY_WINDOW)
     post = _post_ngram_feedback(tail, None)
     def pct(x: float) -> str:
         try: return f"{x*100:.1f}%"
@@ -285,14 +302,13 @@ def _close_if_ready():
     if len(parts) >= 1:
         with _tx() as con:
             con.execute("UPDATE pending SET open=0 WHERE id=?", (int(row["id"]),))
-        # feedback leve
+        # feedback leve no último contexto
         try:
             tail = get_tail(5)
             true1 = int(parts[0])
-            _feedback_upsert(2, _ctx_key(tail[-1:]), true1, +0.8)
+            _feedback_upsert(2, _ctx_key(tail[-1:]), true1, +float(FEEDBACK_REINFORCE))
         except Exception:
             pass
-
         # GREEN/LOSS + snapshot
         suggested = int(row["suggested"] or 0)
         our_disp = suggested if suggested == int(parts[0]) else "X"
@@ -337,8 +353,7 @@ def _normalize_keycaps(s: str) -> str:
 def parse_entry_text(text: str) -> Optional[Dict]:
     t = _normalize_keycaps(re.sub(r"\s+", " ", text).strip())
     if not ENTRY_RX.search(t): return None
-    mseq = SEQ_RX.search(t)
-    seq = []
+    mseq = SEQ_RX.search(t); seq=[]
     if mseq:
         parts = re.findall(r"[1-4]", _normalize_keycaps(mseq.group(1)))
         seq = [int(x) for x in parts]
@@ -352,7 +367,7 @@ def parse_close_numbers(text: str) -> List[int]:
     if groups:
         last = groups[-1]
         nums = re.findall(r"[1-4]", _normalize_keycaps(last))
-        return [int(x) for x in nums][:1]  # G0
+        return [int(x) for x in nums][:1]  # G0: só 1
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:1]
 
@@ -362,7 +377,7 @@ def parse_analise_seq(text: str) -> List[int]:
     if not mseq: return []
     return [int(x) for x in re.findall(r"[1-4]", mseq.group(1))]
 
-# ========= Especialistas (E1..E30) =========
+# ========= Especialistas (E1..E10) =========
 CANDS = [1,2,3,4]
 
 def _post_ngram_feedback(tail: List[int], after: Optional[int]) -> Dict[int,float]:
@@ -398,37 +413,6 @@ def _post_entropy_balancer(tail: List[int]) -> Dict[int,float]:
     uni = {c:0.25 for c in CANDS}
     return _norm({c: (1-mix)*f60[c] + mix*uni[c] for c in CANDS})
 
-def _post_fibo_like(tail: List[int]) -> Dict[int,float]:
-    if len(tail) < 2: return {c:0.25 for c in CANDS}
-    a, b = tail[-2], tail[-1]
-    raw = (a + b) % 4
-    pred = 4 if raw==0 else raw
-    d = {c:0.05 for c in CANDS}; d[pred] = 0.85
-    return _norm(d)
-
-def _post_paridade(tail: List[int]) -> Dict[int,float]:
-    if not tail: return {c:0.25 for c in CANDS}
-    last = tail[-1]
-    want_even = (last % 2 != 0)
-    d = {c:0.15 for c in CANDS}
-    for c in CANDS:
-        if (c%2==0) == want_even:
-            d[c] += 0.35
-    return _norm(d)
-
-def _post_run_length(tail: List[int]) -> Dict[int,float]:
-    if not tail: return {c:0.25 for c in CANDS}
-    last = tail[-1]; run = 1
-    for i in range(len(tail)-2, -1, -1):
-        if tail[i]==last: run+=1
-        else: break
-    d = {c:0.25 for c in CANDS}
-    d[last] = max(0.01, 0.40 - 0.08*run)
-    rest = 1.0 - d[last]
-    others = [c for c in CANDS if c!=last]
-    for c in others: d[c] = rest/len(others)
-    return _norm(d)
-
 def _post_markov_1(tail: List[int]) -> Dict[int,float]:
     if len(tail) < 2: return {c:0.25 for c in CANDS}
     counts = {c:{d:1.0 for d in CANDS} for c in CANDS}
@@ -438,30 +422,12 @@ def _post_markov_1(tail: List[int]) -> Dict[int,float]:
     last = tail[-1]
     return _norm(counts[last])
 
-def _post_recency_penalty(tail: List[int]) -> Dict[int,float]:
-    if not tail: return {c:0.25 for c in CANDS}
-    last_pos = {c: -9999 for c in CANDS}
-    for idx, v in enumerate(tail): last_pos[v] = idx
-    n = len(tail)-1
-    gaps = {c: (n - last_pos[c]) for c in CANDS}
-    return _softmax(gaps, t=3.0)
-
 def _post_exp_decay_freq(tail: List[int]) -> Dict[int,float]:
     if not tail: return {c:0.25 for c in CANDS}
     lam = 0.95; score = {c:0.0 for c in CANDS}; w = 1.0
     for v in reversed(tail):
         score[v] += w; w *= lam
     return _norm(score)
-
-def _post_least_freq_short(tail: List[int]) -> Dict[int,float]:
-    f = _post_freq_k(tail, 30)
-    inv = {c: (1.001 - f[c]) for c in CANDS}
-    return _norm(inv)
-
-def _post_streak_breaker(tail: List[int]) -> Dict[int,float]:
-    if not tail: return {c:0.25 for c in CANDS}
-    last = tail[-1]; d = {c:0.24 for c in CANDS}; d[last] = 0.05
-    return _norm(d)
 
 def _post_pair_table(tail: List[int]) -> Dict[int,float]:
     if len(tail) < 2: return {c:0.25 for c in CANDS}
@@ -475,96 +441,48 @@ def _post_pair_table(tail: List[int]) -> Dict[int,float]:
     a, b = tail[-2], tail[-1]
     return _norm(pair.get((a,b), {c:1.0 for c in CANDS}))
 
-def _post_cycle_guess(tail: List[int]) -> Dict[int,float]:
+def _post_run_length(tail: List[int]) -> Dict[int,float]:
     if not tail: return {c:0.25 for c in CANDS}
-    pred = (tail[-1] % 4) + 1
-    d = {c:0.09 for c in CANDS}; d[pred] = 0.73
+    last = tail[-1]; run = 1
+    for i in range(len(tail)-2, -1, -1):
+        if tail[i]==last: run+=1
+        else: break
+    d = {c:0.25 for c in CANDS}
+    d[last] = max(0.01, 0.40 - 0.08*run)
+    rest = 1.0 - d[last]; others = [c for c in CANDS if c!=last]
+    for c in others: d[c] = rest/len(others)
     return _norm(d)
 
-def _post_mirror(tail: List[int]) -> Dict[int,float]:
+def _post_recency_penalty(tail: List[int]) -> Dict[int,float]:
     if not tail: return {c:0.25 for c in CANDS}
-    m = {1:3, 3:1, 2:4, 4:2}; pred = m.get(tail[-1], 1)
-    d = {c:0.10 for c in CANDS}; d[pred] = 0.70
-    return _norm(d)
+    last_pos = {c: -9999 for c in CANDS}
+    for idx, v in enumerate(tail): last_pos[v] = idx
+    n = len(tail)-1
+    gaps = {c: (n - last_pos[c]) for c in CANDS}
+    return _softmax(gaps, t=3.0)
 
-def _post_feedback_bias(tail: List[int]) -> Dict[int,float]:
-    if not tail: return {c:0.25 for c in CANDS}
-    ctx = tail[-1:]; score = {c: 0.25 + 0.5*_feedback_prob(2, ctx, c) for c in CANDS}
-    return _norm(score)
-
-def _post_bayes_dirichlet(tail: List[int]) -> Dict[int,float]:
-    alpha = {c:1.0 for c in CANDS}
-    for v in tail[-120:]: alpha[v] += 1.0
-    s = sum(alpha.values())
-    return {c: alpha[c]/s for c in CANDS}
-
-def _post_time_mod(tail: List[int]) -> Dict[int,float]:
-    m = int(datetime.now(_TZ).strftime("%M"))
-    pred = (m % 4) + 1
-    d = {c:0.10 for c in CANDS}; d[pred] = 0.70
-    return _norm(d)
-
-def _post_anti_entropy(tail: List[int]) -> Dict[int,float]:
-    f = _post_freq_k(tail, 80)
-    H = -sum(p*math.log(p+1e-12,4) for p in f.values())
-    if H > 0.9:
-        d = {c:0.26 for c in CANDS}
-        if tail: d[tail[-1]] = 0.05
-        return _norm(d)
-    return f
-
-# extras p/ 30
-def _post_window_10(tail: List[int]) -> Dict[int,float]:   return _post_freq_k(tail, 10)
-def _post_window_120(tail: List[int]) -> Dict[int,float]:  return _post_freq_k(tail, 120)
-def _post_window_240(tail: List[int]) -> Dict[int,float]:  return _post_freq_k(tail, 240)
-def _post_even_bias(tail: List[int]) -> Dict[int,float]:
-    d = {1:0.22,2:0.28,3:0.22,4:0.28}; return _norm(d)
-def _post_odd_bias(tail: List[int]) -> Dict[int,float]:
-    d = {1:0.28,2:0.22,3:0.28,4:0.22}; return _norm(d)
-def _post_uniform(tail: List[int]) -> Dict[int,float]:
-    return {1:0.25,2:0.25,3:0.25,4:0.25}
 def _post_meta_sharpen(prev_posts: List[Dict[int,float]]) -> Dict[int,float]:
     avg = {c:0.0 for c in CANDS}
     for p in prev_posts:
         for c in CANDS:
             avg[c] += p.get(c, 0.0)
     for c in CANDS: avg[c] /= max(1, len(prev_posts))
-    return _softmax(avg, t=0.6)
+    return _softmax(avg, t=META_TEMP)
 
-def _ensemble_30(tail: List[int], after: Optional[int]) -> Tuple[int, Dict[int,float], Dict[str,Dict[int,float]]]:
+def _ensemble_10(tail: List[int], after: Optional[int]) -> Tuple[int, Dict[int,float], Dict[str,Dict[int,float]]]:
     posts = {}
-    posts["E01_ngram"]      = _post_ngram_feedback(tail, after)
-    posts["E02_freq10"]     = _post_window_10(tail)
-    posts["E03_freq60"]     = _post_freq_k(tail, 60)
-    posts["E04_freq120"]    = _post_window_120(tail)
-    posts["E05_freq240"]    = _post_window_240(tail)
-    posts["E06_freq300"]    = _post_freq_k(tail, 300)
-    posts["E07_entropy"]    = _post_entropy_balancer(tail)
-    posts["E08_fibo"]       = _post_fibo_like(tail)
-    posts["E09_paridade"]   = _post_paridade(tail)
-    posts["E10_runlen"]     = _post_run_length(tail)
-    posts["E11_markov1"]    = _post_markov_1(tail)
-    posts["E12_recency"]    = _post_recency_penalty(tail)
-    posts["E13_decay"]      = _post_exp_decay_freq(tail)
-    posts["E14_leastS"]     = _post_least_freq_short(tail)
-    posts["E15_streakBr"]   = _post_streak_breaker(tail)
-    posts["E16_pairTbl"]    = _post_pair_table(tail)
-    posts["E17_cycle"]      = _post_cycle_guess(tail)
-    posts["E18_mirror"]     = _post_mirror(tail)
-    posts["E19_fbBias"]     = _post_feedback_bias(tail)
-    posts["E20_bayes"]      = _post_bayes_dirichlet(tail)
-    posts["E21_timeMod"]    = _post_time_mod(tail)
-    posts["E22_antiH"]      = _post_anti_entropy(tail)
-    posts["E23_evenBias"]   = _post_even_bias(tail)
-    posts["E24_oddBias"]    = _post_odd_bias(tail)
-    posts["E25_uniform"]    = _post_uniform(tail)
-    posts["E26_metaA"]      = _post_meta_sharpen(list(posts.values()))
-    posts["E27_metaB"]      = _post_meta_sharpen(list(posts.values()))
-    posts["E28_metaC"]      = _post_meta_sharpen(list(posts.values()))
-    posts["E29_metaD"]      = _post_meta_sharpen(list(posts.values()))
-    posts["E30_metaE"]      = _post_meta_sharpen(list(posts.values()))
+    posts["E01_ngram+fb"] = _post_ngram_feedback(tail, after)
+    posts["E02_freq60"]   = _post_freq_k(tail, 60)
+    posts["E03_freq300"]  = _post_freq_k(tail, 300)
+    posts["E04_entropy"]  = _post_entropy_balancer(tail)
+    posts["E05_markov1"]  = _post_markov_1(tail)
+    posts["E06_decay"]    = _post_exp_decay_freq(tail)
+    posts["E07_pairTbl"]  = _post_pair_table(tail)
+    posts["E08_runlen"]   = _post_run_length(tail)
+    posts["E09_recency"]  = _post_recency_penalty(tail)
+    posts["E10_meta"]     = _post_meta_sharpen(list(posts.values()))
 
-    weights = {k: 1.0 for k in posts.keys()}
+    weights = {k: 1.0 for k in posts.keys()}  # pesos homogêneos (simples/estável)
 
     agg = {c:0.0 for c in CANDS}
     for name, dist in posts.items():
@@ -572,48 +490,43 @@ def _ensemble_30(tail: List[int], after: Optional[int]) -> Tuple[int, Dict[int,f
         for c in CANDS:
             agg[c] += w * dist.get(c, 0.0)
 
-    agg = _softmax(agg, t=0.75)
+    agg = _softmax(agg, t=ENSEMBLE_TEMP)
     best = max(agg.items(), key=lambda kv: kv[1])[0]
     return best, agg, posts
 
 # ========= Decisão G0 =========
 def choose_g0(after: Optional[int]) -> Tuple[int, float, float, Dict[int,float], Dict[str,Dict[int,float]]]:
-    tail = get_tail(800)
-    best, post, posts_all = _ensemble_30(tail, after)
+    tail = get_tail(HISTORY_WINDOW)
+    best, post, posts_all = _ensemble_10(tail, after)
     conf = float(post.get(best, 0.0))
     gap  = _gap_top2(post)
     return best, conf, gap, post, posts_all
 
 # ========= Rotas =========
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "guardiao-g0-30x", "time": ts_str()}
-
 @app.get("/health")
 async def health():
     pend = get_open_pending()
-    return {
-        "ok": True,
-        "db": DB_PATH,
-        "pending_open": bool(pend),
-        "pending_seen": (pend["seen"] if pend else ""),
-        "time": ts_str(),
-        "tz": TZ_NAME,
-    }
+    return {"ok": True,
+            "db": DB_PATH,
+            "pending_open": bool(pend),
+            "pending_seen": (pend["seen"] if pend else ""),
+            "time": ts_str(),
+            "tz": TZ_NAME,
+            "history_window": HISTORY_WINDOW}
 
-@app.post(f"/webhook/{WEBHOOK_TOKEN}")
-async def webhook(request: Request):
+@app.post("/webhook/{token}")
+async def webhook(token: str, request: Request):
+    if token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
     data = await request.json()
-    # Dedupe
-    upd_id = ""
-    if isinstance(data, dict):
-        upd_id = str(data.get("update_id", "") or "")
+
+    # DEDUPE
+    upd_id = str(data.get("update_id", "")) if isinstance(data, dict) else ""
     if _is_processed(upd_id):
         return {"ok": True, "skipped": "duplicate_update"}
-    if upd_id:
-        _mark_processed(upd_id)
+    _mark_processed(upd_id)
 
-    # Mensagem
     msg = data.get("channel_post") or data.get("message") \
         or data.get("edited_channel_post") or data.get("edited_message") or {}
     text = (msg.get("text") or msg.get("caption") or "").strip()
@@ -625,69 +538,73 @@ async def webhook(request: Request):
         if DEBUG_MSG:
             await tg_send_text(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
         return {"ok": True, "skipped": "outro_chat"}
-
     if not text:
         return {"ok": True, "skipped": "sem_texto"}
 
-    # 1) “ANALISANDO”: aprende e pode abrir
+    # 1) “ANALISANDO”: aprende
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
         seq = parse_analise_seq(text)
         if seq: append_seq(seq)
+        # se não houver pendência aberta, pode abrir sinal
         if not get_open_pending():
             mafter = AFTER_RX.search(_normalize_keycaps(text or ""))
             after = int(mafter.group(1)) if mafter else None
-            best, conf, gap, post, _ = choose_g0(after)
+            best, conf, gap, _, _ = choose_g0(after)
             if _open_pending(best):
                 await tg_send_text(
                     TARGET_CHANNEL,
                     (f"🤖 <b>IA SUGERE — {best}</b>\n"
                      f"🧩 <b>Padrão:</b> GEN (after_close)\n"
-                     f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{len(get_tail(400))} | <b>gap≈</b>{gap*100:.1f}pp\n"
-                     f"🧠 <b>Modo:</b> E30_metaE")
+                     f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{len(get_tail(HISTORY_WINDOW))} | <b>gap≈</b>{gap*100:.1f}pp\n"
+                     f"🧠 <b>Modo:</b> E10_meta")
                 )
                 return {"ok": True, "posted": True, "best": best, "conf": conf}
         return {"ok": True, "analise": len(seq)}
 
-    # 2) Fechamento — G0 usa só 1 número
+    # 2) Fechamento (GREEN/LOSS) — G0 pega só 1 número observado
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
             nums = parse_close_numbers(text)  # só 1
             if nums:
                 _append_seen(pend, nums)
+            # aviso curto antes do sinal seguinte
+            new_r = get_open_pending()
+            if new_r and (new_r["seen"] or "").strip():
+                await tg_send_text(TARGET_CHANNEL, f"📌 Fechado (G0) — observado <b>{(new_r['seen'] or '').strip()}</b>.")
             r = _close_if_ready()
             if r and r.get("closed"):
-                # 2.1 aviso curto
-                await tg_send_text(TARGET_CHANNEL, f"📌 Fechado (G0) — observado <b>{r['seen']}</b>.")
-                # 2.2 já dispara NOVA SUGESTÃO (after_close)
-                m_after = AFTER_RX.search(_normalize_keycaps(text or ""))
-                after = int(m_after.group(1)) if m_after else None
-                best, conf, gap, post, _ = choose_g0(after)
-                if _open_pending(best):
-                    await tg_send_text(
-                        TARGET_CHANNEL,
-                        (f"🤖 <b>IA SUGERE — {best}</b>\n"
-                         f"🧩 <b>Padrão:</b> GEN (after_close)\n"
-                         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{len(get_tail(400))} | <b>gap≈</b>{gap*100:.1f}pp\n"
-                         f"🧠 <b>Modo:</b> E30_metaE")
-                    )
-                # 2.3 fechamento detalhado (🟢/🔴 com snapshot)
+                # se habilitado, abre já o próximo após fechar
+                if OPEN_AFTER_CLOSE:
+                    m_after = AFTER_RX.search(_normalize_keycaps(text or ""))
+                    after = int(m_after.group(1)) if m_after else None
+                    best2, conf2, gap2, _, _ = choose_g0(after)
+                    if _open_pending(best2):
+                        await tg_send_text(
+                            TARGET_CHANNEL,
+                            (f"🤖 <b>IA SUGERE — {best2}</b>\n"
+                             f"🧩 <b>Padrão:</b> GEN (after_close)\n"
+                             f"📊 <b>Conf:</b> {conf2*100:.2f}% | <b>Amostra≈</b>{len(get_tail(HISTORY_WINDOW))} | <b>gap≈</b>{gap2*100:.1f}pp\n"
+                             f"🧠 <b>Modo:</b> E10_meta")
+                        )
+                # fechamento detalhado
                 await tg_send_text(TARGET_CHANNEL, r["msg"])
-                return {"ok": True, "closed": True, "seen": r["seen"], "posted_next": True}
+                return {"ok": True, "closed": True, "seen": r["seen"]}
         return {"ok": True, "noted_close": True}
 
-    # 3) ENTRADA CONFIRMADA — gatilha decisão G0
+    # 3) ENTRADA CONFIRMADA — gera decisão G0
     parsed = parse_entry_text(text)
     if not parsed:
         if DEBUG_MSG:
             await tg_send_text(TARGET_CHANNEL, "DEBUG: mensagem não reconhecida.")
         return {"ok": True, "skipped": "nao_eh_entrada_confirmada"}
 
+    # aprende sequência publicada
     seq = parsed["seq"] or []
     if seq: append_seq(seq)
 
     after = parsed["after"]
-    best, conf, gap, post, _ = choose_g0(after)
+    best, conf, gap, _, _ = choose_g0(after)
 
     if not get_open_pending():
         if _open_pending(best):
@@ -695,8 +612,8 @@ async def webhook(request: Request):
                 TARGET_CHANNEL,
                 (f"🤖 <b>IA SUGERE — {best}</b>\n"
                  f"🧩 <b>Padrão:</b> GEN\n"
-                 f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{len(get_tail(400))} | <b>gap≈</b>{gap*100:.1f}pp\n"
-                 f"🧠 <b>Modo:</b> E30_metaE")
+                 f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{len(get_tail(HISTORY_WINDOW))} | <b>gap≈</b>{gap*100:.1f}pp\n"
+                 f"🧠 <b>Modo:</b> E10_meta")
             )
             return {"ok": True, "posted": True, "best": best, "conf": conf}
 
