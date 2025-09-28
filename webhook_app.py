@@ -830,13 +830,14 @@ async def _open_suggestion(after: Optional[int], origin_tag: str):
         return {"ok": True, "skipped": "race_lost"}
 
     aft_txt = f" após {after}" if after else ""
+    ls = _get_loss_streak()
 
-txt = (
-    f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
-    f"🧩 <b>Padrão:</b> GEN{aft_txt} ({reason})\n"
-    f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
-    f"🧠 <b>Modo:</b> IA | <b>streak RED:</b> {ls}"
-)
+    txt = (
+        f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
+        f"🧩 <b>Padrão:</b> GEN{aft_txt} ({origin_tag})\n"
+        f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
+        f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}"
+    )
     await tg_send_text(TARGET_CHANNEL, txt)
     return {"ok": True, "posted": True, "best": best}
 
