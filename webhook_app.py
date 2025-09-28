@@ -182,7 +182,7 @@ def get_tail(limit:int=400) -> List[int]:
     con.close()
     return [int(r["number"]) for r in rows][::-1]
 
-def _update_ngrams(decay: float=0.980, max_n:int=5, window:int=400):
+def _update_ngrams(decay: float=0.985, max_n:int=5, window:int=400):
     tail = get_tail(window)
     if len(tail) < 2: return
     with _tx() as con:
@@ -218,7 +218,7 @@ def _ctx_key(ctx: List[int]) -> str:
 
 def _feedback_upsert(n:int, ctx_key:str, nxt:int, delta:float):
     with _tx() as con:
-        con.execute("UPDATE feedback SET w = w * 0.995")
+        con.execute("UPDATE feedback SET w = w * 0.998")
         con.execute("""
           INSERT INTO feedback (n, ctx, nxt, w)
           VALUES (?,?,?,?)
@@ -263,7 +263,7 @@ def _append_seen(row: sqlite3.Row, nums: List[int]):
         con.execute("UPDATE pending SET seen=? WHERE id=?", (seen_txt, int(row["id"])))
 
 def _ngram_snapshot_text(suggested:int) -> str:
-    tail = get_tail(400)
+    tail = get_tail(800)
     post = _post_ngram_feedback(tail, None)
     def pct(x: float) -> str:
         try: return f"{x*100:.1f}%"
@@ -578,7 +578,7 @@ def _ensemble_30(tail: List[int], after: Optional[int]) -> Tuple[int, Dict[int,f
 
 # ========= Decisão G0 =========
 def choose_g0(after: Optional[int]) -> Tuple[int, float, float, Dict[int,float], Dict[str,Dict[int,float]]]:
-    tail = get_tail(400)
+    tail = get_tail(800)
     best, post, posts_all = _ensemble_30(tail, after)
     conf = float(post.get(best, 0.0))
     gap  = _gap_top2(post)
