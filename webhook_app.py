@@ -6,7 +6,7 @@ webhook_app.py — G0 only — 30 especialistas (E1..E30)
 - Sem gales: decisão única (G0) por consenso de 30 especialistas
 - Dedupe por update_id (tabela processed) — corrigido tuple (upd_id,)
 - Filtro por SOURCE_CHANNEL
-- Abre sugestão e FECHA com o 1º observado (G0), enviando 🟢/🔴 com snapshot
+- Fechamento G0 com snapshot + aviso curto + novo sinal (after_close)
 - DB SQLite (WAL + busy_timeout)
 
 Rotas:
@@ -15,7 +15,7 @@ Rotas:
   POST /webhook/meusegredo123  -> endpoint do Telegram
 """
 
-import os, re, time, sqlite3, math, json, random
+import os, re, time, sqlite3, math, json
 from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
@@ -28,8 +28,8 @@ SOURCE_CHANNEL = "-1002810508717"
 DB_PATH        = "/var/data/data.db"
 TZ_NAME        = "America/Sao_Paulo"
 
-DEBUG_MSG      = False     # enviar mensagens de debug no canal destino
-BYPASS_SOURCE  = False     # se True, não filtra SOURCE_CHANNEL
+DEBUG_MSG      = False
+BYPASS_SOURCE  = False
 
 # ========= Imports web =========
 import httpx
@@ -43,7 +43,7 @@ except Exception:
     _TZ = timezone.utc
 
 # ========= App =========
-app = FastAPI(title="guardiao-g0-30x", version="1.1.0")
+app = FastAPI(title="guardiao-g0-30x", version="1.2.0")
 
 # ========= Utils =========
 def now_ts() -> int:
@@ -130,7 +130,7 @@ def _ensure_tables():
     con.commit(); con.close()
 _ensure_tables()
 
-# ========= Score helpers (para texto GREEN/LOSS) =========
+# ========= Score helpers =========
 def bump_score(outcome: str) -> Tuple[int,int]:
     with _tx() as con:
         row = con.execute("SELECT green,loss FROM score WHERE id=1").fetchone()
@@ -155,7 +155,6 @@ def _is_processed(upd_id: str) -> bool:
         return False
     con = _connect()
     try:
-        # CORRIGIDO: precisa ser tupla (upd_id,)
         row = con.execute("SELECT 1 FROM processed WHERE update_id=?",
                           (str(upd_id),)).fetchone()
         return bool(row)
@@ -286,7 +285,7 @@ def _close_if_ready():
     if len(parts) >= 1:
         with _tx() as con:
             con.execute("UPDATE pending SET open=0 WHERE id=?", (int(row["id"]),))
-        # feedback leve: reforça o 1º observado
+        # feedback leve
         try:
             tail = get_tail(5)
             true1 = int(parts[0])
@@ -297,15 +296,15 @@ def _close_if_ready():
         # GREEN/LOSS + snapshot
         suggested = int(row["suggested"] or 0)
         our_disp = suggested if suggested == int(parts[0]) else "X"
-        outcome = "GREEN" if suggested == int(parts[0]) else "LOSS"
-        g,l = bump_score(outcome)
+        outcome  = "GREEN" if suggested == int(parts[0]) else "LOSS"
+        bump_score(outcome)
         snap = _ngram_snapshot_text(suggested)
         msg = (
             f"{'🟢' if outcome=='GREEN' else '🔴'} <b>{outcome}</b> — finalizado "
             f"(G0, nosso={our_disp}, observados={parts[0]}).\n"
             f"📊 Geral: {score_text()}\n\n{snap}"
         )
-        return {"closed": True, "seen": parts[0], "msg": msg}
+        return {"closed": True, "seen": parts[0], "msg": msg, "suggested": suggested}
     return None
 
 # ========= Telegram =========
@@ -514,7 +513,7 @@ def _post_anti_entropy(tail: List[int]) -> Dict[int,float]:
         return _norm(d)
     return f
 
-# novos para completar 30
+# extras p/ 30
 def _post_window_10(tail: List[int]) -> Dict[int,float]:   return _post_freq_k(tail, 10)
 def _post_window_120(tail: List[int]) -> Dict[int,float]:  return _post_freq_k(tail, 120)
 def _post_window_240(tail: List[int]) -> Dict[int,float]:  return _post_freq_k(tail, 240)
@@ -559,7 +558,6 @@ def _ensemble_30(tail: List[int], after: Optional[int]) -> Tuple[int, Dict[int,f
     posts["E23_evenBias"]   = _post_even_bias(tail)
     posts["E24_oddBias"]    = _post_odd_bias(tail)
     posts["E25_uniform"]    = _post_uniform(tail)
-    # metas adicionais
     posts["E26_metaA"]      = _post_meta_sharpen(list(posts.values()))
     posts["E27_metaB"]      = _post_meta_sharpen(list(posts.values()))
     posts["E28_metaC"]      = _post_meta_sharpen(list(posts.values()))
@@ -659,8 +657,23 @@ async def webhook(request: Request):
                 _append_seen(pend, nums)
             r = _close_if_ready()
             if r and r.get("closed"):
+                # 2.1 aviso curto
+                await tg_send_text(TARGET_CHANNEL, f"📌 Fechado (G0) — observado <b>{r['seen']}</b>.")
+                # 2.2 já dispara NOVA SUGESTÃO (after_close)
+                m_after = AFTER_RX.search(_normalize_keycaps(text or ""))
+                after = int(m_after.group(1)) if m_after else None
+                best, conf, gap, post, _ = choose_g0(after)
+                if _open_pending(best):
+                    await tg_send_text(
+                        TARGET_CHANNEL,
+                        (f"🤖 <b>IA SUGERE — {best}</b>\n"
+                         f"🧩 <b>Padrão:</b> GEN (after_close)\n"
+                         f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{len(get_tail(400))} | <b>gap≈</b>{gap*100:.1f}pp\n"
+                         f"🧠 <b>Modo:</b> E30_metaE")
+                    )
+                # 2.3 fechamento detalhado (🟢/🔴 com snapshot)
                 await tg_send_text(TARGET_CHANNEL, r["msg"])
-                return {"ok": True, "closed": True, "seen": r["seen"]}
+                return {"ok": True, "closed": True, "seen": r["seen"], "posted_next": True}
         return {"ok": True, "noted_close": True}
 
     # 3) ENTRADA CONFIRMADA — gatilha decisão G0
