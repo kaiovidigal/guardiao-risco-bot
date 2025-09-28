@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-webhook_app.py — v4.4.1 (base) -> G0 focado + 9 especialistas (Hedge9)
-- Mantém: anti-tilt, LLM local (opcional), ANALISANDO, dedupe, feedback, reset diário
-- Mudado: fluxo G0 puro (fecha no 1º observado, sem gales), reply no sinal certo
-- Novo: +5 especialistas (total 9) no ensemble Hedge, atualização on-line de pesos
 
+"""
+webhook_app.py — v4.5.0-g0 (G0 puro + Hedge9)
+- Fluxo G0 puro (fecha no 1º observado, sem gales)
+- 9 especialistas (Hedge) + feedback online + anti-tilt
+- ANALISANDO seguro (não quebra se faltar “Sequência: …”)
+- Deduplicação por update_id, filtro de canal, reset diário
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P
                   TZ_NAME
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
+
 import os, re, time, sqlite3, math, json
 from contextlib import contextmanager
 from typing import List, Optional, Tuple, Dict
@@ -31,15 +33,15 @@ from fastapi import FastAPI, Request, HTTPException
 # ========= ENV =========
 TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "").strip() or "-1000000000000"
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # se vazio, não filtra
 DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
-DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip() in ("1","true","True","yes","YES")
-BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip() in ("1","true","True","yes","YES")
+DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip().lower() in ("1","true","yes")
+BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip().lower() in ("1","true","yes")
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ===== LLM (IA local tipo ChatGPT) =====
-LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip() in ("1","true","True","yes","YES")
+# ===== LLM (opcional) =====
+LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip().lower() in ("1","true","yes")
 LLM_MODEL_PATH = os.getenv("LLM_MODEL_PATH", "models/phi-3-mini.gguf").strip()
 LLM_CTX_TOKENS = int(os.getenv("LLM_CTX_TOKENS", "2048"))
 LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
@@ -58,16 +60,8 @@ app = FastAPI(title="guardiao-auto-bot (GEN webhook) — G0 + Hedge9", version="
 DECAY = 0.980
 W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
 
-# ======== Gates (informativos) ========
-CONF_MIN    = 0.90
-GAP_MIN     = 0.14
-H_MAX       = 0.95
-FREQ_WINDOW = 85
-
-# ======== Anti-tilt & cooldown ========
+# ======== Anti-tilt / cooldown ========
 COOLDOWN_N     = 6
-CD_CONF_BOOST  = 0.04
-CD_GAP_BOOST   = 0.03
 ALWAYS_ENTER   = True
 
 # ======== Online Learning (feedback) ========
@@ -77,7 +71,7 @@ FEED_NEG    = 1.30
 FEED_DECAY  = 0.995
 WF4, WF3, WF2, WF1 = W4, W3, W2, W1
 
-# ======== Ensemble Hedge (agora 9 especialistas) ========
+# ======== Ensemble Hedge (9 especialistas) ========
 HEDGE_ETA   = 0.6
 K_SHORT     = 60
 K_LONG      = 300
@@ -89,8 +83,6 @@ def ts_str(ts=None) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 def tz_today_ymd() -> str:
     dt = datetime.now(_TZ); return dt.strftime("%Y-%m-%d")
-def _entropy_norm(post: Dict[int, float]) -> float:
-    eps = 1e-12; H = -sum((p+eps) * math.log(p+eps, 4) for p in post.values()); return H
 def _softmax(d: Dict[int,float], t: float=1.0) -> Dict[int,float]:
     if not d: return {}
     if t<=0: t=1e-6
@@ -165,7 +157,6 @@ def migrate_db():
     )""")
     if not cur.execute("SELECT 1 FROM state WHERE id=1").fetchone():
         cur.execute("INSERT INTO state (id, cooldown_left, loss_streak, last_reset_ymd) VALUES (1,0,0,'')")
-    # pesos para 9 especialistas
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
         w1 REAL NOT NULL, w2 REAL NOT NULL, w3 REAL NOT NULL, w4 REAL NOT NULL,
@@ -355,7 +346,9 @@ def _post_markov_1(tail: List[int]) -> Dict[int,float]:
     counts = {c:{d:1.0 for d in [1,2,3,4]} for c in [1,2,3,4]}
     for i in range(1, len(tail)):
         counts[tail[i-1]][tail[i]] += 1.0
-    return {d: counts[tail[-1]][d]/sum(counts[tail[-1]].values()) for d in [1,2,3,4]}
+    row = counts[tail[-1]]
+    s = sum(row.values()) or 1e-9
+    return {d: row[d]/s for d in [1,2,3,4]}
 
 def _post_exp_decay_freq(tail: List[int]) -> Dict[int,float]:
     if not tail: return {c:0.25 for c in [1,2,3,4]}
@@ -365,7 +358,7 @@ def _post_exp_decay_freq(tail: List[int]) -> Dict[int,float]:
     return {k:v/s for k,v in score.items()}
 
 def _post_pair_table(tail: List[int]) -> Dict[int,float]:
-    if len(tail) < 2: return {c:0.25 for c in [1,2,3,4]}
+    if len(tail) < 3: return {c:0.25 for c in [1,2,3,4]}
     pair = {}
     for i in range(1, len(tail)-1):
         a,b = tail[i-1], tail[i]
@@ -383,6 +376,42 @@ def _post_recency_penalty(tail: List[int]) -> Dict[int,float]:
     n=len(tail)-1
     gaps={c:(n-last_pos[c]) for c in [1,2,3,4]}
     return _softmax(gaps, t=3.0)
+
+# ========= LLM local (opcional) =========
+try:
+    from llama_cpp import Llama
+    _LLM = None
+    def _llm_load():
+        global _LLM
+        if _LLM is None and LLM_ENABLED and os.path.exists(LLM_MODEL_PATH):
+            _LLM = Llama(model_path=LLM_MODEL_PATH, n_ctx=LLM_CTX_TOKENS, n_threads=LLM_N_THREADS, verbose=False)
+        return _LLM
+except Exception:
+    _LLM = None
+    def _llm_load(): return None
+
+_LLM_SYSTEM = (
+    "Você é um assistente que prevê o próximo número de um stream discreto com classes {1,2,3,4}.\n"
+    "Responda APENAS um JSON com as probabilidades normalizadas (%): {\"1\":p1,\"2\":p2,\"3\":p3,\"4\":p4}."
+)
+
+def _llm_probs_from_tail(tail: List[int]) -> Dict[int,float]:
+    llm = _llm_load()
+    if llm is None or not LLM_ENABLED: return {}
+    user = f"Historico_Recente={tail[-50:]}\nDevolva JSON: {{\"1\":p1,\"2\":p2,\"3\":p3,\"4\":p4}}"
+    try:
+        out = llm.create_chat_completion(
+            messages=[{"role":"system","content":_LLM_SYSTEM},{"role":"user","content":user}],
+            temperature=LLM_TEMP, top_p=LLM_TOP_P, max_tokens=128
+        )
+        text = out["choices"][0]["message"]["content"].strip()
+        m = re.search(r"\{.*\}", text, re.S); jtxt = m.group(0) if m else text
+        data = json.loads(jtxt)
+        raw = {int(k): float(v) for k,v in data.items() if str(k) in ("1","2","3","4")}
+        S = sum(raw.values()) or 1e-9
+        return {k: max(0.0, v/S) for k,v in raw.items()}
+    except Exception:
+        return {}
 
 # ========= Hedge (9 exp) =========
 def _get_expert_w():
@@ -421,7 +450,7 @@ def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,
     best = ranking[0][0]
     if ls >= 3:
         comp = {c: max(1e-9, 1.0 - post[c]) for c in [1,2,3,4]}
-        s = sum(comp.values()); comp = {k:v/s for k,v in comp.items()}
+        s = sum(comp.values()) or 1e-9; comp = {k:v/s for k,v in comp.items()}
         post = {c: 0.7*post[c] + 0.3*comp[c] for c in [1,2,3,4]}
         S = sum(post.values()) or 1e-9; post = {k:v/S for k,v in post.items()}
         ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
@@ -444,7 +473,7 @@ def choose_single_number(after: Optional[int]):
     e7 = _post_exp_decay_freq(tail)
     e8 = _post_pair_table(tail)
     e9 = _post_recency_penalty(tail)
-    post, ws = _blend9([e1,e2,e3,e4,e5,e6,e7,e8,e9])
+    post, _ = _blend9([e1,e2,e3,e4,e5,e6,e7,e8,e9])
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     top2 = ranking[:2]
     gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
@@ -457,7 +486,7 @@ def choose_single_number(after: Optional[int]):
     gap2 = (r2[0][1] - r2[1][1]) if len(r2) == 2 else r2[0][1]
     return best, conf, timeline_size(), post_adj, gap2, reason
 
-# ========= Parse =========
+# ========= Parsers =========
 ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
@@ -483,16 +512,25 @@ def parse_close_numbers(text: str) -> List[int]:
     if groups:
         last = groups[-1]
         nums = re.findall(r"[1-4]", _normalize_keycaps(last))
-        return [int(x) for x in nums][:1]  # G0: só o primeiro observado
+        return [int(x) for x in nums][:1]  # G0
     nums = ANY_14_RX.findall(t)
     return [int(x) for x in nums][:1]
 
-# ========= Pending helpers (G0) =========
+# --- helper seguro para ANALISANDO ---
+def parse_analise_seq_safe(text: str) -> List[int]:
+    """Extrai [1..4] de 'ANALISANDO' sem estourar erro se faltar 'Sequência:'."""
+    t = _normalize_keycaps(text or "")
+    if not ANALISANDO_RX.search(t):
+        return []
+    m = SEQ_RX.search(t)
+    if not m:
+        return []
+    return [int(x) for x in re.findall(r"[1-4]", _normalize_keycaps(m.group(1)))]
+
+# ========= Pending (G0) =========
 def get_open_pending() -> Optional[sqlite3.Row]:
     con = _connect(); row = con.execute("SELECT * FROM pending WHERE open=1 ORDER BY id DESC LIMIT 1").fetchone(); con.close()
     return row
-def set_stage(stage:int):
-    with _tx() as con: con.execute("UPDATE pending SET stage=? WHERE open=1", (int(stage),))
 def _seen_list(row: sqlite3.Row) -> List[str]:
     seen = (row["seen"] or "").strip()
     return [s for s in seen.split("-") if s]
@@ -536,12 +574,15 @@ def _close_now(row: sqlite3.Row) -> Dict:
     suggested = int(row["suggested"] or 0)
     outcome, stage_lbl = _stage_from_observed_g0(suggested, obs_first)
     with _tx() as con: con.execute("UPDATE pending SET open=0 WHERE id=?", (int(row["id"]),))
+
     # feedback curta
     try:
         tail = get_tail(5)
         if obs_first is not None:
             _feedback_upsert(2, _ctx_to_key(tail[-1:]), obs_first, +FEED_POS)
-    except Exception: pass
+    except Exception:
+        pass
+
     # hedge update
     try:
         tail_now = get_tail(400)
@@ -557,13 +598,17 @@ def _close_now(row: sqlite3.Row) -> Dict:
             _post_recency_penalty(tail_now),
         ]
         if obs_first is not None: _hedge_update9(obs_first, posts)
-    except Exception: pass
+    except Exception:
+        pass
+
     # streak/cooldown + score
     bump_score(outcome.upper())
     try:
         if outcome.upper()=="LOSS": _set_cooldown(COOLDOWN_N); _bump_loss_streak(False)
         else: _dec_cooldown(); _bump_loss_streak(True)
-    except Exception: pass
+    except Exception:
+        pass
+
     # msg + reply_to
     snapshot = _ngram_snapshot_text(int(suggested))
     our_num_display = suggested if outcome.upper()=="GREEN" else "X"
@@ -574,7 +619,8 @@ def _close_now(row: sqlite3.Row) -> Dict:
     try:
         con=_connect(); r2=con.execute("SELECT suggest_msg_id FROM pending WHERE id=?", (int(row["id"]),)).fetchone(); con.close()
         reply_to = int(r2["suggest_msg_id"] or 0) if r2 and r2["suggest_msg_id"] else None
-    except Exception: pass
+    except Exception:
+        pass
     return {"closed": True, "msg": msg, "reply_to": reply_to}
 
 # ========= Telegram =========
@@ -627,18 +673,19 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "skipped": "outro_chat"}
     if not text: return {"ok": True, "skipped": "sem_texto"}
 
-    # 0) ANALISANDO — aprende e pode adiantar fechamento G0
+    # 0) ANALISANDO — aprende e pode adiantar fechamento G0 (SEGURO)
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
-        seq = [int(x) for x in re.findall(r"[1-4]", _normalize_keycaps((SEQ_RX.search(text) or [""])[0] if isinstance((SEQ_RX.search(text)), list) else (SEQ_RX.search(text).group(1) if SEQ_RX.search(text) else "")))]
-        if seq: append_seq(seq)
-        pend = get_open_pending()
-        if pend and seq:
-            _seen_append(pend, [str(seq[0])])
+        seq = parse_analise_seq_safe(text)
+        if seq:
+            append_seq(seq)
             pend = get_open_pending()
-            if pend and (pend["seen"] or "").strip():
-                result = _close_now(pend)
-                await tg_send_text(TARGET_CHANNEL, result["msg"], reply_to=result.get("reply_to"))
-                return {"ok": True, "closed_from_analise": True}
+            if pend:
+                _seen_append(pend, [str(seq[0])])   # G0: só 1 observado
+                pend = get_open_pending()
+                if pend and (pend["seen"] or "").strip():
+                    result = _close_now(pend)
+                    await tg_send_text(TARGET_CHANNEL, result["msg"], reply_to=result.get("reply_to"))
+                    return {"ok": True, "closed_from_analise": True}
         return {"ok": True, "analise_seen": len(seq)}
 
     # 1) Fechamentos do fonte (GREEN/LOSS) — no G0 basta 1 observado
