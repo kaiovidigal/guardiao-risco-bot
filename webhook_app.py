@@ -8,11 +8,12 @@ webhook_app.py — v4.5.0 (G0 focado + Hedge9)
 - "ANALISANDO" aprende e pode adiantar fechamento
 - Responde GREEN/LOSS em reply ao sinal correto
 - MIGRAÇÃO automática da tabela expert_w (adiciona w5..w9)
+- GATE OPCIONAL: CONF_MIN/GAP_MIN (por padrão 0, não bloqueia)
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE,
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P,
-                  TZ_NAME
+                  TZ_NAME, CONF_MIN, GAP_MIN
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 
@@ -37,10 +38,20 @@ TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # vazio = não filtra
-DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
+DB_PATH        = (os.getenv("DB_PATH", "/tmp/data.db").strip() or "/tmp/data.db")
 DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip().lower() in ("1","true","yes")
 BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip().lower() in ("1","true","yes")
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
+# --- Gates opcionais (não mudam comportamento original se não setados) ---
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+CONF_MIN = _env_float("CONF_MIN", 0.0)   # 0.0 = desativado
+GAP_MIN  = _env_float("GAP_MIN",  0.0)   # 0.0 = desativado
 
 # ===== LLM (opcional) =====
 LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip().lower() in ("1","true","yes")
@@ -443,7 +454,6 @@ def _post_recency_penalty(tail: List[int]) -> Dict[int,float]:
 # ========= Hedge 9 =========
 def _get_expert_w() -> List[float]:
     con = _connect()
-    # garante colunas (instâncias paralelas)
     for col in ("w5","w6","w7","w8","w9"):
         if not _column_exists(con, "expert_w", col):
             con.execute(f"ALTER TABLE expert_w ADD COLUMN {col} REAL NOT NULL DEFAULT 1.0")
@@ -733,6 +743,17 @@ async def webhook(token: str, request: Request):
     after = parsed["after"]
     best, conf, samples, post, gap, reason = choose_single_number(after)
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
+
+    # ---------- GATE OPCIONAL (não altera comportamento padrão) ----------
+    # Ativa somente se CONF_MIN>0 ou GAP_MIN>0
+    if (CONF_MIN > 0.0 and conf < CONF_MIN) or (GAP_MIN > 0.0 and gap < GAP_MIN):
+        if DEBUG_MSG:
+            await tg_send_text(
+                TARGET_CHANNEL,
+                f"DEBUG: pulado por baixa confiança/gap — conf={conf*100:.2f}% gap={gap*100:.2f}pp (min {CONF_MIN*100:.0f}%/{GAP_MIN*100:.0f}pp)"
+            )
+        return {"ok": True, "skipped": "low_confidence", "conf": conf, "gap": gap}
+    # --------------------------------------------------------------------
 
     if _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
         aft_txt = f" após {after}" if after else ""
