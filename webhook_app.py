@@ -384,7 +384,7 @@ def _post_ngram_feedback(tail: List[int], after: Optional[int]) -> Dict[int,floa
     if not tail: return {c:0.25 for c in CANDS}
     if after is not None and after in tail:
         idxs = [i for i,v in enumerate(tail) if v == after]; i = idxs[-1]
-        ctxs = [tail[max(0,i-3):i+1], tail[max(0,i-2):i+1], tail[max(0,i-1):i+1], tail[i:i+1]]
+        ctxs = [tail[max(0,i-3):i+1], tail[max(0,i-2):i+1], tail[max(0,i-1):i+1], tail[i:i+1)]
     else:
         ctxs = [tail[-4:], tail[-3:], tail[-2:], tail[-1:]]
     W4,W3,W2,W1 = 0.42,0.30,0.18,0.10
@@ -568,13 +568,14 @@ async def webhook(token: str, request: Request):
             nums = parse_close_numbers(text)  # só 1
             if nums:
                 _append_seen(pend, nums)
-            # aviso curto antes do sinal seguinte
-            new_r = get_open_pending()
-            if new_r and (new_r["seen"] or "").strip():
-                await tg_send_text(TARGET_CHANNEL, f"📌 Fechado (G0) — observado <b>{(new_r['seen'] or '').strip()}</b>.")
+
+            # fecha, publica RESULTADO primeiro, depois (opcional) abre novo
             r = _close_if_ready()
             if r and r.get("closed"):
-                # se habilitado, abre já o próximo após fechar
+                # 1) publicar PRIMEIRO o resultado detalhado
+                await tg_send_text(TARGET_CHANNEL, r["msg"])
+
+                # 2) opcional: abrir o próximo após fechar
                 if OPEN_AFTER_CLOSE:
                     m_after = AFTER_RX.search(_normalize_keycaps(text or ""))
                     after = int(m_after.group(1)) if m_after else None
@@ -587,8 +588,6 @@ async def webhook(token: str, request: Request):
                              f"📊 <b>Conf:</b> {conf2*100:.2f}% | <b>Amostra≈</b>{len(get_tail(HISTORY_WINDOW))} | <b>gap≈</b>{gap2*100:.1f}pp\n"
                              f"🧠 <b>Modo:</b> E10_meta")
                         )
-                # fechamento detalhado
-                await tg_send_text(TARGET_CHANNEL, r["msg"])
                 return {"ok": True, "closed": True, "seen": r["seen"]}
         return {"ok": True, "noted_close": True}
 
