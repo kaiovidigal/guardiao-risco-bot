@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.5.0 (G0 focado + Hedge9)
-- G0 puro: fecha no 1º observado (sem gales)
-- Ensemble com 9 especialistas (hedge com atualização on-line)
-- Anti-tilt, feedback online, reset diário, dedupe por update_id
-- "ANALISANDO" aprende e pode adiantar fechamento
-- Responde GREEN/LOSS em reply ao sinal correto
-- MIGRAÇÃO automática da tabela expert_w (adiciona w5..w9)
+webhook_app.py — v4.6.0 (G0 focado + Hedge9 + Filtros de Qualidade)
+- G0 puro: finaliza no 1º observado (sem gales)
+- Ensemble com 9 especialistas (Hedge9) e atualização online
+- Filtros para melhorar assertividade: CONF_MIN, GAP_MIN, MIN_SAMPLES
+- Anti-tilt (cooldown por sequência de LOSS), feedback online, reset diário
+- Dedupe por update_id
+- "ANALISANDO" aprende e pode adiantar fechamento do G0
+- Responde GREEN/LOSS em reply ao sinal sugerido
+- Rotas auxiliares para evitar 404/405 no navegador
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE,
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P,
-                  TZ_NAME
+                  TZ_NAME,
+                  CONF_MIN, GAP_MIN, MIN_SAMPLES, COOLDOWN_N,
+                  DECAY, K_SHORT, K_LONG, FEED_POS, FEED_NEG, FEED_DECAY, HEDGE_ETA
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 
@@ -50,29 +54,46 @@ LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
 LLM_TEMP       = float(os.getenv("LLM_TEMP", "0.2"))
 LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.95"))
 
+# ===== Parâmetros base (com override por ENV) =====
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name, "").strip()
+    try: return float(v) if v else default
+    except: return default
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name, "").strip()
+    try: return int(v) if v else default
+    except: return default
+
+# memória/frequência
+DECAY     = _env_float("DECAY", 0.980)
+K_SHORT   = _env_int("K_SHORT", 60)
+K_LONG    = _env_int("K_LONG", 300)
+
+# pesos n-gram
+W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
+
+# feedback/hedge
+FEED_POS   = _env_float("FEED_POS", 0.80)
+FEED_NEG   = _env_float("FEED_NEG", 1.30)  # reservado se quiser punir tbm
+FEED_DECAY = _env_float("FEED_DECAY", 0.995)
+HEDGE_ETA  = _env_float("HEDGE_ETA", 0.6)
+
+# anti-tilt
+COOLDOWN_N = _env_int("COOLDOWN_N", 6)
+
+# filtros de qualidade (NOVO)
+CONF_MIN     = _env_float("CONF_MIN", 0.68)   # confiança mínima do Hedge para abrir
+GAP_MIN      = _env_float("GAP_MIN",  0.08)   # gap min entre 1º e 2º
+MIN_SAMPLES  = _env_int ("MIN_SAMPLES", 1000) # amostra mínima na timeline
+
+# validações obrigatórias
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
 if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
-app = FastAPI(title="guardiao-auto-bot (G0 + Hedge9)", version="4.5.0")
-
-# ========= Parâmetros =========
-DECAY = 0.980
-W4, W3, W2, W1 = 0.42, 0.30, 0.18, 0.10
-
-COOLDOWN_N = 6
-ALWAYS_ENTER = True
-
-FEED_BETA   = 0.40
-FEED_POS    = 0.80
-FEED_NEG    = 1.30
-FEED_DECAY  = 0.995
-WF4, WF3, WF2, WF1 = W4, W3, W2, W1
-
-HEDGE_ETA   = 0.6
-K_SHORT     = 60
-K_LONG      = 300
+app = FastAPI(title="guardiao-auto-bot (G0 + Hedge9 + Quality Filters)", version="4.6.0")
 
 # ========= Utils =========
 def now_ts() -> int: return int(time.time())
@@ -383,10 +404,10 @@ def _post_from_tail(tail: List[int], after: Optional[int]) -> Dict[int, float]:
         if len(ctx3)==3: s += W3 * _prob_from_ngrams(ctx3[:-1], c)
         if len(ctx2)==2: s += W2 * _prob_from_ngrams(ctx2[:-1], c)
         if len(ctx1)==1: s += W1 * _prob_from_ngrams(ctx1[:-1], c)
-        if len(ctx4)==4: s += FEED_BETA * WF4 * _feedback_prob(4, ctx4[:-1], c)
-        if len(ctx3)==3: s += FEED_BETA * WF3 * _feedback_prob(3, ctx3[:-1], c)
-        if len(ctx2)==2: s += FEED_BETA * WF2 * _feedback_prob(2, ctx2[:-1], c)
-        if len(ctx1)==1: s += FEED_BETA * WF1 * _feedback_prob(1, ctx1[:-1], c)
+        if len(ctx4)==4: s += 0.40 * W4 * _feedback_prob(4, ctx4[:-1], c)
+        if len(ctx3)==3: s += 0.40 * W3 * _feedback_prob(3, ctx3[:-1], c)
+        if len(ctx2)==2: s += 0.40 * W2 * _feedback_prob(2, ctx2[:-1], c)
+        if len(ctx1)==1: s += 0.40 * W1 * _feedback_prob(1, ctx1[:-1], c)
         scores[c] = s
     tot = sum(scores.values()) or 1e-9
     return {k: v/tot for k,v in scores.items()}
@@ -655,7 +676,7 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML", reply_to: int
 @app.get("/")
 async def root():
     check_and_maybe_reset_score()
-    return {"ok": True, "service": "guardiao-auto-bot (G0 + Hedge9)"}
+    return {"ok": True, "service": "guardiao-auto-bot (G0 + Hedge9 + Quality Filters)"}
 
 @app.get("/health")
 async def health():
@@ -723,10 +744,34 @@ async def webhook(token: str, request: Request):
     if get_open_pending():
         return {"ok": True, "kept_open_waiting_close": True}
 
+    # aplica memória
     seq = parsed["seq"] or []
     if seq: append_seq(seq)
     after = parsed["after"]
-    best, conf, samples, post, gap, reason = choose_single_number(after)
+
+    # ANTES de sugerir: checagens de QUALIDADE
+    samples = timeline_size()
+    if samples < MIN_SAMPLES:
+        if DEBUG_MSG:
+            await tg_send_text(TARGET_CHANNEL, f"DEBUG: amostra baixa ({samples}/{MIN_SAMPLES}). Não vou abrir.")
+        return {"ok": True, "skipped": "amostra_insuficiente", "samples": samples, "min_samples": MIN_SAMPLES}
+
+    cd = _get_cooldown()
+    if cd > 0:
+        if DEBUG_MSG:
+            await tg_send_text(TARGET_CHANNEL, f"DEBUG: cooldown ativo ({cd}). Não vou abrir.")
+        return {"ok": True, "skipped": "cooldown_active", "cooldown_left": cd}
+
+    # decisão
+    best, conf, samples2, post, gap, reason = choose_single_number(after)
+
+    # filtros de confiança/gap
+    if conf < CONF_MIN or gap < GAP_MIN:
+        if DEBUG_MSG:
+            await tg_send_text(TARGET_CHANNEL, f"DEBUG: Conf {conf:.3f} (min {CONF_MIN}) / Gap {gap:.3f} (min {GAP_MIN}). Não vou abrir.")
+        return {"ok": True, "skipped": "filtro_qualidade", "conf": conf, "gap": gap, "conf_min": CONF_MIN, "gap_min": GAP_MIN}
+
+    # contexto p/ auditoria
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
 
     if _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
@@ -735,12 +780,12 @@ async def webhook(token: str, request: Request):
         txt = (
             f"🤖 <b>IA SUGERE</b> — <b>{best}</b>\n"
             f"🧩 <b>Padrão:</b> GEN{aft_txt}\n"
-            f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples} | <b>gap≈</b>{gap*100:.1f}pp\n"
+            f"📊 <b>Conf:</b> {conf*100:.2f}% | <b>Amostra≈</b>{samples2} | <b>gap≈</b>{gap*100:.1f}pp\n"
             f"🧠 <b>Modo:</b> {reason} | <b>streak RED:</b> {ls}"
         )
         msg_id = await tg_send_text(TARGET_CHANNEL, txt)
         _save_suggest_msg_id(msg_id)
-        return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples}
+        return {"ok": True, "posted": True, "best": best, "conf": conf, "gap": gap, "samples": samples2}
 
     if DEBUG_MSG: await tg_send_text(TARGET_CHANNEL, "DEBUG: Já existe pending open — não abri novo.")
     return {"ok": True, "skipped": "pending_already_open"}
