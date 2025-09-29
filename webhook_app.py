@@ -8,12 +8,11 @@ webhook_app.py — v4.5.0 (G0 focado + Hedge9)
 - "ANALISANDO" aprende e pode adiantar fechamento
 - Responde GREEN/LOSS em reply ao sinal correto
 - MIGRAÇÃO automática da tabela expert_w (adiciona w5..w9)
-- GATE OPCIONAL: CONF_MIN/GAP_MIN (por padrão 0, não bloqueia)
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE,
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P,
-                  TZ_NAME, CONF_MIN, GAP_MIN
+                  TZ_NAME
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 
@@ -38,20 +37,10 @@ TG_BOT_TOKEN   = os.getenv("TG_BOT_TOKEN", "").strip()
 WEBHOOK_TOKEN  = os.getenv("WEBHOOK_TOKEN", "").strip()
 TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "-1002796105884").strip()
 SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "").strip()  # vazio = não filtra
-DB_PATH        = (os.getenv("DB_PATH", "/tmp/data.db").strip() or "/tmp/data.db")
+DB_PATH        = os.getenv("DB_PATH", "/var/data/data.db").strip() or "/var/data/data.db"
 DEBUG_MSG      = os.getenv("DEBUG_MSG", "0").strip().lower() in ("1","true","yes")
 BYPASS_SOURCE  = os.getenv("BYPASS_SOURCE", "0").strip().lower() in ("1","true","yes")
 TELEGRAM_API   = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
-
-# --- Gates opcionais (não mudam comportamento original se não setados) ---
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, str(default)).strip())
-    except Exception:
-        return default
-
-CONF_MIN = _env_float("CONF_MIN", 0.0)   # 0.0 = desativado
-GAP_MIN  = _env_float("GAP_MIN",  0.0)   # 0.0 = desativado
 
 # ===== LLM (opcional) =====
 LLM_ENABLED    = os.getenv("LLM_ENABLED", "1").strip().lower() in ("1","true","yes")
@@ -188,15 +177,13 @@ def migrate_db():
     if not cur.execute("SELECT 1 FROM state WHERE id=1").fetchone():
         cur.execute("INSERT INTO state (id, cooldown_left, loss_streak, last_reset_ymd) VALUES (1,0,0,'')")
 
-    # expert_w base
+    # expert_w base + migração
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
         w1 REAL NOT NULL, w2 REAL NOT NULL, w3 REAL NOT NULL, w4 REAL NOT NULL
     )""")
     if not cur.execute("SELECT 1 FROM expert_w WHERE id=1").fetchone():
         cur.execute("INSERT INTO expert_w (id,w1,w2,w3,w4) VALUES (1,1,1,1,1)")
-
-    # MIGRA: garante w5..w9
     for col in ("w5","w6","w7","w8","w9"):
         if not _column_exists(con, "expert_w", col):
             cur.execute(f"ALTER TABLE expert_w ADD COLUMN {col} REAL NOT NULL DEFAULT 1.0")
@@ -664,7 +651,7 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML", reply_to: int
     except Exception:
         return None
 
-# ========= Rotas =========
+# ========= Rotas principais =========
 @app.get("/")
 async def root():
     check_and_maybe_reset_score()
@@ -676,8 +663,7 @@ async def health():
     pend = get_open_pending()
     return {"ok": True, "db": DB_PATH, "pending_open": bool(pend), "pending_seen": (pend["seen"] if pend else ""), "time": ts_str(), "tz": TZ_NAME}
 
-ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)  # definido antes mas ok
-
+# ========= Webhook correto (POST + token) =========
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
@@ -700,7 +686,7 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "skipped": "outro_chat"}
     if not text: return {"ok": True, "skipped": "sem_texto"}
 
-    # ANALISANDO: aprende e pode fechar G0
+    # ANALISANDO
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
         mseq = SEQ_RX.search(_normalize_keycaps(text))
         seq = [int(x) for x in re.findall(r"[1-4]", mseq.group(1))] if mseq else []
@@ -715,7 +701,7 @@ async def webhook(token: str, request: Request):
                 return {"ok": True, "closed_from_analise": True}
         return {"ok": True, "analise_seen": len(seq)}
 
-    # Fechamentos do fonte (GREEN/LOSS) — no G0 basta 1 observado
+    # Fechamento (GREEN/LOSS)
     if GREEN_RX.search(text) or LOSS_RX.search(text):
         pend = get_open_pending()
         if pend:
@@ -728,7 +714,7 @@ async def webhook(token: str, request: Request):
                 return {"ok": True, "closed": True}
         return {"ok": True, "noted_close": True}
 
-    # Nova ENTRADA CONFIRMADA (abre 1 pending)
+    # Nova ENTRADA CONFIRMADA
     parsed = parse_entry_text(text)
     if not parsed:
         if DEBUG_MSG: await tg_send_text(TARGET_CHANNEL, "DEBUG: Mensagem não reconhecida como ENTRADA/FECHAMENTO/ANALISANDO.")
@@ -737,23 +723,11 @@ async def webhook(token: str, request: Request):
     if get_open_pending():
         return {"ok": True, "kept_open_waiting_close": True}
 
-    # memória + decisão + abertura
     seq = parsed["seq"] or []
     if seq: append_seq(seq)
     after = parsed["after"]
     best, conf, samples, post, gap, reason = choose_single_number(after)
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
-
-    # ---------- GATE OPCIONAL (não altera comportamento padrão) ----------
-    # Ativa somente se CONF_MIN>0 ou GAP_MIN>0
-    if (CONF_MIN > 0.0 and conf < CONF_MIN) or (GAP_MIN > 0.0 and gap < GAP_MIN):
-        if DEBUG_MSG:
-            await tg_send_text(
-                TARGET_CHANNEL,
-                f"DEBUG: pulado por baixa confiança/gap — conf={conf*100:.2f}% gap={gap*100:.2f}pp (min {CONF_MIN*100:.0f}%/{GAP_MIN*100:.0f}pp)"
-            )
-        return {"ok": True, "skipped": "low_confidence", "conf": conf, "gap": gap}
-    # --------------------------------------------------------------------
 
     if _open_pending_with_ctx(best, after, ctx1, ctx2, ctx3, ctx4):
         aft_txt = f" após {after}" if after else ""
@@ -770,3 +744,22 @@ async def webhook(token: str, request: Request):
 
     if DEBUG_MSG: await tg_send_text(TARGET_CHANNEL, "DEBUG: Já existe pending open — não abri novo.")
     return {"ok": True, "skipped": "pending_already_open"}
+
+# --- Rotas auxiliares (GET/POST) para evitar 404/405 no navegador ou chamadas erradas ---
+@app.post("/webhook")
+async def webhook_missing_token(request: Request):
+    try:
+        _ = await request.body()  # consome corpo
+    except Exception:
+        pass
+    return {"ok": True, "hint": "Use POST /webhook/<WEBHOOK_TOKEN> (chamado pelo Telegram)."}
+
+@app.get("/webhook")
+async def webhook_missing_token_get():
+    return {"ok": True, "detail": "Este endpoint aceita POST. Para testar no navegador use /health."}
+
+@app.get("/webhook/{token}")
+async def webhook_get_info(token: str):
+    if token == WEBHOOK_TOKEN:
+        return {"ok": True, "webhook": "ativo", "detail": "Este endpoint aceita POST do Telegram. GET exibido para inspeção."}
+    return {"ok": False, "detail": "Token não confere. O webhook real aceita apenas POST do Telegram."}
