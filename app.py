@@ -1,17 +1,16 @@
-# app.py
-from webhook_app import app
-from fastapi import Request
+from fastapi import FastAPI, Request
 
-@app.post("/webhook")
-async def webhook_missing_token(request: Request):
-    try: _ = await request.body()
-    except Exception: pass
-    return {"ok": True, "hint": "Use /webhook/<WEBHOOK_TOKEN> (com POST)"}
+app = FastAPI()
 
-@app.get("/webhook")
-async def webhook_missing_token_get():
-    return {"ok": True, "detail": "Este endpoint aceita POST. Para testar no navegador use /health."}
+WEBHOOK_SECRET = "meusegredo123"  # mesmo usado no setWebhook
 
-@app.get("/webhook/{token}")
-async def webhook_get_info(token: str):
-    return {"ok": True, "detail": f"Webhook ativo para token={token}. Envie POST pelo Telegram."}
+@app.post(f"/webhook/{WEBHOOK_SECRET}")
+async def telegram_webhook(request: Request):
+    try:
+        data = await request.json()
+        print("Update recebido:", data)
+        # TODO: sua lógica de resposta ao Telegram aqui
+        return {"ok": True}
+    except Exception as e:
+        print("Erro no webhook:", str(e))
+        return {"ok": False, "error": str(e)}
