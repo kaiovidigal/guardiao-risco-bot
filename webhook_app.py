@@ -521,8 +521,11 @@ ENTRY_RX = re.compile(r"ENTRADA\s+CONFIRMADA", re.I)
 SEQ_RX   = re.compile(r"Sequ[eê]ncia:\s*([^\n\r]+)", re.I)
 AFTER_RX = re.compile(r"ap[oó]s\s+o\s+([1-4])", re.I)
 ANALISANDO_RX = re.compile(r"\bANALISANDO\b", re.I)
-GREEN_RX = re.compile(r"(?:\bgr+e+e?n\b|\bwin\b|✅)", re.I)
+
+# ✅ Regex robustecidos: aceita "grem" e variações de green
+GREEN_RX = re.compile(r"(?:\bgr+e*e*n\b|\bgre+m\b|\bwin\b|✅)", re.I)
 LOSS_RX  = re.compile(r"(?:\blo+s+s?\b|\bred\b|❌|\bperdemos\b)", re.I)
+
 PAREN_GROUP_RX = re.compile(r"\(([^)]*)\)")
 ANY_14_RX      = re.compile(r"[1-4]")
 KEYCAP_MAP = {"1️⃣":"1","2️⃣":"2","3️⃣":"3","4️⃣":"4"}
@@ -537,14 +540,33 @@ def parse_entry_text(text: str) -> Optional[Dict]:
     return {"seq": seq, "after": after_num, "raw": t}
 
 def parse_close_numbers(text: str) -> List[int]:
+    """
+    Extrai o primeiro número observado (1..4) do texto de fechamento.
+    Regras:
+    - Prioriza o último grupo entre parênteses.
+    - Ignora dígitos de estágios (G0, G1, G2, G3).
+    - Suporta keycaps (1️⃣..4️⃣).
+    - Retorna só 1 número (G0 puro).
+    """
+    # Normaliza espaços e keycaps logo de início
     t = _normalize_keycaps(re.sub(r"\s+", " ", text))
+
+    # Remove tokens de estágio (G0/G1/G2/G3) para não confundir com número observado
+    # Usa \b para evitar remover partes de palavras e case-insensitive por segurança
+    t = re.sub(r"\bG[0-3]\b", "", t, flags=re.I)
+
+    # 1) Tenta capturar no último parêntese (formato mais comum nos fechamentos)
     groups = PAREN_GROUP_RX.findall(t)
     if groups:
         last = groups[-1]
-        nums = re.findall(r"[1-4]", _normalize_keycaps(last))
-        return [int(x) for x in nums][:1]  # G0: só o primeiro observado
-    nums = ANY_14_RX.findall(t)
-    return [int(x) for x in nums][:1]
+        # Captura apenas 1..4 que NÃO estejam imediatamente após 'G' (proteção extra)
+        nums = re.findall(r"(?<!G)[1-4]", last, flags=re.I)
+        if nums:
+            return [int(nums[0])]
+
+    # 2) Fallback: varre o texto todo, ainda protegendo contra 'G1' etc.
+    nums = re.findall(r"(?<!G)[1-4]", t, flags=re.I)
+    return [int(nums[0])] if nums else []
 
 # ========= Pending (G0) =========
 def get_open_pending() -> Optional[sqlite3.Row]:
