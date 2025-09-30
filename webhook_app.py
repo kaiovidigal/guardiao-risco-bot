@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-webhook_app.py — v4.5.0 (G0 focado + Hedge9)
+webhook_app.py — v4.5.0+profiles (G0 focado + Hedge9 + perfis automáticos 1..3)
 - G0 puro: fecha no 1º observado (sem gales)
-- Ensemble com 9 especialistas (hedge com atualização on-line)
+- Ensemble com 9 especialistas (hedge com atualização on-line) — PESOS GLOBAIS
+- Prior leve por "perfil de dealer" (1..3) identificado automaticamente (warmup + drift)
 - Anti-tilt, feedback online, reset diário, dedupe por update_id
 - "ANALISANDO" aprende e pode adiantar fechamento
 - Responde GREEN/LOSS em reply ao sinal correto
 - MIGRAÇÃO automática da tabela expert_w (adiciona w5..w9)
+- Rotação opcional por tempo/rodadas (para delimitar sessão)
 
 ENV obrigatórias: TG_BOT_TOKEN, WEBHOOK_TOKEN
 ENV opcionais:    TARGET_CHANNEL, SOURCE_CHANNEL, DB_PATH, DEBUG_MSG, BYPASS_SOURCE,
                   LLM_ENABLED, LLM_MODEL_PATH, LLM_CTX_TOKENS, LLM_N_THREADS, LLM_TEMP, LLM_TOP_P,
-                  TZ_NAME
+                  TZ_NAME,
+                  DEALER_ALPHA, DEALER_DECAY, DEALER_PROFILES, DEALER_PROFILE_WARMUP,
+                  DEALER_KL_THRESH, DEALER_DRIFT_WINDOW, DEALER_DRIFT_THRESH, DEALER_DRIFT_PERSIST,
+                  DEALER_AUTO_MIN_MINUTES, DEALER_AUTO_MAX_MINUTES, DEALER_AUTO_MAX_ROUNDS
 Webhook:          POST /webhook/{WEBHOOK_TOKEN}
 """
 
 import os, re, time, sqlite3, math, json
-from contextlib import contextmanager
+from contextmanager import contextmanager
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timezone
 
@@ -50,12 +55,27 @@ LLM_N_THREADS  = int(os.getenv("LLM_N_THREADS", "4"))
 LLM_TEMP       = float(os.getenv("LLM_TEMP", "0.2"))
 LLM_TOP_P      = float(os.getenv("LLM_TOP_P", "0.95"))
 
+# ===== Perfis automáticos (sem nome/visão) =====
+DEALER_ALPHA          = float(os.getenv("DEALER_ALPHA", "0.25"))   # força do prior no pós-Hedge9
+DEALER_DECAY          = float(os.getenv("DEALER_DECAY", "0.995"))  # memória do perfil
+DEALER_PROFILES       = int(os.getenv("DEALER_PROFILES", "3"))     # fixo: usamos 3
+DEALER_PROFILE_WARMUP = int(os.getenv("DEALER_PROFILE_WARMUP", "10"))  # N p/ classificar início
+DEALER_KL_THRESH      = float(os.getenv("DEALER_KL_THRESH", "0.22"))    # parecido o bastante?
+DEALER_DRIFT_WINDOW   = int(os.getenv("DEALER_DRIFT_WINDOW", "16"))     # janela p/ drift
+DEALER_DRIFT_THRESH   = float(os.getenv("DEALER_DRIFT_THRESH", "0.28")) # limite de divergência
+DEALER_DRIFT_PERSIST  = int(os.getenv("DEALER_DRIFT_PERSIST", "3"))     # janelas seguidas
+
+# ===== Rotação opcional por tempo/rodadas (define "sessão") =====
+DEALER_AUTO_MIN_MINUTES = int(os.getenv("DEALER_AUTO_MIN_MINUTES", "30"))
+DEALER_AUTO_MAX_MINUTES = int(os.getenv("DEALER_AUTO_MAX_MINUTES", "40"))
+DEALER_AUTO_MAX_ROUNDS  = int(os.getenv("DEALER_AUTO_MAX_ROUNDS", "0"))  # 0 = desliga
+
 if not TG_BOT_TOKEN:
     raise RuntimeError("Defina TG_BOT_TOKEN no ambiente.")
 if not WEBHOOK_TOKEN:
     raise RuntimeError("Defina WEBHOOK_TOKEN no ambiente.")
 
-app = FastAPI(title="guardiao-auto-bot (G0 + Hedge9)", version="4.5.0")
+app = FastAPI(title="guardiao-auto-bot (G0 + Hedge9 + Profiles)", version="4.5.0-profiles")
 
 # ========= Parâmetros =========
 DECAY = 0.980
@@ -177,6 +197,19 @@ def migrate_db():
     if not cur.execute("SELECT 1 FROM state WHERE id=1").fetchone():
         cur.execute("INSERT INTO state (id, cooldown_left, loss_streak, last_reset_ymd) VALUES (1,0,0,'')")
 
+    # add colunas novas no state
+    for col, default in (
+        ("dealer_auto_idx", "0"),
+        ("dealer_started_at", "0"),
+        ("dealer_rounds", "0"),
+        ("current_profile", "0"),
+        ("session_events", "0"),
+        ("session_start_id", "0"),
+        ("drift_strikes", "0"),
+    ):
+        if not _column_exists(con, "state", col):
+            cur.execute(f"ALTER TABLE state ADD COLUMN {col} INTEGER DEFAULT {default}")
+
     # expert_w base + migração
     cur.execute("""CREATE TABLE IF NOT EXISTS expert_w (
         id INTEGER PRIMARY KEY CHECK (id=1),
@@ -187,6 +220,18 @@ def migrate_db():
     for col in ("w5","w6","w7","w8","w9"):
         if not _column_exists(con, "expert_w", col):
             cur.execute(f"ALTER TABLE expert_w ADD COLUMN {col} REAL NOT NULL DEFAULT 1.0")
+
+    # perfis 1..3
+    cur.execute("""CREATE TABLE IF NOT EXISTS dealer_profiles (
+        id INTEGER PRIMARY KEY CHECK (id IN (1,2,3)),
+        c1 REAL NOT NULL DEFAULT 1.0,
+        c2 REAL NOT NULL DEFAULT 1.0,
+        c3 REAL NOT NULL DEFAULT 1.0,
+        c4 REAL NOT NULL DEFAULT 1.0,
+        updated_at INTEGER NOT NULL DEFAULT 0
+    )""")
+    for i in (1,2,3):
+        cur.execute("INSERT OR IGNORE INTO dealer_profiles (id) VALUES (?)", (i,))
 
     con.commit(); con.close()
 migrate_db()
@@ -251,18 +296,44 @@ def _bump_loss_streak(reset: bool):
     if reset: _set_loss_streak(0)
     else: _set_loss_streak(_get_loss_streak()+1)
 
-# ========= N-gram & Feedback =========
+# ========= Timeline helpers =========
 def timeline_size() -> int:
     con = _connect(); row = con.execute("SELECT COUNT(*) AS c FROM timeline").fetchone(); con.close()
     return int(row["c"] or 0)
+
 def get_tail(limit:int=400) -> List[int]:
-    con = _connect(); rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (limit,)).fetchall(); con.close()
+    con = _connect()
+    rows = con.execute("SELECT number FROM timeline ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    con.close()
     return [int(r["number"]) for r in rows][::-1]
+
+def get_max_timeline_id() -> int:
+    con=_connect()
+    r=con.execute("SELECT MAX(id) AS m FROM timeline").fetchone()
+    con.close()
+    return int(r["m"] or 0)
+
+def get_since_id_dist(start_id:int, k:int) -> Dict[int,float]:
+    """Distribuição dos últimos k números desde start_id (inclusive, por segurança)"""
+    con=_connect()
+    rows=con.execute("SELECT number FROM timeline WHERE id > ? ORDER BY id ASC LIMIT ?", (int(start_id), int(max(1,k)))).fetchall()
+    con.close()
+    arr=[int(r["number"]) for r in rows]
+    if not arr:
+        return {1:0.25,2:0.25,3:0.25,4:0.25}
+    d={1:0,2:0,3:0,4:0}
+    for v in arr[-k:]:
+        if v in d: d[v]+=1
+    s=sum(d.values()) or 1e-9
+    return {k2:v/s for k2,v in d.items()}
+
 def append_seq(seq: List[int]):
     if not seq: return
     with _tx() as con:
         for n in seq: con.execute("INSERT INTO timeline (created_at, number) VALUES (?,?)",(now_ts(), int(n)))
     _update_ngrams()
+
+# ========= N-gram & Feedback =========
 def _update_ngrams(decay: float=DECAY, max_n:int=5, window:int=400):
     tail = get_tail(window)
     if len(tail) < 2: return
@@ -474,6 +545,137 @@ def _hedge_update9(true_c:int, posts: List[Dict[int,float]]):
     S = sum(new) or 1e-9
     _set_expert_w([x/S for x in new])
 
+# ========= Perfis (auto) =========
+def _norm(d: Dict[int,float]) -> Dict[int,float]:
+    s=sum(d.values()) or 1e-9
+    return {k:v/s for k,v in d.items()}
+
+def _kl(p: Dict[int,float], q: Dict[int,float]) -> float:
+    eps=1e-9; r=0.0
+    for c in (1,2,3,4):
+        pv=max(eps,p.get(c,0.0)); qv=max(eps,q.get(c,0.0))
+        r+= pv*math.log(pv/qv)
+    return r
+
+def _profile_get_dist(pid:int)->Dict[int,float]:
+    con=_connect()
+    row=con.execute("SELECT c1,c2,c3,c4 FROM dealer_profiles WHERE id=?", (pid,)).fetchone()
+    con.close()
+    if not row: return {1:0.25,2:0.25,3:0.25,4:0.25}
+    d={1:float(row["c1"]),2:float(row["c2"]),3:float(row["c3"]),4:float(row["c4"])}
+    return _norm(d)
+
+def _profile_update_tick(pid:int, obs:int):
+    if pid not in (1,2,3) or obs not in (1,2,3,4): return
+    with _tx() as con:
+        row=con.execute("SELECT c1,c2,c3,c4 FROM dealer_profiles WHERE id=?", (pid,)).fetchone()
+        if row:
+            c=[float(row["c1"]),float(row["c2"]),float(row["c3"]),float(row["c4"])]
+            c=[x*DEALER_DECAY for x in c]
+        else:
+            c=[1.0,1.0,1.0,1.0]
+        c[obs-1]+=1.0
+        con.execute("""INSERT OR REPLACE INTO dealer_profiles
+                       (id,c1,c2,c3,c4,updated_at) VALUES (?,?,?,?,?,?)""",
+                    (pid,c[0],c[1],c[2],c[3],now_ts()))
+
+def _get_state_int(col:str)->int:
+    con=_connect()
+    row=con.execute(f"SELECT {col} FROM state WHERE id=1").fetchone()
+    con.close()
+    return int((row[col] if row else 0) or 0)
+
+def _set_state(col:str, val:int):
+    with _tx() as con:
+        con.execute(f"UPDATE state SET {col}=? WHERE id=1", (int(val),))
+
+def _get_current_profile()->int: return _get_state_int("current_profile")
+def _set_current_profile(pid:int):
+    with _tx() as con:
+        con.execute("UPDATE state SET current_profile=?, session_events=0 WHERE id=1", (int(pid),))
+
+def _ensure_session_start_id():
+    sid=_get_state_int("session_start_id")
+    if sid<=0:
+        _set_state("session_start_id", get_max_timeline_id())
+
+def _warmup_observed_dist()->Dict[int,float]:
+    """Usa os números desde o início da sessão (session_start_id) para compor a dist de warmup."""
+    sid=_get_state_int("session_start_id")
+    if sid<=0: _ensure_session_start_id(); sid=_get_state_int("session_start_id")
+    d=get_since_id_dist(sid, DEALER_PROFILE_WARMUP)
+    return d
+
+def _choose_profile_for_session()->int:
+    obs=_warmup_observed_dist()
+    best_pid=0; best_kl=1e9
+    for pid in (1,2,3):
+        p=_profile_get_dist(pid)
+        k=_kl(obs,p)
+        if k<best_kl: best_kl, best_pid = k, pid
+    if best_kl <= DEALER_KL_THRESH:
+        return best_pid
+    # fallback: o menos atualizado
+    con=_connect()
+    row=con.execute("SELECT id FROM dealer_profiles ORDER BY updated_at ASC LIMIT 1").fetchone()
+    con.close()
+    return int(row["id"] if row else 1)
+
+def _drift_check_and_maybe_reassign():
+    """Se a janela recente divergir demais do perfil ativo, reclassifica."""
+    pid=_get_current_profile()
+    if pid not in (1,2,3): return
+    tail=get_tail(max(20, DEALER_DRIFT_WINDOW+4))
+    if not tail: return
+    recent=tail[-DEALER_DRIFT_WINDOW:] if len(tail)>=DEALER_DRIFT_WINDOW else tail
+    d={1:0,2:0,3:0,4:0}
+    for v in recent:
+        if v in d: d[v]+=1
+    recent=_norm(d)
+    prof=_profile_get_dist(pid)
+    k=_kl(recent, prof)
+    strikes=_get_state_int("drift_strikes")
+    if k>=DEALER_DRIFT_THRESH:
+        strikes+=1
+    else:
+        strikes=0
+    _set_state("drift_strikes", strikes)
+    if strikes>=DEALER_DRIFT_PERSIST:
+        # reclassifica
+        new_pid=_choose_profile_for_session()
+        _set_current_profile(new_pid)
+        _set_state("drift_strikes", 0)
+        # reinicia warmup da sessão (opcional manter)
+        _set_state("session_start_id", get_max_timeline_id())
+
+# ========= Rotação de sessão (tempo/rodadas) — opcional =========
+def _maybe_rotate_session_by_time_and_rounds():
+    # inicia se nunca iniciou
+    started=_get_state_int("dealer_started_at")
+    if started<=0:
+        now=now_ts()
+        with _tx() as con:
+            con.execute("UPDATE state SET dealer_auto_idx=COALESCE(dealer_auto_idx,0)+1, dealer_started_at=?, dealer_rounds=0, current_profile=0, session_events=0, session_start_id=? WHERE id=1",
+                        (now, get_max_timeline_id()))
+        return
+
+    # tempo
+    elapsed_min = int((now_ts() - started)/60)
+    if elapsed_min >= DEALER_AUTO_MAX_MINUTES:
+        with _tx() as con:
+            con.execute("UPDATE state SET dealer_auto_idx=COALESCE(dealer_auto_idx,0)+1, dealer_started_at=?, dealer_rounds=0, current_profile=0, session_events=0, session_start_id=? WHERE id=1",
+                        (now_ts(), get_max_timeline_id()))
+        return
+
+    # rodadas
+    if DEALER_AUTO_MAX_ROUNDS > 0:
+        rounds=_get_state_int("dealer_rounds")
+        if rounds >= DEALER_AUTO_MAX_ROUNDS:
+            with _tx() as con:
+                con.execute("UPDATE state SET dealer_auto_idx=COALESCE(dealer_auto_idx,0)+1, dealer_started_at=?, dealer_rounds=0, current_profile=0, session_events=0, session_start_id=? WHERE id=1",
+                            (now_ts(), get_max_timeline_id()))
+            return
+
 # ========= Anti-tilt =========
 def _streak_adjust_choice(post:Dict[int,float], gap:float, ls:int) -> Tuple[int,str,Dict[int,float]]:
     reason = "Hedge9"
@@ -504,6 +706,18 @@ def choose_single_number(after: Optional[int]):
     e8 = _post_pair_table(tail)
     e9 = _post_recency_penalty(tail)
     post, ws = _blend9([e1,e2,e3,e4,e5,e6,e7,e8,e9])
+
+    # pós-Hedge9: mistura leve com o prior do perfil ativo (1..3)
+    try:
+        pid=_get_current_profile()
+        if pid in (1,2,3) and DEALER_ALPHA>0.0:
+            prior=_profile_get_dist(pid)
+            post={c:(1.0-DEALER_ALPHA)*post[c] + DEALER_ALPHA*prior[c] for c in [1,2,3,4]}
+            s=sum(post.values()) or 1e-9
+            post={k:v/s for k,v in post.items()}
+    except Exception:
+        pass
+
     ranking = sorted(post.items(), key=lambda kv: kv[1], reverse=True)
     top2 = ranking[:2]
     gap = (top2[0][1] - top2[1][1]) if len(top2) >= 2 else ranking[0][1]
@@ -548,23 +762,14 @@ def parse_close_numbers(text: str) -> List[int]:
     - Suporta keycaps (1️⃣..4️⃣).
     - Retorna só 1 número (G0 puro).
     """
-    # Normaliza espaços e keycaps logo de início
     t = _normalize_keycaps(re.sub(r"\s+", " ", text))
-
-    # Remove tokens de estágio (G0/G1/G2/G3) para não confundir com número observado
-    # Usa \b para evitar remover partes de palavras e case-insensitive por segurança
     t = re.sub(r"\bG[0-3]\b", "", t, flags=re.I)
-
-    # 1) Tenta capturar no último parêntese (formato mais comum nos fechamentos)
     groups = PAREN_GROUP_RX.findall(t)
     if groups:
         last = groups[-1]
-        # Captura apenas 1..4 que NÃO estejam imediatamente após 'G' (proteção extra)
         nums = re.findall(r"(?<!G)[1-4]", last, flags=re.I)
         if nums:
             return [int(nums[0])]
-
-    # 2) Fallback: varre o texto todo, ainda protegendo contra 'G1' etc.
     nums = re.findall(r"(?<!G)[1-4]", t, flags=re.I)
     return [int(nums[0])] if nums else []
 
@@ -640,6 +845,16 @@ def _close_now(row: sqlite3.Row) -> Dict:
         if obs_first is not None: _hedge_update9(obs_first, posts)
     except Exception: pass
 
+    # ====== Atualiza contadores de sessão e perfil ======
+    try:
+        with _tx() as con:
+            con.execute("UPDATE state SET dealer_rounds=COALESCE(dealer_rounds,0)+1, session_events=COALESCE(session_events,0)+1 WHERE id=1")
+        pid=_get_current_profile()
+        if obs_first is not None and pid in (1,2,3):
+            _profile_update_tick(pid, obs_first)
+    except Exception:
+        pass
+
     bump_score(outcome.upper())
     try:
         if outcome.upper()=="LOSS": _set_cooldown(COOLDOWN_N); _bump_loss_streak(False)
@@ -677,7 +892,7 @@ async def tg_send_text(chat_id: str, text: str, parse: str="HTML", reply_to: int
 @app.get("/")
 async def root():
     check_and_maybe_reset_score()
-    return {"ok": True, "service": "guardiao-auto-bot (G0 + Hedge9)"}
+    return {"ok": True, "service": "guardiao-auto-bot (G0 + Hedge9 + Profiles)"}
 
 @app.get("/health")
 async def health():
@@ -685,13 +900,17 @@ async def health():
     pend = get_open_pending()
     return {"ok": True, "db": DB_PATH, "pending_open": bool(pend), "pending_seen": (pend["seen"] if pend else ""), "time": ts_str(), "tz": TZ_NAME}
 
-# ========= Webhook correto (POST + token) =========
+# ========= Webhook =========
 @app.post("/webhook/{token}")
 async def webhook(token: str, request: Request):
     if token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     check_and_maybe_reset_score()
+
+    # Define/rotaciona sessão (tempo/rodadas — opcional)
+    _maybe_rotate_session_by_time_and_rounds()
+
     data = await request.json()
 
     # Dedupe
@@ -707,6 +926,18 @@ async def webhook(token: str, request: Request):
         if DEBUG_MSG: await tg_send_text(TARGET_CHANNEL, f"DEBUG: Ignorando chat {chat_id}. Fonte esperada: {SOURCE_CHANNEL}")
         return {"ok": True, "skipped": "outro_chat"}
     if not text: return {"ok": True, "skipped": "sem_texto"}
+
+    # ====== Classificação de perfil após warmup e checagem de drift ======
+    try:
+        # Se ainda não tem perfil ativo, tenta escolher quando já houver warmup
+        pid=_get_current_profile()
+        sess_events=_get_state_int("session_events")
+        if pid not in (1,2,3) and sess_events >= DEALER_PROFILE_WARMUP:
+            _set_current_profile(_choose_profile_for_session())
+        # Checa drift de tempos em tempos (não bloqueante)
+        _drift_check_and_maybe_reassign()
+    except Exception:
+        pass
 
     # ANALISANDO
     if ANALISANDO_RX.search(_normalize_keycaps(text)):
@@ -746,7 +977,12 @@ async def webhook(token: str, request: Request):
         return {"ok": True, "kept_open_waiting_close": True}
 
     seq = parsed["seq"] or []
-    if seq: append_seq(seq)
+    if seq:
+        # ao receber sequência de ENTRADA, reinicia session_start_id se a sessão acabou de rotacionar
+        if _get_state_int("session_events")==0:
+            _set_state("session_start_id", get_max_timeline_id())
+        append_seq(seq)
+
     after = parsed["after"]
     best, conf, samples, post, gap, reason = choose_single_number(after)
     ctx1, ctx2, ctx3, ctx4 = _decision_context(after)
@@ -770,21 +1006,18 @@ async def webhook(token: str, request: Request):
 # --- Rotas auxiliares (GET/POST) para evitar 404/405 no navegador ou chamadas erradas ---
 @app.post("/webhook")
 async def webhook_missing_token(request: Request):
-    # POST sem token: responde 200 e dica (não interfere no correto)
     try:
-        _ = await request.body()  # consome corpo
+        _ = await request.body()
     except Exception:
         pass
     return {"ok": True, "hint": "Use POST /webhook/<WEBHOOK_TOKEN> (chamado pelo Telegram)."}
 
 @app.get("/webhook")
 async def webhook_missing_token_get():
-    # GET sem token (navegador) — só mensagem amigável
     return {"ok": True, "detail": "Este endpoint aceita POST. Para testar no navegador use /health."}
 
 @app.get("/webhook/{token}")
 async def webhook_get_info(token: str):
-    # GET com token — evita 405 no navegador; não processa updates
     if token == WEBHOOK_TOKEN:
         return {"ok": True, "webhook": "ativo", "detail": "Este endpoint aceita POST do Telegram. GET exibido para inspeção."}
     return {"ok": False, "detail": "Token não confere. O webhook real aceita apenas POST do Telegram."}
