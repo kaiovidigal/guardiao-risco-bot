@@ -1,4 +1,4 @@
-# app.py (COMPLETO — Bac Bo + Fantan)
+# app.py (COMPLETO — Bac Bo + Fantan, 1 por vez, fechamento com resumo)
 import os, json, asyncio, re, pytz
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -7,8 +7,8 @@ import logging
 
 # ========= ENV =========
 TG_BOT_TOKEN   = os.environ["TG_BOT_TOKEN"]
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])    # origem
-TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])    # destino
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])    # ORIGEM (ex: -1003156785631)
+TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])    # DESTINO (ex: -1002796105884)
 TZ_NAME = os.getenv("TZ", "UTC")
 
 # Estratégia/limites
@@ -23,10 +23,10 @@ TOP_HOURS_MIN_SAMPLES = int(os.getenv("TOP_HOURS_MIN_SAMPLES", "25"))
 MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "20"))
 
 # Toggles
-FLOW_THROUGH   = os.getenv("FLOW_THROUGH", "0") == "1"   # espelha tudo para testar
+FLOW_THROUGH    = os.getenv("FLOW_THROUGH", "0") == "1"  # espelha tudo (teste)
 DISABLE_WINDOWS = os.getenv("DISABLE_WINDOWS", "0") == "1"
 DISABLE_RISK    = os.getenv("DISABLE_RISK", "0") == "1"
-LOG_RAW        = os.getenv("LOG_RAW", "1") == "1"
+LOG_RAW         = os.getenv("LOG_RAW", "1") == "1"
 
 STATE_PATH = os.getenv("STATE_PATH", "./state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
@@ -45,6 +45,11 @@ STATE = {
     "hourly_entries": {},     # "YYYY-MM-DD HH" -> int
     "cooldown_until": None,   # ISO
     "recent_g0": [],          # últimos resultados: "G"/"R"
+
+    # Controle de operação única + métricas de fechamento
+    "open_signal": None,                 # {"ts": ISO, "text": str, "pattern": str}
+    "totals": {"greens": 0, "reds": 0},  # acumulado do dia
+    "streak_green": 0,                   # sequência de greens
 }
 
 def _ensure_dir(path: str):
@@ -87,7 +92,6 @@ PATTERN_RE = re.compile(
     r"(banker|player|empate|bac\s*bo|dados|entrada\s*confirmada|odd|even)",
     re.I,
 )
-
 # Ruídos a ignorar
 NOISE_RE = re.compile(
     r"(bot\s*online|estamos\s+no\s+\d+º?\s*gale|aposta\s*encerrada|analisando)",
@@ -175,6 +179,9 @@ def daily_reset_if_needed():
         STATE["daily_losses"] = 0
         STATE["hourly_entries"] = {}
         STATE["cooldown_until"] = None
+        STATE["totals"] = {"greens": 0, "reds": 0}
+        STATE["streak_green"] = 0
+        STATE["open_signal"] = None
         save_state()
 
 # ========= PIPELINE =========
@@ -182,6 +189,11 @@ async def process_signal(text: str):
     daily_reset_if_needed()
     pattern = extract_pattern(text)
     add_message("signal", text, pattern)
+
+    # Não abrir novo enquanto não fechar o atual
+    if STATE.get("open_signal"):
+        logger.info("IGNORADO: já existe operação aberta; aguardando fechamento")
+        return
 
     low = (text or "").lower()
     # ruído
@@ -220,16 +232,57 @@ async def process_signal(text: str):
         if not hourly_cap_ok():
             logger.info("DESCARTADO: limite por hora"); return
 
+    # Aprovação final → publica e marca operação aberta
+    STATE["open_signal"] = {
+        "ts": now_local().isoformat(),
+        "text": text,
+        "pattern": pattern or "fantan",
+    }
+    save_state()
+
     await tg_send(TARGET_CHAT_ID, f"✅ <b>G0 {wr*100:.1f}%</b>\n{text}")
     register_hourly_entry()
 
 async def process_result(text: str):
     patt_hint = extract_pattern(text)
     t = (text or "").lower()
+
+    result = None
     if "green" in t or "win" in t or "✅" in t:
-        add_message("green", text, patt_hint); register_outcome_g0("G", patt_hint)
+        result = "G"
     elif "red" in t or "lose" in t or "perd" in t or "❌" in t:
-        add_message("red", text, patt_hint); register_outcome_g0("R", patt_hint)
+        result = "R"
+    if not result: return
+
+    add_message("green" if result=="G" else "red", text, patt_hint)
+    register_outcome_g0(result, patt_hint)
+
+    # Atualiza contadores do dia
+    if result == "G":
+        STATE["totals"]["greens"] = STATE["totals"].get("greens", 0) + 1
+        STATE["streak_green"] = STATE.get("streak_green", 0) + 1
+    else:
+        STATE["totals"]["reds"] = STATE["totals"].get("reds", 0) + 1
+        STATE["streak_green"] = 0
+    save_state()
+
+    # Se havia operação aberta, FECHA e publica o resumo
+    if STATE.get("open_signal"):
+        g = STATE["totals"]["greens"]
+        r = STATE["totals"]["reds"]
+        total = g + r
+        wr = (g / total * 100.0) if total else 0.0
+        streak = STATE.get("streak_green", 0)
+
+        resumo = (
+            f"✅ {g} ⛔️ {r} 🎯 Acertamos {wr:.2f}%\n"
+            f"🥇 ESTAMOS A {streak} GREENS SEGUIDOS ⏳"
+        )
+        await tg_send(TARGET_CHAT_ID, resumo)
+
+        # libera próxima entrada
+        STATE["open_signal"] = None
+        save_state()
 
 # ========= RELATÓRIO =========
 def build_daily_report():
@@ -287,7 +340,7 @@ async def on_startup():
 # ========= ROTAS =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "g0-bot (bacbo+fantan)"}
+    return {"ok": True, "service": "g0-bot (bacbo+fantan, single-trade)"}
 
 # /webhook e /webhook/
 @app.post("/webhook")
