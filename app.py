@@ -1,4 +1,4 @@
-# app.py — pipeline G0 com 5 especialistas + dedup e contagem real
+ # app.py — pipeline G0 com 5 especialistas + dedup e contagem real
 import os, json, asyncio, re, pytz, hashlib
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -394,4 +394,103 @@ def build_report():
     for p, dq in STATE.get("pattern_roll", {}).items():
         n = len(dq)
         if n >= 10:
-            wr = sum(1 for x in dq if x=="G")/n
+            wr = sum(1 for x in dq if x == "G") / n
+            rows.append((p, wr, n))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    tops = rows[:5]
+
+    cleanup_expired_bans()
+    bans = []
+    for p, b in STATE.get("pattern_ban", {}).items():
+        try:
+            until = datetime.fromisoformat(b["until"]).strftime("%d/%m %H:%M")
+        except Exception:
+            until = b.get("until", "?")
+        bans.append(f"• {p} (até {until})")
+
+    lines = [
+        f"<b>📊 Relatório Diário ({today_str()})</b>",
+        f"Dia: <b>{g}G / {r}R</b>  (WR: {wr_day:.1f}%)",
+        f"Stop-loss: {DAILY_STOP_LOSS}  •  Perdas hoje: {STATE.get('daily_losses',0)}",
+        "", "<b>Top padrões (rolling):</b>",
+    ]
+    if tops:
+        lines += [f"• {p} → {wr*100:.1f}% ({n})" for p, wr, n in tops]
+    else:
+        lines.append("• Sem dados suficientes.")
+    lines += ["", "<b>Padrões banidos:</b>"]
+    lines += bans or ["• Nenhum ativo."]
+    return "\n".join(lines)
+
+# ============= LOOP DE RELATÓRIO =============
+async def daily_report_loop():
+    await asyncio.sleep(5)
+    while True:
+        try:
+            n = now_local()
+            if n.hour == 0 and n.minute == 0:
+                daily_reset_if_needed()
+                await tg_send(TARGET_CHAT_ID, build_report())
+                await asyncio.sleep(65)  # evita disparar 2x no mesmo minuto
+            else:
+                await asyncio.sleep(10)
+        except Exception:
+            await asyncio.sleep(5)
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(daily_report_loop())
+
+# ============= ROTAS =============
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "g0-pipeline (5 especialistas + dedup + cores)"}
+
+# /webhook e /webhook/<segredo>
+@app.post("/webhook")
+@app.post("/webhook/{secret}")
+async def webhook(req: Request, secret: str|None=None):
+    update = await req.json()
+    if LOG_RAW: log.info("RAW UPDATE: %s", update)
+
+    # DEDUP por update_id do Telegram
+    up_id = update.get("update_id")
+    if up_id is not None:
+        if up_id in STATE["processed_updates"]:
+            return {"ok": True}
+        STATE["processed_updates"].append(up_id)
+
+    msg = update.get("channel_post") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (msg.get("text") or "").strip()
+
+    if not text or chat_id != SOURCE_CHAT_ID:
+        return {"ok": True}
+
+    # modo espelho (debug)
+    if FLOW_THROUGH:
+        await tg_send(TARGET_CHAT_ID, colorize_line(text))
+        asyncio.create_task(aux_log_history({
+            "ts": now_local().isoformat(), "type":"mirror", "text": text
+        }))
+        return {"ok": True}
+
+    low = text.lower()
+
+    # resultado?
+    if GREEN_RE.search(text) or RED_RE.search(text):
+        await process_result(text)
+        return {"ok": True}
+
+    # potencial sinal?
+    if (("entrada confirmada" in low) or
+        re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)):
+        await process_signal(text)
+        return {"ok": True}
+
+    # descartado (outro)
+    asyncio.create_task(aux_log_history({
+        "ts": now_local().isoformat(), "type":"other", "text": text
+    }))
+    return {"ok": True}
