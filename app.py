@@ -1,4 +1,4 @@
-# app.py — pipeline G0 destravado (soft checks) + auxiliares assíncronos
+# app.py — G0 only (sem gales), auto-LOSS, cores, dedupe, soft checks + risco
 import os, json, asyncio, re, pytz
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -6,54 +6,84 @@ import httpx
 import logging
 from collections import deque
 
-# ============= ENV =============
+# ==================== ENV ====================
 TG_BOT_TOKEN   = os.environ["TG_BOT_TOKEN"]
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])   # origem
-TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # destino
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])   # canal origem (G2 etc.)
+TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # canal destino (G0)
 TZ_NAME = os.getenv("TZ", "UTC")
 LOCAL_TZ = pytz.timezone(TZ_NAME)
 
-# Estratégia / limites
-MIN_G0 = float(os.getenv("MIN_G0", "0.80"))                # corte do G0
+# G0 / estatística
+MIN_G0 = float(os.getenv("MIN_G0", "0.80"))
 MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "20"))
-ROLLING_MAX = int(os.getenv("ROLLING_MAX", "500"))         # janela rolante por padrão
-BAN_AFTER_CONSECUTIVE_R = int(os.getenv("BAN_AFTER_CONSECUTIVE_R", "2"))
-BAN_FOR_HOURS = int(os.getenv("BAN_FOR_HOURS", "4"))
+ROLLING_MAX = int(os.getenv("ROLLING_MAX", "500"))
 
+# risco
 DAILY_STOP_LOSS = int(os.getenv("DAILY_STOP_LOSS", "3"))
 STREAK_GUARD_LOSSES = int(os.getenv("STREAK_GUARD_LOSSES", "2"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "30"))
 HOURLY_CAP = int(os.getenv("HOURLY_CAP", "6"))
 
+# janelas (soft check)
 TOP_HOURS_MIN_WINRATE = float(os.getenv("TOP_HOURS_MIN_WINRATE", "0.85"))
 TOP_HOURS_MIN_SAMPLES = int(os.getenv("TOP_HOURS_MIN_SAMPLES", "25"))
 TOP_HOURS_COUNT = int(os.getenv("TOP_HOURS_COUNT", "6"))
 
-# Fluxo sem travar (anti-spam leve)
-MIN_GAP_SECS = int(os.getenv("MIN_GAP_SECS", "15"))  # intervalo mínimo entre publicações
+# bans
+BAN_AFTER_CONSECUTIVE_R = int(os.getenv("BAN_AFTER_CONSECUTIVE_R", "2"))
+BAN_FOR_HOURS = int(os.getenv("BAN_FOR_HOURS", "4"))
 
-# Toggles
-FLOW_THROUGH = os.getenv("FLOW_THROUGH", "0") == "1"   # espelha tudo (teste)
-LOG_RAW = os.getenv("LOG_RAW", "1") == "1"
-DISABLE_WINDOWS = os.getenv("DISABLE_WINDOWS", "0") == "1"
-DISABLE_RISK = os.getenv("DISABLE_RISK", "0") == "1"
+# fluxo / proteção
+MIN_GAP_SECS = int(os.getenv("MIN_GAP_SECS", "12"))           # intervalo mínimo entre publicações
+AUTO_LOSS_SECONDS = int(os.getenv("AUTO_LOSS_SECONDS", "120"))# timeout p/ fechar como LOSS se não vier GREEN
+DUP_CACHE = int(os.getenv("DUP_CACHE", "2000"))               # quantos msg_ids manter
+
+# toggles
+FLOW_THROUGH = os.getenv("FLOW_THROUGH", "0") == "1"          # espelhar tudo (debug)
+LOG_RAW = os.getenv("LOG_RAW", "0") == "1"
+DISABLE_WINDOWS = os.getenv("DISABLE_WINDOWS", "0") == "1"    # se 1, ignora janelas (já é soft)
+DISABLE_RISK = os.getenv("DISABLE_RISK", "0") == "1"          # se 1, desliga stop/cooldown/streakguard
 
 STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ============= APP/LOG =============
+# ==================== APP/LOG ====================
 app = FastAPI()
 log = logging.getLogger("uvicorn.error")
 
-# ============= REGRAS DE TEXTO =============
-# Padrões Bac Bo + Fantan
-PATTERN_RE = re.compile(r"(banker|player|empate|bac\s*bo|dados|entrada\s*confirmada|odd|even)", re.I)
-# Ruídos
-NOISE_RE = re.compile(r"(bot\s*online|estamos\s+no\s+\d+º?\s*gale|aposta\s*encerrada|analisando)", re.I)
-# Resultado
-GREEN_RE = re.compile(r"(green|win|✅)", re.I)
-RED_RE   = re.compile(r"(red|lose|perd|loss|derrota|❌)", re.I)
+# ==================== REGEX ====================
+# Sinais (Bac Bo/Fantan) — G0 somente
+PATTERN_RE = re.compile(r"(banker|player|empate|bac\s*bo|fantan|dados|entrada\s*confirmada|odd|even)", re.I)
 
+# ruídos
+NOISE_RE = re.compile(r"(bot\s*online|aposta\s*encerrada|analisando)", re.I)
+GALE_RE  = re.compile(r"estamos\s+no\s+\d+º?\s*gale", re.I)   # não usamos gales
+
+# resultados
+GREEN_RE = re.compile(r"(?:\bgreen\b|\bwin\b|✅)", re.I)
+RED_RE   = re.compile(r"(?:\bred\b|\blose\b|\bloss\b|\bderrota\b|\bperd(?:e|emos)\b|❌)", re.I)
+
+# cores (marcação visual)
+PLAYER_RE = re.compile(r"\bplayer\b", re.I)
+BANKER_RE = re.compile(r"\bbanker\b", re.I)
+EMPATE_RE = re.compile(r"\bempate\b", re.I)
+
+def sides_badge(text: str) -> str:
+    low = (text or "").lower()
+    tags = []
+    if PLAYER_RE.search(low): tags.append("🔵 Player")
+    if BANKER_RE.search(low): tags.append("🔴 Banker")
+    if EMPATE_RE.search(low): tags.append("🟡 Empate")
+    return " | ".join(tags)
+
+def colorize_inline(text: str) -> str:
+    s = text
+    s = PLAYER_RE.sub("🔵 Player", s)
+    s = BANKER_RE.sub("🔴 Banker", s)
+    s = EMPATE_RE.sub("🟡 Empate", s)
+    return s
+
+# ==================== UTILS ====================
 def now_local(): return datetime.now(LOCAL_TZ)
 def today_str(): return now_local().strftime("%Y-%m-%d")
 def hour_str(dt=None): return (dt or now_local()).strftime("%H")
@@ -64,33 +94,26 @@ def extract_pattern(text: str) -> str|None:
     if not f: return None
     return "+".join(sorted([w.strip().lower() for w in f]))
 
-# ============= STATE =============
+# ==================== STATE ====================
 STATE = {
-    "messages": [],           # [{ts,type,text,hour,pattern}]
-    "last_reset_date": None,  # "YYYY-MM-DD"
+    "messages": [],                # log leve
+    "last_reset_date": None,
 
-    # rolling por padrão: pattern -> deque de "G"/"R" (máx ROLLING_MAX)
-    "pattern_roll": {},
+    "pattern_roll": {},            # pattern -> deque("G"/"R")
+    "hour_stats": {},              # "00".."23" -> {"g":int,"t":int}
+    "pattern_ban": {},             # pattern -> {"until": ISO, "reason": str}
 
-    # métricas agregadas por hora (para janelas de ouro)
-    "hour_stats": {},         # "00".."23" -> {"g":int,"t":int}
-
-    # bans temporários por padrão
-    "pattern_ban": {},        # pattern -> {"until": ISO, "reason": str}
-
-    # risco / fluxo
     "daily_losses": 0,
-    "hourly_entries": {},     # "YYYY-MM-DD HH" -> int
-    "cooldown_until": None,   # ISO
-    "recent_g0": [],          # últimos G/R (para streak-guard)
+    "hourly_entries": {},
+    "cooldown_until": None,
+    "recent_g0": [],
 
-    # operação + contagem real
-    "open_signal": None,               # {"ts", "text", "pattern"}
+    "open_signal": None,           # {"ts","text","pattern"}
     "totals": {"greens": 0, "reds": 0},
     "streak_green": 0,
 
-    # anti-spam de publicação (sem travar)
-    "last_publish_ts": None,  # ISO
+    "last_publish_ts": None,       # anti-spam leve
+    "seen_msg_ids": []             # dedupe por message_id
 }
 
 def _ensure_dir(path):
@@ -111,22 +134,21 @@ def load_state():
         save_state()
 load_state()
 
-# ============= LOGGING DE HISTÓRICO (aux) =============
+# ==================== LOG AUX ====================
 async def aux_log_history(entry: dict):
     STATE["messages"].append(entry)
     if len(STATE["messages"]) > 5000:
         STATE["messages"] = STATE["messages"][-4000:]
     save_state()
 
-# ============= MÉTRICAS/ROLLING =============
+# ==================== ROLLING / ESTAT ====================
 def rolling_append(pattern: str, result: str):
     dq = STATE["pattern_roll"].setdefault(pattern, deque(maxlen=ROLLING_MAX))
     dq.append(result)
-    # também atualizar hour_stats
     h = hour_str()
-    hst = STATE["hour_stats"].setdefault(h, {"g": 0, "t": 0})
-    hst["t"] += 1
-    if result == "G": hst["g"] += 1
+    hs = STATE["hour_stats"].setdefault(h, {"g": 0, "t": 0})
+    hs["t"] += 1
+    if result == "G": hs["g"] += 1
 
 def rolling_wr(pattern: str) -> float:
     dq = STATE["pattern_roll"].get(pattern)
@@ -135,8 +157,7 @@ def rolling_wr(pattern: str) -> float:
 
 def pattern_recent_tail(pattern: str, k: int) -> str:
     dq = STATE["pattern_roll"].get(pattern) or []
-    tail = list(dq)[-k:]
-    return "".join(tail)  # ex: "GRR"
+    return "".join(list(dq)[-k:])
 
 def ban_pattern(pattern: str, reason: str):
     until = now_local() + timedelta(hours=BAN_FOR_HOURS)
@@ -145,11 +166,10 @@ def ban_pattern(pattern: str, reason: str):
 
 def is_banned(pattern: str) -> bool:
     b = STATE["pattern_ban"].get(pattern)
-    if not b: return False
-    return datetime.fromisoformat(b["until"]) > now_local()
+    return bool(b) and datetime.fromisoformat(b["until"]) > now_local()
 
 def cleanup_expired_bans():
-    expired = [p for p,b in STATE["pattern_ban"].items()
+    expired = [p for p,b in STATE.get("pattern_ban", {}).items()
                if datetime.fromisoformat(b["until"]) <= now_local()]
     for p in expired: STATE["pattern_ban"].pop(p, None)
 
@@ -162,10 +182,10 @@ def daily_reset_if_needed():
         STATE["totals"] = {"greens": 0, "reds": 0}
         STATE["streak_green"] = 0
         STATE["open_signal"] = None
-        cleanup_expired_bans()  # não limpamos pattern_roll; o aprendizado continua
+        cleanup_expired_bans()
         save_state()
 
-# ============= RISCO / FLUXO =============
+# ==================== RISCO ====================
 def cooldown_active():
     cu = STATE.get("cooldown_until")
     return bool(cu) and datetime.fromisoformat(cu) > now_local()
@@ -179,7 +199,9 @@ def streak_guard_triggered():
     r = STATE.get("recent_g0", [])
     return k > 0 and len(r) >= k and all(x == "R" for x in r[-k:])
 
-def hourly_cap_ok(): return STATE["hourly_entries"].get(hour_key(), 0) < HOURLY_CAP
+def hourly_cap_ok():
+    return STATE["hourly_entries"].get(hour_key(), 0) < HOURLY_CAP
+
 def register_hourly_entry():
     k = hour_key()
     STATE["hourly_entries"][k] = STATE["hourly_entries"].get(k, 0) + 1
@@ -198,159 +220,186 @@ def is_top_hour_now() -> bool:
         if len(top) >= TOP_HOURS_COUNT: break
     return hour_str() in top if top else True
 
-# ============= TELEGRAM =============
+# ==================== TELEGRAM ====================
 async def tg_send(chat_id: int, text: str, disable_preview=True):
     async with httpx.AsyncClient(timeout=20) as cli:
         await cli.post(f"{API}/sendMessage",
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
                   "disable_web_page_preview": disable_preview})
 
-# ============= ESPECIALISTA FIXO: G0 (gating) =============
+# ==================== G0 (gating) ====================
 def g0_allows(pattern: str) -> tuple[bool, float, int]:
     dq = STATE["pattern_roll"].get(pattern, deque())
     samples = len(dq)
-    # aquecimento: libera até juntar MIN_SAMPLES_BEFORE_FILTER
     if samples < MIN_SAMPLES_BEFORE_FILTER:
-        return True, 1.0, samples
+        return True, 1.0, samples  # aquecimento
     wr = rolling_wr(pattern)
     return (wr >= MIN_G0), wr, samples
 
-# ============= PROCESSAMENTO ============
+# ==================== AUTO-LOSS (timeout) ====================
+def auto_loss_due() -> bool:
+    op = STATE.get("open_signal")
+    if not op: return False
+    try:
+        opened = datetime.fromisoformat(op["ts"])
+    except Exception:
+        return False
+    return (now_local() - opened).total_seconds() >= AUTO_LOSS_SECONDS
+
+async def auto_loss_loop():
+    await asyncio.sleep(3)
+    while True:
+        try:
+            if STATE.get("open_signal") and auto_loss_due():
+                # fecha como LOSS (sem depender de mensagem ❌ do canal)
+                await close_open_trade(as_green=False, reason="timeout")
+            await asyncio.sleep(2)
+        except Exception:
+            await asyncio.sleep(2)
+
+# ==================== FECHAMENTO ====================
+async def close_open_trade(as_green: bool, reason: str = "result"):
+    # contabilização diária
+    if as_green:
+        STATE["totals"]["greens"] += 1
+        STATE["streak_green"] = STATE.get("streak_green", 0) + 1
+        res_tag = "GREEN"
+    else:
+        STATE["totals"]["reds"] += 1
+        STATE["streak_green"] = 0
+        STATE["daily_losses"] = STATE.get("daily_losses", 0) + 1
+        res_tag = "LOSS"
+
+    g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
+    total = max(1, g + r)
+    wr_day = (g/total*100.0)
+
+    resumo = f"✅ {g} ⛔️ {r} 🎯 Acertamos {wr_day:.2f}%\n🥇 ESTAMOS A {STATE['streak_green']} GREENS SEGUIDOS ⏳"
+    if STATE.get("open_signal"):
+        base = STATE["open_signal"]["text"]
+        badge = sides_badge(base)
+        if badge:
+            resumo = badge + "\n" + resumo
+    await tg_send(TARGET_CHAT_ID, resumo)
+
+    asyncio.create_task(aux_log_history({
+        "ts": now_local().isoformat(),
+        "type": f"close_{res_tag}",
+        "reason": reason
+    }))
+
+    STATE["open_signal"] = None
+    save_state()
+
+# ==================== PROCESSAMENTO ====================
 async def process_signal(text: str):
     daily_reset_if_needed()
 
     low = (text or "").lower()
-    # ruído
-    if NOISE_RE.search(low):
-        log.info("DESCARTADO: ruído")
+    if NOISE_RE.search(low) or GALE_RE.search(low):
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"noise","text":text}))
         return
 
-    # gatilho de sinal
     pattern = extract_pattern(text)
-    gatilho = ("entrada confirmada" in low) or re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)
+    gatilho = ("entrada confirmada" in low) or re.search(r"\b(banker|player|empate|bac\s*bo|fantan|dados)\b", low)
     if not gatilho:
-        log.info("DESCARTADO: sem gatilho")
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"no_trigger","text":text}))
         return
 
     if not pattern and "entrada confirmada" in low:
         pattern = "fantan"
 
-    # 1) G0 (gating) — estatístico por padrão (rolling)
+    # ban
     if is_banned(pattern):
-        log.info("DESCARTADO: padrão banido temporariamente")
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"banned_pattern","pattern":pattern,"text":text}))
         return
 
+    # G0
     allowed, wr, samples = g0_allows(pattern)
     if not allowed:
-        log.info("REPROVADO G0: wr=%.2f amostras=%d < min=%.2f", wr, samples, MIN_G0)
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"rejected_g0","pattern":pattern,"wr":wr,"n":samples,"text":text}))
         return
 
-    # 2) Sentinela de risco (bloqueios reais)
+    # risco (bloqueios reais)
     if not DISABLE_RISK:
         if STATE["daily_losses"] >= DAILY_STOP_LOSS:
-            log.info("STOP diário")
             asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"stop_daily","text":text}))
             return
         if cooldown_active():
-            log.info("COOLDOWN ativo")
             asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"cooldown","text":text}))
             return
         if streak_guard_triggered():
             start_cooldown()
-            log.info("STREAK GUARD")
             asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"streak_guard","text":text}))
             return
 
-    # CAP por hora → apenas AVISO (não bloqueia)
+    # CAP por hora → aviso (soft)
     if not hourly_cap_ok():
-        log.info("CAP por hora atingido (aviso, não bloqueia)")
-        asyncio.create_task(aux_log_history({
-            "ts": now_local().isoformat(), "type":"hour_cap_notice", "text": text
-        }))
+        asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"hour_cap_notice","text":text}))
 
-    # 3) Janela de ouro → APENAS AVISO (não bloqueia)
+    # janelas de ouro → aviso (soft)
     if not is_top_hour_now():
-        log.info("FORA da janela de ouro (aviso, não bloqueia)")
-        asyncio.create_task(aux_log_history({
-            "ts": now_local().isoformat(), "type":"outside_window_notice", "text": text
-        }))
+        asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"outside_window_notice","text":text}))
 
-    # Anti-spam leve: intervalo mínimo entre publicações
+    # anti-spam leve
     last = STATE.get("last_publish_ts")
     if last:
         try:
             last_dt = datetime.fromisoformat(last)
             if (now_local() - last_dt).total_seconds() < MIN_GAP_SECS:
-                log.info("ANTI-SPAM: aguardando %ss para próxima publicação", MIN_GAP_SECS)
-                asyncio.create_task(aux_log_history({
-                    "ts": now_local().isoformat(), "type":"anti_spam_gap",
-                    "gap": MIN_GAP_SECS, "text": text
-                }))
+                asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"anti_spam_gap","gap":MIN_GAP_SECS,"text":text}))
                 return
         except Exception:
             pass
 
-    # Publica (não travamos por open_signal; usamos apenas para o resumo)
+    # publica ENTRADA (G0 only) — com cores
     STATE["open_signal"] = {"ts": now_local().isoformat(), "text": text, "pattern": pattern}
-    STATE["last_publish_ts"] = now_local().isoformat()   # marca horário da publicação
+    STATE["last_publish_ts"] = now_local().isoformat()
     save_state()
-    await tg_send(TARGET_CHAT_ID, f"🚀 <b>ENTRADA ABERTA</b>\n✅ G0 {wr*100:.1f}% ({samples} am.)\n{text}")
+
+    badge = sides_badge(text)
+    pretty = colorize_inline(text)
+    msg = (
+        "🚀 <b>ENTRADA ABERTA (G0)</b>\n"
+        f"✅ G0 {wr*100:.1f}% ({samples} am.)\n"
+    )
+    if badge: msg += f"{badge}\n"
+    msg += pretty
+    await tg_send(TARGET_CHAT_ID, msg)
     register_hourly_entry()
 
 async def process_result(text: str):
-    patt_hint = extract_pattern(text)
+    low = (text or "").lower()
+    if GALE_RE.search(low):  # ignorar progressão de gale (somos G0 only)
+        asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"gale_progress","text":text}))
+        return
 
+    patt_hint = extract_pattern(text)
     is_green = bool(GREEN_RE.search(text))
     is_red   = bool(RED_RE.search(text))
     if not (is_green or is_red):
         return
 
-    # Atualiza rolling e risco
-    res = "G" if is_green else "R"
+    # rolling por padrão (se der pra extrair pattern)
     if patt_hint:
-        rolling_append(patt_hint, res)
+        rolling_append(patt_hint, "G" if is_green else "R")
+        if BAN_AFTER_CONSECUTIVE_R > 0:
+            tail = pattern_recent_tail(patt_hint, BAN_AFTER_CONSECUTIVE_R)
+            if tail and tail.endswith("R"*BAN_AFTER_CONSECUTIVE_R):
+                ban_pattern(patt_hint, f"{BAN_AFTER_CONSECUTIVE_R} REDS seguidos")
 
-    STATE["recent_g0"].append(res)
+    # streak-guard feed
+    STATE["recent_g0"].append("G" if is_green else "R")
     STATE["recent_g0"] = STATE["recent_g0"][-10:]
-    if res == "R":
-        STATE["daily_losses"] = STATE.get("daily_losses", 0) + 1
 
-    # Contagem real do dia
-    if res == "G":
-        STATE["totals"]["greens"] += 1
-        STATE["streak_green"] = STATE.get("streak_green", 0) + 1
-    else:
-        STATE["totals"]["reds"] += 1
-        STATE["streak_green"] = 0
-
-    # Ban de padrão se 2 reds seguidos naquele padrão
-    if patt_hint:
-        tail = pattern_recent_tail(patt_hint, BAN_AFTER_CONSECUTIVE_R)
-        if tail and tail.endswith("R"*BAN_AFTER_CONSECUTIVE_R):
-            ban_pattern(patt_hint, f"{BAN_AFTER_CONSECUTIVE_R} REDS seguidos")
-
-    # Fecha operação (apenas para soltar o resumo — não bloqueava sinais)
+    # fechar operação atual (se houver). Se não houver, contabiliza também (opcional).
     if STATE.get("open_signal"):
-        g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
-        total = g + r
-        wr_day = (g/total*100.0) if total else 0.0
-        resumo = f"✅ {g} ⛔️ {r} 🎯 Acertamos {wr_day:.2f}%\n🥇 ESTAMOS A {STATE['streak_green']} GREENS SEGUIDOS ⏳"
-        await tg_send(TARGET_CHAT_ID, resumo)
-        STATE["open_signal"] = None
+        await close_open_trade(as_green=is_green, reason="explicit_result")
+    else:
+        # contabiliza dia mesmo sem open_signal — útil quando canal manda só resultado
+        await close_open_trade(as_green=is_green, reason="result_no_open")
 
-    # Logger assíncrono
-    asyncio.create_task(aux_log_history({
-        "ts": now_local().isoformat(),
-        "type": "result_green" if is_green else "result_red",
-        "pattern": patt_hint, "text": text
-    }))
-    save_state()
-
-# ============= RELATÓRIO / AUXILIARES =============
+# ==================== RELATÓRIO ====================
 def build_report():
     g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
     total = g + r
@@ -399,47 +448,60 @@ async def daily_report_loop():
         except Exception:
             await asyncio.sleep(5)
 
+# ==================== STARTUP ====================
 @app.on_event("startup")
 async def on_startup():
     asyncio.create_task(daily_report_loop())
+    asyncio.create_task(auto_loss_loop())
 
-# ============= ROTAS =============
+# ==================== ROTAS ====================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "g0-pipeline destravado (soft checks + risco)"}
+    return {"ok": True, "service": "g0-only pipeline (timeout auto-LOSS + soft checks + risco)"}
 
-# Aceita /webhook e /webhook/<segredo> — processa APENAS channel_post para evitar duplicados
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
 async def webhook(req: Request, secret: str|None=None):
     update = await req.json()
     if LOG_RAW: log.info("RAW UPDATE: %s", update)
 
+    # dedupe por message_id
     msg = update.get("channel_post") or {}
     chat_id = (msg.get("chat") or {}).get("id")
     text = msg.get("text") or ""
+    msg_id = msg.get("message_id")
+
+    if msg_id:
+        seen = STATE.get("seen_msg_ids", [])
+        if msg_id in seen:
+            return {"ok": True}
+        seen.append(msg_id)
+        STATE["seen_msg_ids"] = seen[-DUP_CACHE:]
+        save_state()
 
     if not text or chat_id != SOURCE_CHAT_ID:
         return {"ok": True}
 
-    # Teste de espelho (não bloqueia)
     if FLOW_THROUGH:
         await tg_send(TARGET_CHAT_ID, text)
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"mirror","text": text}))
         return {"ok": True}
 
     low = text.lower()
-    # resultado?
+
+    # resultados primeiro
     if GREEN_RE.search(text) or RED_RE.search(text):
         await process_result(text)
         return {"ok": True}
 
-    # potencial sinal?
-    if (("entrada confirmada" in low) or
-        re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)):
+    # potenciais sinais (G0 apenas; ignoramos gale)
+    if ("entrada confirmada" in low) or re.search(r"\b(banker|player|empate|bac\s*bo|fantan|dados)\b", low):
         await process_signal(text)
         return {"ok": True}
 
-    # logger de descartados “outros”
+    if NOISE_RE.search(low) or GALE_RE.search(low):
+        asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"noise_or_gale","text":text}))
+        return {"ok": True}
+
     asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"other","text":text}))
     return {"ok": True}
