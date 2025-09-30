@@ -1,4 +1,4 @@
-# app.py (COMPLETO)
+# app.py (COMPLETO — Bac Bo + Fantan)
 import os, json, asyncio, re, pytz
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -6,12 +6,12 @@ import httpx
 import logging
 
 # ========= ENV =========
-TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]                # ex: 12345:ABC...
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])       # origem (canal)
-TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])       # destino (canal/grupo)
+TG_BOT_TOKEN   = os.environ["TG_BOT_TOKEN"]
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])    # origem
+TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])    # destino
 TZ_NAME = os.getenv("TZ", "UTC")
 
-# Filtros (podem ser relaxados por ENV)
+# Estratégia/limites
 MIN_G0 = float(os.getenv("MIN_G0", "0.80"))
 DAILY_STOP_LOSS = int(os.getenv("DAILY_STOP_LOSS", "3"))
 STREAK_GUARD_LOSSES = int(os.getenv("STREAK_GUARD_LOSSES", "2"))
@@ -23,16 +23,16 @@ TOP_HOURS_MIN_SAMPLES = int(os.getenv("TOP_HOURS_MIN_SAMPLES", "25"))
 MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "20"))
 
 # Toggles
-FLOW_THROUGH  = os.getenv("FLOW_THROUGH",  "0") == "1"   # espelha tudo do SOURCE
+FLOW_THROUGH   = os.getenv("FLOW_THROUGH", "0") == "1"   # espelha tudo para testar
 DISABLE_WINDOWS = os.getenv("DISABLE_WINDOWS", "0") == "1"
-DISABLE_RISK    = os.getenv("DISABLE_RISK",    "0") == "1"
-LOG_RAW       = os.getenv("LOG_RAW",       "1") == "1"
+DISABLE_RISK    = os.getenv("DISABLE_RISK", "0") == "1"
+LOG_RAW        = os.getenv("LOG_RAW", "1") == "1"
 
 STATE_PATH = os.getenv("STATE_PATH", "./state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 LOCAL_TZ = pytz.timezone(TZ_NAME)
-
 logger = logging.getLogger("uvicorn.error")
+
 app = FastAPI()
 
 # ========= STATE =========
@@ -81,9 +81,16 @@ async def tg_send(chat_id: int, text: str, disable_preview=True):
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
                   "disable_web_page_preview": disable_preview})
 
-# ========= PADRÕES (amplo p/ Bac Bo) =========
+# ========= PADRÕES =========
+# Sinais (Bac Bo + Fantan)
 PATTERN_RE = re.compile(
-    r"(banker|player|empate|bac\s*bo|dados|banker\s*\+\s*empate|player\s*\+\s*empate|g0|g1)",
+    r"(banker|player|empate|bac\s*bo|dados|entrada\s*confirmada|odd|even)",
+    re.I,
+)
+
+# Ruídos a ignorar
+NOISE_RE = re.compile(
+    r"(bot\s*online|estamos\s+no\s+\d+º?\s*gale|aposta\s*encerrada|analisando)",
     re.I,
 )
 
@@ -175,20 +182,43 @@ async def process_signal(text: str):
     daily_reset_if_needed()
     pattern = extract_pattern(text)
     add_message("signal", text, pattern)
-    if not pattern:
-        logger.info("DESCARTADO: sem padrão | %s", text); return
 
+    low = (text or "").lower()
+    # ruído
+    if NOISE_RE.search(low):
+        logger.info("DESCARTADO: ruído | %s", text)
+        return
+    # exige gatilho (Fantan ou Bac Bo)
+    if not (("entrada confirmada" in low) or
+            re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)):
+        logger.info("DESCARTADO: sem gatilho de sinal | %s", text)
+        return
+    # se for Fantan e não achou padrão, usa rótulo genérico
+    if not pattern and "entrada confirmada" in low:
+        pattern = "fantan"
+
+    # Amostragem: até juntar MIN_SAMPLES_BEFORE_FILTER, libera
     ps = STATE["pattern_stats"].get(pattern, {"g0_green":0,"g0_total":0})
     wr = 1.0 if ps["g0_total"] < MIN_SAMPLES_BEFORE_FILTER else g0_winrate(pattern)
+
     if wr < MIN_G0:
-        logger.info("DESCARTADO: wr=%.2f < MIN_G0=%.2f | %s total=%s", wr, MIN_G0, pattern, ps["g0_total"]); return
+        logger.info("DESCARTADO: wr=%.2f < MIN_G0=%.2f | %s total=%s",
+                    wr, MIN_G0, pattern, ps["g0_total"])
+        return
+
     if not DISABLE_WINDOWS and not is_top_hour_now():
-        logger.info("DESCARTADO: fora da Janela de Ouro"); return
+        logger.info("DESCARTADO: fora da Janela de Ouro")
+        return
+
     if not DISABLE_RISK:
-        if STATE["daily_losses"] >= DAILY_STOP_LOSS: logger.info("DESCARTADO: stop-loss diário"); return
-        if cooldown_active(): logger.info("DESCARTADO: cooldown ativo"); return
-        if streak_guard_triggered(): start_cooldown(); logger.info("DESCARTADO: streak guard"); return
-        if not hourly_cap_ok(): logger.info("DESCARTADO: limite por hora"); return
+        if STATE["daily_losses"] >= DAILY_STOP_LOSS:
+            logger.info("DESCARTADO: stop-loss diário"); return
+        if cooldown_active():
+            logger.info("DESCARTADO: cooldown ativo"); return
+        if streak_guard_triggered():
+            start_cooldown(); logger.info("DESCARTADO: streak guard"); return
+        if not hourly_cap_ok():
+            logger.info("DESCARTADO: limite por hora"); return
 
     await tg_send(TARGET_CHAT_ID, f"✅ <b>G0 {wr*100:.1f}%</b>\n{text}")
     register_hourly_entry()
@@ -201,7 +231,7 @@ async def process_result(text: str):
     elif "red" in t or "lose" in t or "perd" in t or "❌" in t:
         add_message("red", text, patt_hint); register_outcome_g0("R", patt_hint)
 
-# ========= RELATÓRIO DIÁRIO =========
+# ========= RELATÓRIO =========
 def build_daily_report():
     today = today_str()
     msgs = [m for m in STATE["messages"] if m["ts"].startswith(today)]
@@ -257,15 +287,15 @@ async def on_startup():
 # ========= ROTAS =========
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "bacbo-g0-bot"}
+    return {"ok": True, "service": "g0-bot (bacbo+fantan)"}
 
-# aceita /webhook e /webhook/
+# /webhook e /webhook/
 @app.post("/webhook")
 @app.post("/webhook/")
 async def webhook_base(req: Request):
     return await process_update(req)
 
-# aceita /webhook/<segredo> e /webhook/<segredo>/
+# /webhook/<segredo> e /webhook/<segredo>/
 @app.post("/webhook/{secret}")
 @app.post("/webhook/{secret}/")
 async def webhook_secret(secret: str, req: Request):
@@ -280,21 +310,21 @@ async def process_update(req: Request):
     chat_id = chat.get("id")
     text = msg.get("text", "") or ""
 
-    # 🔓 Fluxo livre: espelha tudo do SOURCE (para teste rápido)
+    # Fluxo livre para teste
     if FLOW_THROUGH and (chat_id == SOURCE_CHAT_ID) and text:
         await tg_send(TARGET_CHAT_ID, text)
         return {"ok": True}
 
-    # Lógica padrão
+    # Estratégia
     if chat_id == SOURCE_CHAT_ID and text:
         low = text.lower()
-        if any(k in low for k in ["banker","player","empate","bac bo","dados","g0","g1"]):
+        if any(k in low for k in ["entrada confirmada","banker","player","empate","bac bo","dados"]):
             await process_signal(text)
         if any(k in low for k in ["green","win","✅","red","lose","❌","perd"]):
             await process_result(text)
     return {"ok": True}
 
-# cron manual
+# Relatório manual
 @app.get("/cron/daily_report")
 async def cron_daily():
     daily_reset_if_needed()
