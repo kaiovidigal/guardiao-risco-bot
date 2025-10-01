@@ -1,4 +1,4 @@
- # app.py — pipeline G0 com 5 especialistas + dedup e contagem real
+# app.py — pipeline G0 com 5 especialistas + dedup e contagem real
 import os, json, asyncio, re, pytz, hashlib
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
