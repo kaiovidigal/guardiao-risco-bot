@@ -1,4 +1,4 @@
-# app.py — G0 AUTÔNOMO + fechamento rápido + override opcional + anti-502 + warm-up
+# app.py — G0 AUTÔNOMO + fechamento rápido + GREEN/LOSS gigante + placar + anti-502
 import os, json, asyncio, re, pytz, hashlib, fastapi
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -13,7 +13,7 @@ TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])
 TZ_NAME = os.getenv("TZ", "UTC")
 LOCAL_TZ = pytz.timezone(TZ_NAME)
 
-# Limiares (destravados; depois aperte)
+# Limiares / destravado (ajuste depois p/ sniper)
 MIN_G0 = float(os.getenv("MIN_G0", "0.92"))
 MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "20"))
 ROLLING_MAX = int(os.getenv("ROLLING_MAX", "800"))
@@ -34,7 +34,7 @@ COOLDOWN_MINUTES  = int(os.getenv("COOLDOWN_MINUTES", "15"))
 HOURLY_CAP        = int(os.getenv("HOURLY_CAP", "20"))
 MIN_GAP_SECS      = int(os.getenv("MIN_GAP_SECS", "5"))
 
-FLOW_THROUGH     = os.getenv("FLOW_THROUGH", "1") == "1"
+FLOW_THROUGH     = os.getenv("FLOW_THROUGH", "1") == "1"  # espelho p/ debug
 LOG_RAW          = os.getenv("LOG_RAW", "1") == "1"
 DISABLE_WINDOWS  = os.getenv("DISABLE_WINDOWS", "0") == "1"
 DISABLE_RISK     = os.getenv("DISABLE_RISK", "1") == "1"
@@ -42,12 +42,12 @@ DISABLE_RISK     = os.getenv("DISABLE_RISK", "1") == "1"
 STRICT_TRIGGER   = os.getenv("STRICT_TRIGGER", "0") == "1"
 COUNT_STRATEGY_G0_ONLY = os.getenv("COUNT_STRATEGY_G0_ONLY", "1") == "1"
 DEDUP_TTL_MIN    = int(os.getenv("DEDUP_TTL_MIN", "0"))
-IGNORE_CHANNEL_OPENS = os.getenv("IGNORE_CHANNEL_OPENS", "1") == "1"   # << abre só autônomo
+IGNORE_CHANNEL_OPENS = os.getenv("IGNORE_CHANNEL_OPENS", "1") == "1"   # abre só autônomo
 
 STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# Override (opcional)
+# Override (opcional — aqui não usamos para abrir por canal, mas pode ser útil)
 DECISION_STRATEGY = os.getenv("DECISION_STRATEGY", "override").lower()
 P_MIN_OVERRIDE = float(os.getenv("P_MIN_OVERRIDE", "0.62"))
 MARGEM_MIN     = float(os.getenv("MARGEM_MIN", "0.08"))
@@ -61,11 +61,11 @@ AUTONOMOUS_INTERVAL_SEC = int(os.getenv("AUTONOMOUS_INTERVAL_SEC", "12"))
 AUTO_MIN_SIDE_SAMPLES   = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))
 AUTO_MIN_SCORE          = float(os.getenv("AUTO_MIN_SCORE", "0.50"))
 AUTO_MIN_MARGIN         = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))
-AUTO_RESULT_TIMEOUT_MIN = int(os.getenv("AUTO_RESULT_TIMEOUT_MIN", "2"))   # << FECHAMENTO RÁPIDO
+AUTO_RESULT_TIMEOUT_MIN = int(os.getenv("AUTO_RESULT_TIMEOUT_MIN", "2"))   # FECHAMENTO RÁPIDO
 AUTO_MAX_PARALLEL       = int(os.getenv("AUTO_MAX_PARALLEL", "1"))
 AUTO_RESPECT_WINDOWS    = os.getenv("AUTO_RESPECT_WINDOWS", "0") == "1"
 
-TRACE_MODE = os.getenv("TRACE_MODE", "1") == "1"
+TRACE_MODE = os.getenv("TRACE_MODE", "0") == "1"  # off p/ não poluir
 
 # ================== APP/LOG ==================
 app = FastAPI()
@@ -85,7 +85,7 @@ async def trace(msg: str):
         try: await tg_send(TARGET_CHAT_ID, f"🧪 <b>TRACE</b> {msg}")
         except Exception as e: log.error("trace error: %s", e)
 
-# Anti-crash (evita 502)
+# Anti-crash (evita 502 na Render)
 @app.middleware("http")
 async def safe_errors(request, call_next):
     try:
@@ -97,15 +97,11 @@ async def safe_errors(request, call_next):
 
 # ================== REGEX / PARSE ==================
 SIDE_ALIASES_RE = re.compile(r"\b(player|banker|empate|p\b|b\b|azul|vermelho|blue|red)\b", re.I)
-PATTERN_RE = re.compile(r"(banker|player|empate|azul|vermelho|blue|red|p\b|b\b|entrada\s*confirmada|\(?\s*g0\s*\)?)", re.I)
 NOISE_RE   = re.compile(r"(bot\s*online|aposta\s*encerrada|analisando)", re.I)
 GREEN_RE   = re.compile(r"(green|win|✅)", re.I)
 RED_RE     = re.compile(r"(red|lose|perd|loss|derrota|❌)", re.I)
-
-# G1/G2 (variações comuns)
 G1_HINT_RE = re.compile(r"\b(g-?1|gale\s*1|primeiro\s*gale|indo\s+pro\s*g1|vamos\s+pro\s*g1|\bG1\b)\b", re.I)
 G2_HINT_RE = re.compile(r"\b(g-?2|gale\s*2|segundo\s*gale|indo\s+pro\s*g2|vamos\s+pro\s*g2|\bG2\b)\b", re.I)
-
 EMOJI_PLAYER_RE = re.compile(r"(🔵|🟦)", re.U)
 EMOJI_BANKER_RE = re.compile(r"(🔴|🟥)", re.U)
 
@@ -115,10 +111,10 @@ def hour_str(dt=None): return (dt or now_local()).strftime("%H")
 def hour_key(dt=None): return (dt or now_local()).strftime("%Y-%m-%d %H")
 
 def colorize_line(text: str) -> str:
-    t = re.sub(r"\b(player|p|azul|blue)\b", "🔵 Player", text, flags=re.I)
+    t = text
+    t = re.sub(r"\b(player|p|azul|blue)\b", "🔵 Player", t, flags=re.I)
     t = re.sub(r"\b(banker|b|vermelho|red)\b", "🔴 Banker", t, flags=re.I)
     t = re.sub(r"\bempate\b", "🟡 Empate", t, flags=re.I)
-    t = re.sub(r"\( ?g0 ?\)", "(G0)", t, flags=re.I)
     return t
 
 def normalize_side(s: str|None) -> str|None:
@@ -225,7 +221,7 @@ def is_top_hour_now()->bool:
     stats=STATE.get("hour_stats",{}); items=[(h,s) for h,s in stats.items() if s["t"]>=TOP_HOURS_MIN_SAMPLES]
     if not items: return True
     ranked=sorted(items,key=lambda kv:(kv[1]["g"]/kv[1]["t"]),reverse=True)
-    top=[]; 
+    top=[]
     for h,s in ranked:
         wr=s["g"]/s["t"]
         if wr>=TOP_HOURS_MIN_WINRATE: top.append(h)
@@ -246,13 +242,6 @@ def trend_allows()->tuple[bool,float,int]:
 
 def window_allows()->tuple[bool,float]:
     ok=is_top_hour_now(); return ok, 1.0 if ok else 0.0
-
-def streak_ban_allows(p)->tuple[bool,str]:
-    if is_banned(p): return False,"pattern_banned"
-    tail=pattern_recent_tail(p,BAN_AFTER_CONSECUTIVE_R)
-    if tail and tail.endswith("R"*BAN_AFTER_CONSECUTIVE_R):
-        ban_pattern(p,f"{BAN_AFTER_CONSECUTIVE_R} REDS seguidos"); return False,"tail_rr"
-    return True,""
 
 def risk_allows()->tuple[bool,str]:
     if DISABLE_RISK: return True,""
@@ -284,28 +273,48 @@ def compute_scores(fonte_side:str|None):
     dbg={"wr_player":wr_p,"n_player":n_p,"wr_banker":wr_b,"n_banker":n_b,"hour_bonus":hb,"trend_bonus":tb,"score_player":s_p,"score_banker":s_b,"delta":delta}
     return winner, s_win, delta, dbg
 
-def compute_override(text:str):
-    fonte=extract_side(text)
-    if fonte in (None,"empate"): return None, {"reason":"no_override"}
-    winner, s_win, delta, dbg = compute_scores(fonte)
-    passes=(s_win>=P_MIN_OVERRIDE) and (delta>=MARGEM_MIN) and (min(dbg["n_player"],dbg["n_banker"])>=MIN_SIDE_SAMPLES)
-    dbg.update({"fonte":fonte,"passes":passes,"threshold":P_MIN_OVERRIDE,"margin":MARGEM_MIN})
-    return (winner if passes else None), dbg
+# ================== PUBLICAÇÃO / ANÚNCIOS ==================
+def _score_snapshot():
+    g = STATE["totals"].get("greens", 0)
+    r = STATE["totals"].get("reds", 0)
+    t = g + r
+    wr = (g / t * 100.0) if t else 0.0
+    streak = STATE.get("streak_green", 0)
+    return g, r, wr, streak
 
-# ================== PUBLICAÇÃO ==================
+async def announce_outcome(result: str, chosen_side: str | None, fonte_side: str | None, by: str):
+    if result == "G":
+        big = "🟩🟩🟩 <b>GREEN</b> 🟩🟩🟩"
+    else:
+        big = "🟥🟥🟥 <b>LOSS</b> 🟥🟥🟥"
+
+    ns = {"player": "🔵 Player", "banker": "🔴 Banker"}.get((chosen_side or "").lower(), "?")
+    fs = {"player": "🔵 Player", "banker": "🔴 Banker"}.get((fonte_side or "").lower(), None)
+
+    msg = f"{big}\nNossa: {ns}" + (f"\nFonte: {fs}" if fs else "")
+    await tg_send(TARGET_CHAT_ID, msg)
+
+    g, r, wr, streak = _score_snapshot()
+    placar = (
+        f"📊 <b>Placar Geral</b>\n"
+        f"✅ {g}   ⛔️ {r}\n"
+        f"🎯 {wr:.2f}%  •  🔥 Streak {streak}"
+    )
+    await tg_send(TARGET_CHAT_ID, placar)
+
 async def publish_entry(final_side:str, fonte_side:str|None, header:str, extra_line:str=""):
     pretty = f"{'🔵 Player' if final_side=='player' else '🔴 Banker'}\n{header}"
     ok_win,_ = window_allows()
     allow_g0, wr_g0, n_g0 = g0_side_allows(final_side)
     window_tag = "" if ok_win else " <i>(fora da janela de ouro)</i>"
     msg = (
-        f"🚀 <b>{'ENTRADA AUTÔNOMA' if fonte_side is None else 'ENTRADA ABERTA (G0)'}</b>\n"
+        f"🚀 <b>{'ENTRADA AUTÔNOMA (G0)' if fonte_side is None else 'ENTRADA ABERTA (G0)'}</b>\n"
         f"✅ G0 {wr_g0*100:.1f}% ({n_g0} am.){window_tag}{extra_line}\n{pretty}"
     )
     await tg_send(TARGET_CHAT_ID, msg)
     register_hourly_entry()
 
-# ================== SINAL DO CANAL (APENAS APRENDER) ==================
+# ================== SINAL DO CANAL (apenas aprendizado) ==================
 def dedup_recent_signal(text:str)->bool:
     if DEDUP_TTL_MIN<=0: return False
     t=re.sub(r"\s+"," ",(text or "").lower()).strip()
@@ -318,109 +327,148 @@ def dedup_recent_signal(text:str)->bool:
     STATE["recent_signal_hashes"][h]=now.isoformat(); save_state(); return False
 
 async def process_signal(text:str):
-    daily_reset_if_needed()
-    low=(text or "").lower()
-    if NOISE_RE.search(low): 
-        asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"noise","text":text})); 
-        return
-    if STRICT_TRIGGER:
-        gat = ("entrada confirmada" in low) or re.search(r"\b\(?\s*g0\s*\)?\b", low)
-    else:
-        gat = ("entrada confirmada" in low) or re.search(r"\b\(?\s*g0\s*\)?\b", low) or (extract_side(text) in ("player","banker"))
-    if not gat: 
-        asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"no_trigger","text":text})); 
-        return
-    if dedup_recent_signal(text): 
-        asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"dupe_signal","text":text})); 
-        return
+    # Mantemos para compatibilidade, mas NÃO abrimos por canal (independente)
     if IGNORE_CHANNEL_OPENS:
-        # não abre por canal; só aprende resultado depois
         return
-
-    # (se quiser permitir híbrido, basta remover este return e manter o resto)
+    # (Se quiser modo híbrido, poderia entrar lógica aqui)
     return
 
-# ================== AUTÔNOMO ==================
+# ================== AUTÔNOMO (abre 100% independente) ==================
 async def autonomous_try_open():
-    if STATE.get("open_signal"):  # silencioso; sem TRACE
+    if STATE.get("open_signal"):
         return
-    if AUTO_MAX_PARALLEL<=0: return
+    if AUTO_MAX_PARALLEL <= 0:
+        return
 
-    allow_risk, why = risk_allows()
-    if not allow_risk: return
-    if not hourly_cap_ok(): return
-    if AUTO_RESPECT_WINDOWS and not is_top_hour_now(): return
+    allow_risk, _ = risk_allows()
+    if not allow_risk:
+        return
+    if not hourly_cap_ok():
+        return
+    if AUTO_RESPECT_WINDOWS and not is_top_hour_now():
+        return
 
-    wr_p,n_p=side_wr("player"); wr_b,n_b=side_wr("banker")
-    if min(n_p,n_b)<AUTO_MIN_SIDE_SAMPLES: return
+    wr_p, n_p = side_wr("player"); wr_b, n_b = side_wr("banker")
+    if min(n_p, n_b) < AUTO_MIN_SIDE_SAMPLES:
+        return
 
     winner, s_win, delta, dbg = compute_scores(None)
-    if (s_win<AUTO_MIN_SCORE) or (delta<AUTO_MIN_MARGIN): return
+    if (s_win < AUTO_MIN_SCORE) or (delta < AUTO_MIN_MARGIN):
+        return
 
     allow_g0, wr_g0, n_g0 = g0_side_allows(winner)
-    if not allow_g0: return
+    if not allow_g0:
+        return
 
-    last=STATE.get("last_publish_ts")
+    last = STATE.get("last_publish_ts")
     if last:
         try:
-            if (now_local()-datetime.fromisoformat(last)).total_seconds()<MIN_GAP_SECS: return
-        except: pass
+            last_dt = datetime.fromisoformat(last)
+            if (now_local() - last_dt).total_seconds() < MIN_GAP_SECS:
+                return
+        except Exception:
+            pass
 
-    header=f"(G0) entrada técnica — escP={dbg['score_player']:.2f} escB={dbg['score_banker']:.2f} (Δ={dbg['delta']:.2f})"
-    STATE["open_signal"]={
-        "ts":now_local().isoformat(),
-        "text":header,
-        "pattern":winner,
-        "fonte_side":None,
-        "chosen_side":winner,
-        "autonomous":True,
-        "expires_at":(now_local()+timedelta(minutes=AUTO_RESULT_TIMEOUT_MIN)).isoformat()
+    header = (
+        f"Score P={dbg['score_player']:.2f} • "
+        f"Score B={dbg['score_banker']:.2f} • "
+        f"Δ={dbg['delta']:.2f}"
+    )
+
+    STATE["open_signal"] = {
+        "ts": now_local().isoformat(),
+        "text": header,
+        "pattern": winner,
+        "fonte_side": None,          # independente do canal
+        "chosen_side": winner,
+        "autonomous": True,
+        "expires_at": (now_local() + timedelta(minutes=AUTO_RESULT_TIMEOUT_MIN)).isoformat()
     }
-    STATE["last_publish_ts"]=now_local().isoformat(); save_state()
+    STATE["last_publish_ts"] = now_local().isoformat()
+    save_state()
+
     await publish_entry(winner, None, header, "")
 
-# Fechamento RÁPIDO ao detectar G1/G2 (ou Green/Red)
-async def settle_open_g0_due_to_gale(text:str, reason:str="canal_gale"):
-    open_sig=STATE.get("open_signal")
-    if not open_sig: return
-    chosen=open_sig.get("chosen_side") or open_sig.get("pattern")
-    fonte =open_sig.get("fonte_side")  # None no autônomo
-    if fonte not in ("player","banker"):
-        # autônomo sem lado da fonte: não há como inferir assertividade pelo gale; ignora (neutro)
-        asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"auto_gale_hint_ignored","text":text}))
+# ================== FECHAMENTOS ==================
+async def settle_open_g0_due_to_gale_hint(text: str):
+    """
+    Recebe um hint G1/G2 do canal.
+    - Se open_signal tem fonte_side conhecido: deduz G/R (canal errou no G0 => se nosso lado é oposto ao da fonte, GREEN).
+    - Se não tem fonte (autônomo), fecha neutro (sem contar).
+    """
+    open_sig = STATE.get("open_signal")
+    if not open_sig:
         return
-    res = "R" if (chosen==fonte) else "G"
-    rolling_append(chosen,res); STATE["recent_results"].append(res)
-    STATE["recent_g0"]=(STATE.get("recent_g0",[])+[res])[-10:]
-    if res=="R": STATE["daily_losses"]=STATE.get("daily_losses",0)+1
-    if COUNT_STRATEGY_G0_ONLY:
-        if res=="G": STATE["totals"]["greens"]+=1; STATE["streak_green"]=STATE.get("streak_green",0)+1
-        else: STATE["totals"]["reds"]+=1; STATE["streak_green"]=0
-    STATE["open_signal"]=None; save_state()
-    asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"g0_settled_by_gale","result":res,"text":text}))
 
-async def process_result(text:str):
-    is_green=bool(GREEN_RE.search(text)); is_red=bool(RED_RE.search(text))
-    if not (is_green or is_red): return
-    open_sig=STATE.get("open_signal")
-    if COUNT_STRATEGY_G0_ONLY and open_sig is None:
-        asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"late_result_ignored","text":text})); return
-    res="G" if is_green else "R"
-    chosen=(open_sig.get("chosen_side") or open_sig.get("pattern")) if open_sig else None
-    if chosen: rolling_append(chosen,res)
+    chosen = open_sig.get("chosen_side")
+    fonte  = open_sig.get("fonte_side")  # None no autônomo
+
+    if fonte not in ("player","banker"):
+        # autônomo sem lado conhecido da fonte -> fecha neutro
+        STATE["open_signal"] = None
+        save_state()
+        asyncio.create_task(aux_log({"ts": now_local().isoformat(),"type":"auto_closed_neutral_by_gale_hint","text": text}))
+        return
+
+    # Se a fonte foi para gale, quer dizer que ERROU o G0 no lado que indicou.
+    # Se nosso chosen == fonte -> nosso G0 foi LOSS; se chosen != fonte -> GREEN.
+    res = "R" if (chosen == fonte) else "G"
+
+    # registra
+    if chosen: rolling_append(chosen, res)
     STATE["recent_results"].append(res)
-    STATE["recent_g0"]=(STATE.get("recent_g0",[])+[res])[-10:]
-    if res=="R": STATE["daily_losses"]=STATE.get("daily_losses",0)+1
-    if res=="G": STATE["totals"]["greens"]+=1; STATE["streak_green"]=STATE.get("streak_green",0)+1
-    else: STATE["totals"]["reds"]+=1; STATE["streak_green"]=0
-    STATE["open_signal"]=None; save_state()
+    STATE["recent_g0"] = (STATE.get("recent_g0", []) + [res])[-10:]
+    if res == "R": STATE["daily_losses"] = STATE.get("daily_losses", 0) + 1
+    if res == "G":
+        STATE["totals"]["greens"] += 1; STATE["streak_green"] = STATE.get("streak_green", 0) + 1
+    else:
+        STATE["totals"]["reds"] += 1; STATE["streak_green"] = 0
+
+    # anúncio + placar
+    await announce_outcome(res, chosen, fonte, by="gale")
+
+    STATE["open_signal"] = None
+    save_state()
+    asyncio.create_task(aux_log({"ts": now_local().isoformat(),"type":"g0_settled_by_gale_hint","result":res,"text":text}))
+
+async def process_result(text: str):
+    # GREEN/RED explícito
+    is_green = bool(GREEN_RE.search(text))
+    is_red   = bool(RED_RE.search(text))
+    if not (is_green or is_red):
+        return
+
+    res = "G" if is_green else "R"
+    open_sig = STATE.get("open_signal")
+    chosen = open_sig.get("chosen_side") if open_sig else None
+    fonte  = open_sig.get("fonte_side") if open_sig else None
+
+    # registra rolling pelo chosen (quando houver)
+    if chosen:
+        rolling_append(chosen, res)
+
+    # tendência/contadores
+    STATE["recent_results"].append(res)
+    STATE["recent_g0"] = (STATE.get("recent_g0", []) + [res])[-10:]
+    if res == "R": STATE["daily_losses"] = STATE.get("daily_losses", 0) + 1
+    if res == "G":
+        STATE["totals"]["greens"] += 1; STATE["streak_green"] = STATE.get("streak_green", 0) + 1
+    else:
+        STATE["totals"]["reds"] += 1; STATE["streak_green"] = 0
+
+    # anúncio + placar
+    await announce_outcome(res, chosen, fonte, by="canal")
+
+    STATE["open_signal"] = None
+    save_state()
+    asyncio.create_task(aux_log({"ts": now_local().isoformat(),"type": "result_from_channel","result":res,"text": text}))
 
 async def expire_open_if_needed():
     open_sig=STATE.get("open_signal")
     if not open_sig: return
     exp=open_sig.get("expires_at")
     if exp and datetime.fromisoformat(exp)<=now_local():
-        # timeout curto → fecha sem contar
+        # timeout curto → fecha sem contar (neutro)
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"auto_expired_no_result","chosen":open_sig.get("chosen_side")}))
         STATE["open_signal"]=None; save_state()
 
@@ -435,7 +483,11 @@ def build_report():
     rows.sort(key=lambda x:x[1], reverse=True)
     tops=rows[:5]
     cleanup_expired_bans()
-    bans=[f"• {p} (até {datetime.fromisoformat(b['until']).strftime('%d/%m %H:%M')})" for p,b in STATE.get("pattern_ban",{}).items()]
+    bans=[]
+    for p,b in STATE.get("pattern_ban",{}).items():
+        try: until = datetime.fromisoformat(b["until"]).strftime("%d/%m %H:%M")
+        except: until = b.get("until","?")
+        bans.append(f"• {p} (até {until})")
     lines=[f"<b>📊 Relatório Diário ({today_str()})</b>", f"Dia: <b>{g}G / {r}R</b> (WR: {wr_day:.1f}%)", "", "<b>Top lados:</b>"]
     lines += [f"• {p} → {wr*100:.1f}% ({n})" for p,wr,n in tops] or ["• Sem dados."]
     lines += ["", "<b>Lados banidos:</b>"] + (bans or ["• Nenhum."])
@@ -471,7 +523,7 @@ async def on_startup():
 # ================== ROTAS ==================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 autônomo + fast close + anti-502"}
+    return {"ok": True, "service": "G0 autônomo + fast close + GREEN/LOSS + anti-502"}
 
 @app.get("/healthz")
 async def healthz(): return {"ok": True}
@@ -508,12 +560,12 @@ async def webhook(req: Request, secret: str|None=None):
 
     # FECHAMENTO RÁPIDO
     if G1_HINT_RE.search(text) or G2_HINT_RE.search(text):
-        await settle_open_g0_due_to_gale(text, reason="canal_gale")
+        await settle_open_g0_due_to_gale_hint(text)
         return JSONResponse({"ok": True})
     if GREEN_RE.search(text) or RED_RE.search(text):
         await process_result(text)
         return JSONResponse({"ok": True})
 
-    # (opcional) processamento do “sinal” do canal — aqui ignorado se IGNORE_CHANNEL_OPENS=1
+    # Sinal do canal (NÃO abrimos por ele — independente)
     await process_signal(text)
     return JSONResponse({"ok": True})
