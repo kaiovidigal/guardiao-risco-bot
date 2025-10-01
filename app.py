@@ -1,4 +1,4 @@
-# app.py — pipeline G0 com 5 especialistas + dedup e contagem real
+# app.py — pipeline G0 (corte rígido ≥95% e ≥40 amostras) + 5 especialistas, dedup e contagem real
 import os, json, asyncio, re, pytz, hashlib
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -15,28 +15,28 @@ TZ_NAME = os.getenv("TZ", "UTC")
 LOCAL_TZ = pytz.timezone(TZ_NAME)
 
 # Estratégia / limites (ajuste no Render)
-MIN_G0 = float(os.getenv("MIN_G0", "0.90"))                 # corte do G0 (rolling)
-MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "20"))
+MIN_G0 = float(os.getenv("MIN_G0", "0.95"))                   # corte do G0 (rolling) — default rígido 95%
+MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "40"))  # amostras mínimas
 ROLLING_MAX = int(os.getenv("ROLLING_MAX", "600"))
 
 # Tendência recente (especialista #2)
-TREND_LOOKBACK = int(os.getenv("TREND_LOOKBACK", "40"))     # últimas N entradas aprovadas
-TREND_MIN_WR   = float(os.getenv("TREND_MIN_WR", "0.80"))   # WR mínimo no lookback
+TREND_LOOKBACK = int(os.getenv("TREND_LOOKBACK", "40"))       # últimas N entradas aprovadas
+TREND_MIN_WR   = float(os.getenv("TREND_MIN_WR", "0.85"))     # WR mínimo no lookback (leve)
 
 # Janela de ouro (especialista #3)
-TOP_HOURS_MIN_WINRATE = float(os.getenv("TOP_HOURS_MIN_WINRATE", "0.85"))
+TOP_HOURS_MIN_WINRATE = float(os.getenv("TOP_HOURS_MIN_WINRATE", "0.88"))
 TOP_HOURS_MIN_SAMPLES = int(os.getenv("TOP_HOURS_MIN_SAMPLES", "25"))
 TOP_HOURS_COUNT       = int(os.getenv("TOP_HOURS_COUNT", "6"))
 
 # Streak/ban (especialista #4)
-BAN_AFTER_CONSECUTIVE_R = int(os.getenv("BAN_AFTER_CONSECUTIVE_R", "2"))
+BAN_AFTER_CONSECUTIVE_R = int(os.getenv("BAN_AFTER_CONSECUTIVE_R", "1"))  # 1 red já bane temporariamente
 BAN_FOR_HOURS           = int(os.getenv("BAN_FOR_HOURS", "4"))
 
 # Risco geral (especialista #5)
 DAILY_STOP_LOSS   = int(os.getenv("DAILY_STOP_LOSS", "3"))
-STREAK_GUARD_LOSSES = int(os.getenv("STREAK_GUARD_LOSSES", "2"))
+STREAK_GUARD_LOSSES = int(os.getenv("STREAK_GUARD_LOSSES", "1"))  # perdeu a última → cooldown
 COOLDOWN_MINUTES  = int(os.getenv("COOLDOWN_MINUTES", "30"))
-HOURLY_CAP        = int(os.getenv("HOURLY_CAP", "8"))  # só avisa (soft)
+HOURLY_CAP        = int(os.getenv("HOURLY_CAP", "8"))  # aviso (soft)
 
 # Fluxo
 MIN_GAP_SECS = int(os.getenv("MIN_GAP_SECS", "12"))     # anti-spam leve
@@ -72,7 +72,6 @@ def extract_pattern(text: str) -> str|None:
 
 def colorize_line(text: str) -> str:
     t = text
-    # ordem importa para não re-colorir
     t = re.sub(r"\bplayer\b",  "🔵 Player", t, flags=re.I)
     t = re.sub(r"\bempate\b",  "🟡 Empate", t, flags=re.I)
     t = re.sub(r"\bbanker\b",  "🔴 Banker", t, flags=re.I)
@@ -279,21 +278,21 @@ async def process_signal(text: str):
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":why,"pattern":pattern,"text":text}))
         return
 
-    # Especialista 1: G0 rolling
+    # Especialista 1: G0 rolling — CORTE RÍGIDO (≥95% e ≥40 amostras)
     allow_g0, wr_g0, n_g0 = g0_allows(pattern)
-    if not allow_g0:
-        log.info("REPROVADO G0: wr=%.2f am=%d", wr_g0, n_g0)
-        asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"rejected_g0","wr":wr_g0,"n":n_g0,"pattern":pattern,"text":text}))
+    if (n_g0 < 40) or (wr_g0 < 0.95):
+        log.info("REPROVADO G0 (rigid): wr=%.2f am=%d (cut 95%% / 40 am.)", wr_g0, n_g0)
+        asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"rejected_g0_strict","wr":wr_g0,"n":n_g0,"pattern":pattern,"text":text}))
         return
 
-    # Especialista 2: tendência
+    # Especialista 2: tendência (leve — só barra se muito ruim)
     allow_trend, wr_trend, n_trend = trend_allows()
     if not allow_trend:
         log.info("REPROVADO tendência: wr=%.2f n=%d", wr_trend, n_trend)
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"rejected_trend","wr":wr_trend,"n":n_trend,"text":text}))
         return
 
-    # Especialista 3: janela de ouro (soft – se reprovar ainda segue, mas com tag)
+    # Especialista 3: janela de ouro (soft – passa, mas etiqueta)
     allow_window, _ = window_allows()
     window_tag = "" if allow_window else " <i>(fora da janela de ouro)</i>"
 
@@ -340,7 +339,7 @@ async def process_result(text: str):
     if patt_hint:
         rolling_append(patt_hint, res)
 
-    # alimentar tendência global (apenas quando houve entrada aberta recentemente)
+    # alimentar tendência global (últimos resultados)
     STATE["recent_results"].append(res)
 
     STATE["recent_g0"].append(res)
@@ -362,19 +361,16 @@ async def process_result(text: str):
         if tail and tail.endswith("R"*BAN_AFTER_CONSECUTIVE_R):
             ban_pattern(patt_hint, f"{BAN_AFTER_CONSECUTIVE_R} REDS seguidos")
 
-    # resumo (dedup firme)
+    # resumo (dedup)
     g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
     total = g + r
     wr_day = (g/total*100.0) if total else 0.0
     resumo = f"✅ {g} ⛔️ {r} 🎯 Acertamos {wr_day:.2f}%\n🥇 ESTAMOS A {STATE['streak_green']} GREENS SEGUIDOS ⏳"
-
-    # Evitar duplicar mesmo resumo
     digest = hashlib.md5(resumo.encode("utf-8")).hexdigest()
     if digest != STATE.get("last_summary_hash"):
         await tg_send(TARGET_CHAT_ID, resumo)
         STATE["last_summary_hash"] = digest
 
-    # fechar operação (libera próxima)
     STATE["open_signal"] = None
 
     asyncio.create_task(aux_log_history({
@@ -431,7 +427,7 @@ async def daily_report_loop():
             if n.hour == 0 and n.minute == 0:
                 daily_reset_if_needed()
                 await tg_send(TARGET_CHAT_ID, build_report())
-                await asyncio.sleep(65)  # evita disparar 2x no mesmo minuto
+                await asyncio.sleep(65)
             else:
                 await asyncio.sleep(10)
         except Exception:
@@ -444,9 +440,8 @@ async def on_startup():
 # ============= ROTAS =============
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "g0-pipeline (5 especialistas + dedup + cores)"}
+    return {"ok": True, "service": "g0-pipeline (rigid 95/40 + 5 especialistas)"}
 
-# /webhook e /webhook/<segredo>
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
 async def webhook(req: Request, secret: str|None=None):
@@ -468,29 +463,21 @@ async def webhook(req: Request, secret: str|None=None):
     if not text or chat_id != SOURCE_CHAT_ID:
         return {"ok": True}
 
-    # modo espelho (debug)
     if FLOW_THROUGH:
         await tg_send(TARGET_CHAT_ID, colorize_line(text))
-        asyncio.create_task(aux_log_history({
-            "ts": now_local().isoformat(), "type":"mirror", "text": text
-        }))
+        asyncio.create_task(aux_log_history({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
         return {"ok": True}
 
     low = text.lower()
 
-    # resultado?
     if GREEN_RE.search(text) or RED_RE.search(text):
         await process_result(text)
         return {"ok": True}
 
-    # potencial sinal?
     if (("entrada confirmada" in low) or
         re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)):
         await process_signal(text)
         return {"ok": True}
 
-    # descartado (outro)
-    asyncio.create_task(aux_log_history({
-        "ts": now_local().isoformat(), "type":"other", "text": text
-    }))
+    asyncio.create_task(aux_log_history({"ts": now_local().isoformat(), "type":"other", "text": text}))
     return {"ok": True}
