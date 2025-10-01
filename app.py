@@ -50,6 +50,19 @@ DISABLE_RISK     = os.getenv("DISABLE_RISK", "0") == "1"
 STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
+# === Override / decisão própria (opcional) ===
+DECISION_STRATEGY = os.getenv("DECISION_STRATEGY", "").lower()  # "override" para ativar
+
+P_MIN_OVERRIDE = float(os.getenv("P_MIN_OVERRIDE", "0.62"))
+MARGEM_MIN     = float(os.getenv("MARGEM_MIN", "0.08"))
+
+W_WR        = float(os.getenv("W_WR", "0.70"))
+W_HOUR      = float(os.getenv("W_HOUR", "0.15"))
+W_TREND     = float(os.getenv("W_TREND", "0.00"))
+SOURCE_BIAS = float(os.getenv("SOURCE_BIAS", "0.15"))
+
+MIN_SIDE_SAMPLES = int(os.getenv("MIN_SIDE_SAMPLES", "40"))
+
 # ============= APP/LOG =============
 app = FastAPI()
 log = logging.getLogger("uvicorn.error")
@@ -59,6 +72,7 @@ PATTERN_RE = re.compile(r"(banker|player|empate|bac\s*bo|dados|entrada\s*confirm
 NOISE_RE   = re.compile(r"(bot\s*online|estamos\s+no\s+\d+º?\s*gale|aposta\s*encerrada|analisando)", re.I)
 GREEN_RE   = re.compile(r"(green|win|✅)", re.I)
 RED_RE     = re.compile(r"(red|lose|perd|loss|derrota|❌)", re.I)
+SIDE_RE    = re.compile(r"\b(player|banker|empate)\b", re.I)
 
 def now_local(): return datetime.now(LOCAL_TZ)
 def today_str(): return now_local().strftime("%Y-%m-%d")
@@ -76,6 +90,11 @@ def colorize_line(text: str) -> str:
     t = re.sub(r"\bempate\b",  "🟡 Empate", t, flags=re.I)
     t = re.sub(r"\bbanker\b",  "🔴 Banker", t, flags=re.I)
     return t
+
+def extract_side(text: str) -> str|None:
+    """Retorna 'player' | 'banker' | 'empate' ou None."""
+    m = SIDE_RE.search(text or "")
+    return m.group(1).lower() if m else None
 
 # ============= STATE =============
 STATE = {
@@ -254,6 +273,91 @@ async def tg_send(chat_id: int, text: str, disable_preview=True):
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
                   "disable_web_page_preview": disable_preview})
 
+# ============= OVERRIDE: scoring ============
+def side_wr(side: str) -> tuple[float, int]:
+    """WR e amostras do rolling para um lado específico ('player'/'banker'/'empate')."""
+    dq = STATE["pattern_roll"].get(side, deque())
+    n = len(dq)
+    if n == 0:
+        return 0.0, 0
+    wr = sum(1 for x in dq if x == "G") / n
+    return wr, n
+
+def hour_bonus() -> float:
+    """Retorna 1.0 se estamos na janela de ouro; 0.0 caso contrário (para virar bônus)."""
+    return 1.0 if is_top_hour_now() else 0.0
+
+def trend_bonus() -> float:
+    """Bônus leve baseado na tendência global recente (mesma base do especialista 2)."""
+    dq = list(STATE["recent_results"])
+    n = len(dq)
+    if n == 0:
+        return 0.0
+    wr = sum(1 for x in dq if x == "G") / n
+    return max(0.0, min(1.0, wr))
+
+def compute_override(text: str) -> tuple[str|None, dict]:
+    """
+    Decide entre 'player' e 'banker' (ignora 'empate' para override).
+    Retorna (side_escolhido_ou_None, debug_dict).
+    Se None, mantenha lado do fonte.
+    """
+    fonte = extract_side(text)  # pode ser None
+    # Se fonte for 'empate' ou None, não vamos forçar override aqui.
+    if fonte in (None, "empate"):
+        return None, {"reason": "no_override_on_empate_or_none"}
+
+    # métricas por lado
+    wr_player, n_player = side_wr("player")
+    wr_banker, n_banker = side_wr("banker")
+
+    # se não temos amostras mínimas para pelo menos um lado, seja conservador: não override
+    if min(n_player, n_banker) < MIN_SIDE_SAMPLES:
+        return None, {
+            "reason": "insufficient_side_samples",
+            "n_player": n_player, "n_banker": n_banker
+        }
+
+    # componentes
+    hb = hour_bonus()
+    tb = trend_bonus()
+
+    # fonte_bias: empurra o lado sugerido pelo canal
+    bias_player = SOURCE_BIAS if fonte == "player" else 0.0
+    bias_banker = SOURCE_BIAS if fonte == "banker" else 0.0
+
+    # score final (linear, simples e explicável)
+    score_player = (W_WR * wr_player) + (W_HOUR * hb) + (W_TREND * tb) + bias_player
+    score_banker = (W_WR * wr_banker) + (W_HOUR * hb) + (W_TREND * tb) + bias_banker
+
+    # normaliza para [0,1] (por segurança)
+    score_player = max(0.0, min(1.0, score_player))
+    score_banker = max(0.0, min(1.0, score_banker))
+
+    # decisão
+    if score_player >= score_banker:
+        winner, loser = "player", "banker"
+        s_win, s_lose = score_player, score_banker
+    else:
+        winner, loser = "banker", "player"
+        s_win, s_lose = score_banker, score_player
+
+    delta = s_win - s_lose
+    passes = (s_win >= P_MIN_OVERRIDE) and (delta >= MARGEM_MIN)
+
+    dbg = {
+        "fonte": fonte,
+        "wr_player": wr_player, "n_player": n_player,
+        "wr_banker": wr_banker, "n_banker": n_banker,
+        "hour_bonus": hb, "trend_bonus": tb,
+        "score_player": score_player,
+        "score_banker": score_banker,
+        "winner": winner, "delta": delta,
+        "passes": passes, "threshold": P_MIN_OVERRIDE, "margin": MARGEM_MIN,
+    }
+
+    return (winner if passes else None), dbg
+
 # ============= PROCESSAMENTO ============
 async def process_signal(text: str):
     daily_reset_if_needed()
@@ -314,15 +418,50 @@ async def process_signal(text: str):
         except Exception:
             pass
 
-    # Publica
+    # ====== OVERRIDE (opcional) ======
+    chosen_side = None
+    dbg_override = {}
+    fonte_side = extract_side(text)  # player/banker/empate/None
+    override_tag = ""
+
+    if DECISION_STRATEGY == "override":
+        chosen_side, dbg_override = compute_override(text)
+        if chosen_side and fonte_side not in (None, "empate") and chosen_side != fonte_side:
+            override_tag = " <i>(override ao fonte)</i>"
+            # Ajusta o "pattern" para o lado escolhido, garantindo que o rolling conte no lado correto
+            pattern = chosen_side
+
+    # ====== Publica ======
     pretty = colorize_line(text)
+
+    # Prefixo claro informando a direção final quando houver override
+    if chosen_side:
+        dir_txt = "🔵 Player" if chosen_side == "player" else "🔴 Banker"
+        pretty = f"{dir_txt}{override_tag}\n{pretty}"
+
     STATE["open_signal"] = {"ts": now_local().isoformat(), "text": pretty, "pattern": pattern}
     STATE["last_publish_ts"] = now_local().isoformat()
     save_state()
 
+    extra_line = ""
+    if DECISION_STRATEGY == "override":
+        if chosen_side is None and fonte_side in ("player","banker"):
+            reason = dbg_override.get("reason","")
+            if reason:
+                extra_line = f"\n<i>Override não aplicado — {reason}</i>"
+        elif chosen_side:
+            sp = dbg_override.get("score_player", 0.0)
+            sb = dbg_override.get("score_banker", 0.0)
+            delta = dbg_override.get("delta", 0.0)
+            if chosen_side == "player":
+                extra_line = f"\n<i>Override:</i> escP={sp:.2f} vs escB={sb:.2f} (Δ={delta:.2f})"
+            else:
+                extra_line = f"\n<i>Override:</i> escB={sb:.2f} vs escP={sp:.2f} (Δ={delta:.2f})"
+
     msg = (
-        f"🚀 <b>ENTRADA ABERTA (G0)</b>\n"
-        f"✅ G0 {wr_g0*100:.1f}% ({n_g0} am.) • Tendência {wr_trend*100:.1f}% ({n_trend}){window_tag}\n"
+        f"🚀 <b>ENTRADA ABERTA (G0)</b>{override_tag}\n"
+        f"✅ G0 {wr_g0*100:.1f}% ({n_g0} am.) • Tendência {wr_trend*100:.1f}% ({n_trend}){window_tag}"
+        f"{extra_line}\n"
         f"{pretty}"
     )
     await tg_send(TARGET_CHAT_ID, msg)
@@ -440,7 +579,7 @@ async def on_startup():
 # ============= ROTAS =============
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "g0-pipeline (rigid 95/40 + 5 especialistas)"}
+    return {"ok": True, "service": "g0-pipeline (rigid 95/40 + 5 especialistas + override opcional)"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
