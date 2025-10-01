@@ -1,4 +1,4 @@
-# app.py — pipeline G0 (corte rígido ≥95% e ≥40 amostras) + 5 especialistas, override opcional, G0-only e dedup
+# app.py — Sniper G0 (corte rígido ≥95% e ≥40 amostras no LADO FINAL) + override opcional + aprendizado G1/G2 + dedup + fix deque
 import os, json, asyncio, re, pytz, hashlib
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -14,66 +14,63 @@ TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])
 TZ_NAME = os.getenv("TZ", "UTC")
 LOCAL_TZ = pytz.timezone(TZ_NAME)
 
-# Estratégia / limites (ajuste no Render)
-MIN_G0 = float(os.getenv("MIN_G0", "0.95"))                   # corte do G0 (rolling) — default rígido 95%
-MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "40"))  # amostras mínimas
-ROLLING_MAX = int(os.getenv("ROLLING_MAX", "600"))
+# Estratégia / limites
+MIN_G0 = float(os.getenv("MIN_G0", "0.95"))                   # corte rígido 95%
+MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "40"))
+ROLLING_MAX = int(os.getenv("ROLLING_MAX", "800"))
 
-# Tendência recente (especialista #2)
-TREND_LOOKBACK = int(os.getenv("TREND_LOOKBACK", "40"))       # últimas N entradas aprovadas
-TREND_MIN_WR   = float(os.getenv("TREND_MIN_WR", "0.85"))     # WR mínimo no lookback (leve)
+# Tendência recente
+TREND_LOOKBACK = int(os.getenv("TREND_LOOKBACK", "40"))
+TREND_MIN_WR   = float(os.getenv("TREND_MIN_WR", "0.85"))
 
-# Janela de ouro (especialista #3)
+# Janela de ouro
 TOP_HOURS_MIN_WINRATE = float(os.getenv("TOP_HOURS_MIN_WINRATE", "0.88"))
 TOP_HOURS_MIN_SAMPLES = int(os.getenv("TOP_HOURS_MIN_SAMPLES", "25"))
 TOP_HOURS_COUNT       = int(os.getenv("TOP_HOURS_COUNT", "6"))
 
-# Streak/ban (especialista #4)
-BAN_AFTER_CONSECUTIVE_R = int(os.getenv("BAN_AFTER_CONSECUTIVE_R", "1"))  # 1 red já bane temporariamente
+# Streak/ban
+BAN_AFTER_CONSECUTIVE_R = int(os.getenv("BAN_AFTER_CONSECUTIVE_R", "1"))
 BAN_FOR_HOURS           = int(os.getenv("BAN_FOR_HOURS", "4"))
 
-# Risco geral (especialista #5)
+# Risco global
 DAILY_STOP_LOSS   = int(os.getenv("DAILY_STOP_LOSS", "3"))
-STREAK_GUARD_LOSSES = int(os.getenv("STREAK_GUARD_LOSSES", "1"))  # perdeu a última → cooldown
+STREAK_GUARD_LOSSES = int(os.getenv("STREAK_GUARD_LOSSES", "1"))
 COOLDOWN_MINUTES  = int(os.getenv("COOLDOWN_MINUTES", "30"))
-HOURLY_CAP        = int(os.getenv("HOURLY_CAP", "8"))  # aviso (soft)
+HOURLY_CAP        = int(os.getenv("HOURLY_CAP", "8"))
 
 # Fluxo
-MIN_GAP_SECS = int(os.getenv("MIN_GAP_SECS", "12"))     # anti-spam leve
+MIN_GAP_SECS = int(os.getenv("MIN_GAP_SECS", "12"))
 
 # Toggles
-FLOW_THROUGH     = os.getenv("FLOW_THROUGH", "0") == "1"   # espelha tudo (debug)
+FLOW_THROUGH     = os.getenv("FLOW_THROUGH", "0") == "1"
 LOG_RAW          = os.getenv("LOG_RAW", "1") == "1"
 DISABLE_WINDOWS  = os.getenv("DISABLE_WINDOWS", "0") == "1"
 DISABLE_RISK     = os.getenv("DISABLE_RISK", "0") == "1"
 
 # Novos toggles
-STRICT_TRIGGER   = os.getenv("STRICT_TRIGGER", "1") == "1"         # só considera "entrada confirmada" como G0
+STRICT_TRIGGER   = os.getenv("STRICT_TRIGGER", "1") == "1"         # só G0 real vira gatilho
 COUNT_STRATEGY_G0_ONLY = os.getenv("COUNT_STRATEGY_G0_ONLY", "1") == "1"
-DEDUP_TTL_MIN    = int(os.getenv("DEDUP_TTL_MIN", "2"))            # minutos
+DEDUP_TTL_MIN    = int(os.getenv("DEDUP_TTL_MIN", "2"))
 
 STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# === Override / decisão própria (opcional) ===
+# Override opcional
 DECISION_STRATEGY = os.getenv("DECISION_STRATEGY", "").lower()  # "override" para ativar
-
-P_MIN_OVERRIDE = float(os.getenv("P_MIN_OVERRIDE", "0.62"))
-MARGEM_MIN     = float(os.getenv("MARGEM_MIN", "0.08"))
-
-W_WR        = float(os.getenv("W_WR", "0.70"))
-W_HOUR      = float(os.getenv("W_HOUR", "0.15"))
+P_MIN_OVERRIDE = float(os.getenv("P_MIN_OVERRIDE", "0.65"))
+MARGEM_MIN     = float(os.getenv("MARGEM_MIN", "0.10"))
+W_WR        = float(os.getenv("W_WR", "0.75"))
+W_HOUR      = float(os.getenv("W_HOUR", "0.25"))
 W_TREND     = float(os.getenv("W_TREND", "0.00"))
-SOURCE_BIAS = float(os.getenv("SOURCE_BIAS", "0.15"))
-
-MIN_SIDE_SAMPLES = int(os.getenv("MIN_SIDE_SAMPLES", "40"))
+SOURCE_BIAS = float(os.getenv("SOURCE_BIAS", "0.20"))
+MIN_SIDE_SAMPLES = int(os.getenv("MIN_SIDE_SAMPLES", "60"))
 
 # ============= APP/LOG =============
 app = FastAPI()
 log = logging.getLogger("uvicorn.error")
 
 # ============= REGRAS DE TEXTO =============
-PATTERN_RE = re.compile(r"(banker|player|empate|bac\s*bo|dados|entrada\s*confirmada|odd|even)", re.I)
+PATTERN_RE = re.compile(r"(banker|player|empate|bac\s*bo|dados|entrada\s*confirmada|odd|even|\(?\s*g0\s*\)?)", re.I)
 NOISE_RE   = re.compile(
     r"(bot\s*online|estamos\s+no\s+\d+º?\s*gale|aposta\s*encerrada|analisando|"
     r"\bg-?1\b|\bg-?2\b|\bgale\b|\bgal[eé]\b|\bg1\b|\bg2\b)",
@@ -82,8 +79,6 @@ NOISE_RE   = re.compile(
 GREEN_RE   = re.compile(r"(green|win|✅)", re.I)
 RED_RE     = re.compile(r"(red|lose|perd|loss|derrota|❌)", re.I)
 SIDE_RE    = re.compile(r"\b(player|banker|empate)\b", re.I)
-
-# G1/G2 hints para fechar o G0
 G1_HINT_RE = re.compile(r"\b(g-?1|gale\s*1|primeiro\s*gale|indo\s+pro\s*g1|vamos\s+pro\s*g1)\b", re.I)
 G2_HINT_RE = re.compile(r"\b(g-?2|gale\s*2|segundo\s*gale|indo\s+pro\s*g2|vamos\s+pro\s*g2)\b", re.I)
 
@@ -102,26 +97,26 @@ def colorize_line(text: str) -> str:
     t = re.sub(r"\bplayer\b",  "🔵 Player", t, flags=re.I)
     t = re.sub(r"\bempate\b",  "🟡 Empate", t, flags=re.I)
     t = re.sub(r"\bbanker\b",  "🔴 Banker", t, flags=re.I)
+    t = re.sub(r"\( ?g0 ?\)",  "(G0)", t, flags=re.I)
     return t
 
 def extract_side(text: str) -> str|None:
-    """Retorna 'player' | 'banker' | 'empate' ou None."""
     m = SIDE_RE.search(text or "")
     return m.group(1).lower() if m else None
 
 # ============= STATE =============
 STATE = {
-    "messages": [],                     # histórico leve
+    "messages": [],
     "last_reset_date": None,
 
-    "pattern_roll": {},                 # pattern -> deque("G"/"R")
-    "recent_results": deque(maxlen=TREND_LOOKBACK),  # últimos resultados aprovados (G/R)
+    "pattern_roll": {},                 # "player"/"banker" -> deque("G"/"R")
+    "recent_results": deque(maxlen=TREND_LOOKBACK),
 
     "hour_stats": {},                   # "00".."23" -> {"g":int,"t":int}
-    "pattern_ban": {},                  # pattern -> {"until": iso, "reason": str}
+    "pattern_ban": {},
 
     "daily_losses": 0,
-    "hourly_entries": {},               # "YYYY-MM-DD HH" -> int
+    "hourly_entries": {},
     "cooldown_until": None,
     "recent_g0": [],
 
@@ -129,9 +124,9 @@ STATE = {
     "totals": {"greens": 0, "reds": 0},
     "streak_green": 0,
 
-    "last_publish_ts": None,            # anti-spam
-    "processed_updates": deque(maxlen=500),  # update_id dedup
-    "last_summary_hash": None,          # anti duplicidade de resumo
+    "last_publish_ts": None,
+    "processed_updates": deque(maxlen=500),
+    "last_summary_hash": None,
 
     "recent_signal_hashes": {},         # hash -> iso ts
 }
@@ -140,28 +135,64 @@ def _ensure_dir(path):
     d = os.path.dirname(path)
     if d and not os.path.exists(d): os.makedirs(d, exist_ok=True)
 
+# -------- JSON save/load com fix deque --------
 def save_state():
+    # Converte deque->list recursivamente
+    def _convert(obj):
+        from collections import deque as _dq
+        if isinstance(obj, _dq):
+            return list(obj)
+        if isinstance(obj, dict):
+            return {k: _convert(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_convert(x) for x in obj]
+        return obj
     _ensure_dir(STATE_PATH)
     tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f: json.dump(STATE, f, ensure_ascii=False)
+    safe_state = _convert(STATE)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(safe_state, f, ensure_ascii=False)
     os.replace(tmp, STATE_PATH)
 
 def load_state():
     global STATE
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f: STATE = json.load(f)
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        pr = data.get("pattern_roll") or {}
+        for p, lst in list(pr.items()):
+            try:
+                pr[p] = deque(lst, maxlen=ROLLING_MAX)
+            except Exception:
+                pr[p] = deque(maxlen=ROLLING_MAX)
+        data["pattern_roll"] = pr
+
+        rr = data.get("recent_results")
+        data["recent_results"] = deque(rr or [], maxlen=TREND_LOOKBACK)
+
+        rg0 = data.get("recent_g0") or []
+        data["recent_g0"] = list(rg0)[-10:]
+
+        data.setdefault("hourly_entries", {})
+        data.setdefault("pattern_ban", {})
+        data.setdefault("messages", [])
+        data.setdefault("totals", {"greens": 0, "reds": 0})
+        data.setdefault("recent_signal_hashes", {})
+
+        STATE = data
     except Exception:
         save_state()
 load_state()
+# ----------------------------------------------
 
-# ============= AUX LOG ============
+# ============= AUX LOG / DEDUP ============
 async def aux_log_history(entry: dict):
     STATE["messages"].append(entry)
     if len(STATE["messages"]) > 5000:
         STATE["messages"] = STATE["messages"][-4000:]
     save_state()
 
-# ============= DEDUP ============
 def _soft_hash(s: str) -> str:
     t = re.sub(r"\s+", " ", (s or "").lower()).strip()
     return hashlib.sha1(t.encode("utf-8")).hexdigest()
@@ -179,7 +210,7 @@ def dedup_recent_signal(text: str) -> bool:
     save_state()
     return False
 
-# ============= MÉTRICAS ============
+# ============= MÉTRICAS E RISCO ============
 def rolling_append(pattern: str, result: str):
     dq = STATE["pattern_roll"].setdefault(pattern, deque(maxlen=ROLLING_MAX))
     dq.append(result)
@@ -225,7 +256,6 @@ def daily_reset_if_needed():
         cleanup_expired_bans()
         save_state()
 
-# ============= RISCO / FLUXO ============
 def cooldown_active():
     cu = STATE.get("cooldown_until")
     return bool(cu) and datetime.fromisoformat(cu) > now_local()
@@ -258,20 +288,22 @@ def is_top_hour_now() -> bool:
         if len(top) >= TOP_HOURS_COUNT: break
     return hour_str() in top if top else True
 
-# ============= ESPECIALISTAS ============
-def g0_allows(pattern: str) -> tuple[bool, float, int]:
-    dq = STATE["pattern_roll"].get(pattern, deque())
-    samples = len(dq)
-    if samples < MIN_SAMPLES_BEFORE_FILTER:
-        return True, 1.0, samples
-    wr = rolling_wr(pattern)
-    return (wr >= MIN_G0), wr, samples
+def g0_side_allows(side: str) -> tuple[bool, float, int]:
+    """Corte rígido no LADO final ('player'/'banker')."""
+    if side not in ("player", "banker"):
+        return False, 0.0, 0
+    dq = STATE["pattern_roll"].get(side, deque())
+    n = len(dq)
+    if n < MIN_SAMPLES_BEFORE_FILTER:
+        return False, 0.0, n
+    wr = sum(1 for x in dq if x == "G") / n
+    return (wr >= MIN_G0), wr, n
 
 def trend_allows() -> tuple[bool, float, int]:
     dq = list(STATE["recent_results"])
     n = len(dq)
     if n < max(10, int(TREND_LOOKBACK/2)):
-        return True, 1.0, n  # aquecimento
+        return True, 1.0, n
     wr = sum(1 for x in dq if x == "G")/n
     return (wr >= TREND_MIN_WR), wr, n
 
@@ -306,7 +338,7 @@ async def tg_send(chat_id: int, text: str, disable_preview=True):
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
                   "disable_web_page_preview": disable_preview})
 
-# ============= OVERRIDE: scoring ============
+# ============= OVERRIDE ============
 def side_wr(side: str) -> tuple[float, int]:
     dq = STATE["pattern_roll"].get(side, deque())
     n = len(dq)
@@ -327,47 +359,36 @@ def trend_bonus() -> float:
     return max(0.0, min(1.0, wr))
 
 def compute_override(text: str) -> tuple[str|None, dict]:
-    fonte = extract_side(text)  # pode ser None
+    fonte = extract_side(text)
     if fonte in (None, "empate"):
         return None, {"reason": "no_override_on_empate_or_none"}
 
-    wr_player, n_player = side_wr("player")
-    wr_banker, n_banker = side_wr("banker")
-
-    if min(n_player, n_banker) < MIN_SIDE_SAMPLES:
-        return None, {"reason": "insufficient_side_samples", "n_player": n_player, "n_banker": n_banker}
+    wr_p, n_p = side_wr("player")
+    wr_b, n_b = side_wr("banker")
+    if min(n_p, n_b) < MIN_SIDE_SAMPLES:
+        return None, {"reason": "insufficient_side_samples", "n_player": n_p, "n_banker": n_b}
 
     hb = hour_bonus()
     tb = trend_bonus()
 
-    bias_player = SOURCE_BIAS if fonte == "player" else 0.0
-    bias_banker = SOURCE_BIAS if fonte == "banker" else 0.0
+    bias_p = SOURCE_BIAS if fonte == "player" else 0.0
+    bias_b = SOURCE_BIAS if fonte == "banker" else 0.0
 
-    score_player = (W_WR * wr_player) + (W_HOUR * hb) + (W_TREND * tb) + bias_player
-    score_banker = (W_WR * wr_banker) + (W_HOUR * hb) + (W_TREND * tb) + bias_banker
+    s_p = (W_WR*wr_p) + (W_HOUR*hb) + (W_TREND*tb) + bias_p
+    s_b = (W_WR*wr_b) + (W_HOUR*hb) + (W_TREND*tb) + bias_b
+    s_p = max(0.0, min(1.0, s_p))
+    s_b = max(0.0, min(1.0, s_b))
 
-    score_player = max(0.0, min(1.0, score_player))
-    score_banker = max(0.0, min(1.0, score_banker))
-
-    if score_player >= score_banker:
-        winner, s_win, s_lose = "player", score_player, score_banker
-    else:
-        winner, s_win, s_lose = "banker", score_banker, score_player
-
+    winner, s_win, s_lose = ("player", s_p, s_b) if s_p >= s_b else ("banker", s_b, s_p)
     delta = s_win - s_lose
     passes = (s_win >= P_MIN_OVERRIDE) and (delta >= MARGEM_MIN)
 
-    dbg = {
-        "fonte": fonte,
-        "wr_player": wr_player, "n_player": n_player,
-        "wr_banker": wr_banker, "n_banker": n_banker,
-        "hour_bonus": hb, "trend_bonus": tb,
-        "score_player": score_player,
-        "score_banker": score_banker,
-        "winner": winner, "delta": delta,
-        "passes": passes, "threshold": P_MIN_OVERRIDE, "margin": MARGEM_MIN,
+    return (winner if passes else None), {
+        "fonte": fonte, "score_player": s_p, "score_banker": s_b,
+        "delta": delta, "passes": passes, "threshold": P_MIN_OVERRIDE, "margin": MARGEM_MIN,
+        "n_player": n_p, "n_banker": n_b, "wr_player": wr_p, "wr_banker": wr_b,
+        "hour_bonus": hb, "trend_bonus": tb
     }
-    return (winner if passes else None), dbg
 
 # ============= PROCESSAMENTO ============
 async def process_signal(text: str):
@@ -378,47 +399,37 @@ async def process_signal(text: str):
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"noise","text":text}))
         return
 
-    # Gatilho do G0
+    # Gatilho G0 (estrito)
     if STRICT_TRIGGER:
-        gatilho = ("entrada confirmada" in low)
+        gatilho = ("entrada confirmada" in low) or re.search(r"\b\(?\s*g0\s*\)?\b", low)
     else:
-        gatilho = ("entrada confirmada" in low) or re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)
-
+        gatilho = ("entrada confirmada" in low) or re.search(r"\b\(?\s*g0\s*\)?\b", low) \
+                  or re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)
     if not gatilho:
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"no_trigger","text":text}))
         return
 
-    # Dedup de sinais repetidos em janela curta
+    # Dedup de sinais em janela curta
     if dedup_recent_signal(text):
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"dupe_signal","text":text}))
         return
 
-    pattern = extract_pattern(text)
-    if not pattern and "entrada confirmada" in low:
-        pattern = "fantan"
-
-    # Especialista 4: streak/ban
+    # Especialista 4: streak/ban (com base na chave textual detectada, mas só para ban ativo)
+    pattern = extract_pattern(text) or "g0"
     ok, why = streak_ban_allows(pattern)
     if not ok:
         log.info("DESCARTADO (ban/streak): %s", why)
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":why,"pattern":pattern,"text":text}))
         return
 
-    # Especialista 1: G0 rolling — CORTE RÍGIDO (≥95% e ≥40 amostras)
-    allow_g0, wr_g0, n_g0 = g0_allows(pattern)
-    if (n_g0 < 40) or (wr_g0 < 0.95):
-        log.info("REPROVADO G0 (rigid): wr=%.2f am=%d (cut 95%% / 40 am.)", wr_g0, n_g0)
-        asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"rejected_g0_strict","wr":wr_g0,"n":n_g0,"pattern":pattern,"text":text}))
-        return
-
-    # Especialista 2: tendência (leve — só barra se muito ruim)
+    # Especialista 2: tendência (leve)
     allow_trend, wr_trend, n_trend = trend_allows()
     if not allow_trend:
         log.info("REPROVADO tendência: wr=%.2f n=%d", wr_trend, n_trend)
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"rejected_trend","wr":wr_trend,"n":n_trend,"text":text}))
         return
 
-    # Especialista 3: janela de ouro (soft – passa, mas etiqueta)
+    # Especialista 3: janela de ouro
     allow_window, _ = window_allows()
     window_tag = "" if allow_window else " <i>(fora da janela de ouro)</i>"
 
@@ -440,7 +451,7 @@ async def process_signal(text: str):
         except Exception:
             pass
 
-    # ====== OVERRIDE (opcional) ======
+    # ===== OVERRIDE / lado final =====
     chosen_side = None
     dbg_override = {}
     fonte_side = extract_side(text)  # player/banker/empate/None
@@ -450,23 +461,36 @@ async def process_signal(text: str):
         chosen_side, dbg_override = compute_override(text)
         if chosen_side and fonte_side not in (None, "empate") and chosen_side != fonte_side:
             override_tag = " <i>(override ao fonte)</i>"
-            # Ajusta o "pattern" para o lado escolhido (rolling conta no lado final)
-            pattern = chosen_side
 
-    # ====== Publica ======
+    final_side = (chosen_side or fonte_side)
+
+    # ===== CORTE G0 NO LADO FINAL =====
+    allow_g0, wr_g0, n_g0 = g0_side_allows(final_side or "")
+    if not allow_g0:
+        log.info("REPROVADO G0 (lado_final): side=%s wr=%.2f am=%d (cut %.0f%% / %d am.)",
+                 final_side, wr_g0, n_g0, MIN_G0*100, MIN_SAMPLES_BEFORE_FILTER)
+        asyncio.create_task(aux_log_history({
+            "ts": now_local().isoformat(),
+            "type":"rejected_g0_strict_side",
+            "final_side": final_side, "wr": wr_g0, "n": n_g0, "text": text
+        }))
+        return
+
+    # ===== Publica =====
     pretty = colorize_line(text)
-
-    # Prefixo com a direção final (quando houver override)
     if chosen_side:
         dir_txt = "🔵 Player" if chosen_side == "player" else "🔴 Banker"
         pretty = f"{dir_txt}{override_tag}\n{pretty}"
 
+    # pattern vira o LADO FINAL para contar rolling no lado que realmente entramos
+    pattern = final_side or pattern
+
     STATE["open_signal"] = {
         "ts": now_local().isoformat(),
         "text": pretty,
-        "pattern": pattern,                  # lado FINAL usado no rolling
-        "fonte_side": fonte_side,            # lado sugerido pelo canal
-        "chosen_side": (chosen_side or pattern)  # redundância: garante o lado final
+        "pattern": pattern,
+        "fonte_side": fonte_side,
+        "chosen_side": final_side
     }
     STATE["last_publish_ts"] = now_local().isoformat()
     save_state()
@@ -495,27 +519,22 @@ async def process_signal(text: str):
     await tg_send(TARGET_CHAT_ID, msg)
     register_hourly_entry()
 
-# ======== Fechamento de G0 quando o canal indica G1/G2 ========
+# ===== Fechamento de G0 ao detectar G1/G2 do canal =====
 async def settle_open_g0_due_to_gale(hint_text: str, reason: str = "canal_moveu_para_gale"):
-    """
-    Fecha o G0 aberto quando o canal indica G1/G2.
-    Se escolhemos o mesmo lado do canal, G0 foi RED.
-    Se escolhemos o lado oposto, G0 foi GREEN (acertamos de primeira).
-    """
     open_sig = STATE.get("open_signal")
     if not open_sig:
-        return  # não há G0 aberto
+        return
 
     chosen = open_sig.get("chosen_side") or open_sig.get("pattern")  # player/banker
     fonte  = open_sig.get("fonte_side")  # player/banker/empate/None
 
     if chosen not in ("player", "banker") or fonte not in ("player", "banker"):
-        res = "R"  # conservador se lados não estão claros
+        res = "R"  # conservador
     else:
+        # Se seguimos o canal e ele foi pro G1/G2 => erramos (R). Se contrariamos => acertamos (G).
         res = "R" if (chosen == fonte) else "G"
 
     rolling_append(chosen, res)
-
     STATE["recent_results"].append(res)
     STATE["recent_g0"].append(res)
     STATE["recent_g0"] = STATE["recent_g0"][-10:]
@@ -543,7 +562,7 @@ async def settle_open_g0_due_to_gale(hint_text: str, reason: str = "canal_moveu_
         "text": hint_text
     }))
 
-# ============= RESULTADOS ============
+# ============= RESULTADOS (GREEN/RED explícitos) ============
 async def process_result(text: str):
     patt_hint = extract_pattern(text)
     is_green = bool(GREEN_RE.search(text))
@@ -553,7 +572,7 @@ async def process_result(text: str):
 
     open_sig = STATE.get("open_signal")
 
-    # Em modo G0-only, se já fechamos por gale (ou não há G0 aberto), ignoramos resultados tardios
+    # Em modo G0-only, se já fechamos (ou não há aberto), ignorar resultado tardio
     if COUNT_STRATEGY_G0_ONLY and open_sig is None:
         asyncio.create_task(aux_log_history({
             "ts": now_local().isoformat(),
@@ -562,16 +581,12 @@ async def process_result(text: str):
         }))
         return
 
-    # Há G0 aberto e chegou GREEN/RED => interpretamos como resultado do próprio G0.
     res = "G" if is_green else "R"
-
-    # Determine o lado final que realmente usamos (chosen) para registrar o rolling correto
     chosen = None
     if open_sig:
         chosen = open_sig.get("chosen_side") or open_sig.get("pattern")
 
     if patt_hint:
-        # Se não sabemos 'chosen', caímos no patt_hint; mas o ideal é usar 'chosen'
         rolling_append(chosen or patt_hint, res)
     else:
         if chosen:
@@ -644,13 +659,13 @@ def build_report():
         f"<b>📊 Relatório Diário ({today_str()})</b>",
         f"Dia: <b>{g}G / {r}R</b>  (WR: {wr_day:.1f}%)",
         f"Stop-loss: {DAILY_STOP_LOSS}  •  Perdas hoje: {STATE.get('daily_losses',0)}",
-        "", "<b>Top padrões (rolling):</b>",
+        "", "<b>Top lados (rolling G0):</b>",
     ]
     if tops:
         lines += [f"• {p} → {wr*100:.1f}% ({n})" for p, wr, n in tops]
     else:
         lines.append("• Sem dados suficientes.")
-    lines += ["", "<b>Padrões banidos:</b>"]
+    lines += ["", "<b>Lados banidos:</b>"]
     lines += bans or ["• Nenhum ativo."]
     return "\n".join(lines)
 
@@ -676,7 +691,7 @@ async def on_startup():
 # ============= ROTAS =============
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "g0-pipeline (rigid 95/40 + 5 especialistas + override opcional + g0-only)"}
+    return {"ok": True, "service": "sniper-g0 (rigid 95/40 no lado final + override opcional + gale learning)"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -684,7 +699,7 @@ async def webhook(req: Request, secret: str|None=None):
     update = await req.json()
     if LOG_RAW: log.info("RAW UPDATE: %s", update)
 
-    # DEDUP por update_id do Telegram
+    # DEDUP por update_id
     up_id = update.get("update_id")
     if up_id is not None:
         if up_id in STATE["processed_updates"]:
@@ -704,26 +719,25 @@ async def webhook(req: Request, secret: str|None=None):
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
         return {"ok": True}
 
-    low = text.lower()
-
-    # --- Fechamento por G1/G2: G0-only settlement (decide G ou R conforme seguimos/contrariamos o canal)
+    # Fechamento por G1/G2
     if G1_HINT_RE.search(text) or G2_HINT_RE.search(text):
         await settle_open_g0_due_to_gale(text, reason="canal_moveu_para_gale")
         return {"ok": True}
 
-    # --- Resultado explícito do canal (GREEN/RED)
+    # Resultado explícito
     if GREEN_RE.search(text) or RED_RE.search(text):
         await process_result(text)
         return {"ok": True}
 
-    # --- Gatilho de sinal (Entrada Confirmada)
-    gatilho_ok = ("entrada confirmada" in low) if STRICT_TRIGGER else (
-        ("entrada confirmada" in low) or re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)
+    # Gatilho de G0
+    low = text.lower()
+    gatilho_ok = (("entrada confirmada" in low) or re.search(r"\b\(?\s*g0\s*\)?\b", low)) if STRICT_TRIGGER else (
+        ("entrada confirmada" in low) or re.search(r"\b\(?\s*g0\s*\)?\b", low) or re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)
     )
     if gatilho_ok:
         await process_signal(text)
         return {"ok": True}
 
-    # --- Ruído / outras mensagens
+    # Ruído
     asyncio.create_task(aux_log_history({"ts": now_local().isoformat(), "type":"other", "text": text}))
     return {"ok": True}
