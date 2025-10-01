@@ -169,7 +169,7 @@ def is_top_hour_now()->bool:
     stats=STATE.get("hour_stats",{}); items=[(h,s) for h,s in stats.items() if s["t"]>=TOP_HOURS_MIN_SAMPLES]
     if not items: return True
     ranked=sorted(items,key=lambda kv:(kv[1]["g"]/kv[1]["t"]),reverse=True)
-    top=[]; 
+    top=[]
     for h,s in ranked:
         wr=s["g"]/s["t"]
         if wr>=TOP_HOURS_MIN_WINRATE: top.append(h)
@@ -238,7 +238,7 @@ async def publish_entry(final_side:str, header:str):
 
 # ================== AUTÔNOMO ==================
 async def autonomous_try_open():
-    if STATE.get("open_signal"):  # já existe aberto
+    if STATE.get("open_signal"):  # já existe G0 aberto
         return
     if AUTO_MAX_PARALLEL <= 0:
         return
@@ -268,7 +268,7 @@ async def autonomous_try_open():
         "ts": now_local().isoformat(),
         "chosen_side": winner,
         "autonomous": True,
-        "expires_at": (now_local()+timedelta(minutes=AUTO_RESULT_TIMEOUT_MIN)).isoformat()
+        "expires_at": (now_local() + timedelta(minutes=AUTO_RESULT_TIMEOUT_MIN)).isoformat()
     }
     STATE["last_publish_ts"] = now_local().isoformat()
     save_state()
@@ -300,7 +300,7 @@ async def process_result(text: str):
 
     osig = STATE.get("open_signal")
     if not osig:
-        # sem G0 aberto → ignora
+        # sem G0 aberto → ignora resultado do canal
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"result_without_open","text":text}))
         return
 
@@ -318,7 +318,7 @@ async def process_result(text: str):
         STATE["streak_green"] = 0
     else:
         STATE["totals"]["greens"] += 1
-        STATE["streak_green"] += 1
+        STATE["streak_green"] = STATE.get("streak_green", 0) + 1
 
     await announce_outcome(res, chosen)
     STATE["open_signal"] = None
@@ -335,7 +335,6 @@ async def daily_report_loop():
         try:
             n = now_local()
             if n.hour==0 and n.minute==0:
-                # reset diário
                 STATE["daily_losses"]=0; STATE["hourly_entries"]={}; STATE["streak_green"]=0
                 await tg_send(TARGET_CHAT_ID, build_report())
                 await asyncio.sleep(65)
