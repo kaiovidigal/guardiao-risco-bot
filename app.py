@@ -1,4 +1,4 @@
-# app.py — G0 autônomo • 1 sinal por vez (serial) • Resultado só após conferir (outra msg + delay) • Timeout seguro
+# app.py — G0 AUTÔNOMO • Serial 1-por-vez • Fecha SÓ com confirmação do fluxo (G0 do fonte OU Gale) • TTL com graça
 import os, json, asyncio, re, pytz, hashlib, random
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -14,7 +14,7 @@ TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # canal-destino
 TZ_NAME        = os.getenv("TZ", "UTC")
 LOCAL_TZ       = pytz.timezone(TZ_NAME)
 
-# Rolling / filtros (internos – não travam abertura quando destravado)
+# Rolling / filtros (internos)
 MIN_G0 = float(os.getenv("MIN_G0", "0.95"))
 MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "40"))
 ROLLING_MAX = int(os.getenv("ROLLING_MAX", "800"))
@@ -45,7 +45,7 @@ STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ===== Decisão/autonomia =====
-FORCE_TRIGGER_OPEN            = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"   # abre no gatilho
+FORCE_TRIGGER_OPEN            = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"   # abre no gatilho do fonte
 FORCE_OPEN_ON_ANY_SOURCE_MSG  = os.getenv("FORCE_OPEN_ON_ANY_SOURCE_MSG", "1") == "1"  # abre em qualquer msg do fonte
 AUTO_MIN_SIDE_SAMPLES         = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))
 AUTO_MIN_SCORE                = float(os.getenv("AUTO_MIN_SCORE", "0.50"))
@@ -60,22 +60,27 @@ EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.35"))
 SIDE_STREAK_CAP= int(os.getenv("SIDE_STREAK_CAP", "3"))
 EPS_TIE        = float(os.getenv("EPS_TIE", "0.02"))
 
-# ===== Fonte desacoplada =====
-LEARN_FROM_SOURCE_RESULTS = os.getenv("LEARN_FROM_SOURCE_RESULTS", "0") == "1"  # 0 = NÃO alimenta modelo
+# ===== Fonte desacoplada / placar
+LEARN_FROM_SOURCE_RESULTS = os.getenv("LEARN_FROM_SOURCE_RESULTS", "0") == "1"  # 0 = NÃO alimentar modelo
 SCOREBOARD_FROM_SOURCE    = os.getenv("SCOREBOARD_FROM_SOURCE", "1") == "1"     # 1 = atualiza placar
-STRICT_RESULT_MODE        = os.getenv("STRICT_RESULT_MODE", "1") == "1"         # 1 = ignora post ambíguo
 
-# ===== Regra definitiva: fechar só depois de conferir ====
+# ===== Fechar SÓ com confirmação do fluxo do fonte ====
+CLOSE_ONLY_ON_FLOW_CONFIRM = os.getenv("CLOSE_ONLY_ON_FLOW_CONFIRM", "1") == "1"
+
+# ===== Delay e "outra mensagem" ====
 ONLY_ACCEPT_RESULT_IF_OPEN = os.getenv("ONLY_ACCEPT_RESULT_IF_OPEN", "1") == "1"
-MIN_RESULT_DELAY_SEC       = int(os.getenv("MIN_RESULT_DELAY_SEC", "8"))   # exige Xs desde abertura
+MIN_RESULT_DELAY_SEC       = int(os.getenv("MIN_RESULT_DELAY_SEC", "8"))
 ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE = os.getenv("ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE", "1") == "1"
-DELAY_RESULT_ON_SAME_MESSAGE = float(os.getenv("DELAY_RESULT_ON_SAME_MESSAGE", "0"))  # mantido 0
 
-# ===== Serialização (1 sinal por vez) + Timeout =====
-OPEN_STRICT_SERIAL = os.getenv("OPEN_STRICT_SERIAL", "1") == "1"  # não abre se já houver aberto
-OPEN_TTL_SEC = int(os.getenv("OPEN_TTL_SEC", "40"))               # fecha sozinho se não vier resultado
+# ===== Serial (1 por vez) + TTL com graça ====
+OPEN_STRICT_SERIAL = os.getenv("OPEN_STRICT_SERIAL", "1") == "1"
+OPEN_TTL_SEC       = int(os.getenv("OPEN_TTL_SEC", "90"))         # TTL mais longo
 TIMEOUT_CLOSE_POLICY = os.getenv("TIMEOUT_CLOSE_POLICY", "skip").lower()  # "skip" | "loss"
-POST_TIMEOUT_NOTICE = os.getenv("POST_TIMEOUT_NOTICE", "1") == "1"
+POST_TIMEOUT_NOTICE = os.getenv("POST_TIMEOUT_NOTICE", "0") == "1"        # 0 = silencioso por padrão
+
+# Prorrogar TTL quando houver atividade mas SEM confirmação final
+EXTEND_TTL_ON_ACTIVITY = os.getenv("EXTEND_TTL_ON_ACTIVITY", "1") == "1"
+RESULT_GRACE_EXTEND_SEC = int(os.getenv("RESULT_GRACE_EXTEND_SEC", "25"))
 
 # Visual do sinal
 SHOW_DEBUG_ON_ENTRY = os.getenv("SHOW_DEBUG_ON_ENTRY", "1") == "1"
@@ -105,66 +110,21 @@ async def safe_errors(request, call_next):
 SIDE_ALIASES_RE = re.compile(r"\b(player|banker|empate|p\b|b\b|azul|vermelho|blue|red)\b", re.I)
 NOISE_RE   = re.compile(r"(bot\s*online|aposta\s*encerrada|analisando)", re.I)
 
-# Resultado — REGEX rígida (sem ✅ genérico)
-GREEN_RE = re.compile(r"\b(green|win|vit[oó]ria)\b|🟩|🟢", re.I)
+# Confirmações explícitas do fluxo do canal-fonte
+SOURCE_G0_GREEN_RE = re.compile(r"(de\s+primeira|sem\s+gale|bateu\s+g0|\bg0\b|\bacert(o|amos)\s+de\s+primeira)", re.I)
+SOURCE_WENT_GALE_RE = re.compile(r"(estamos|indo|fomos|vamos)\s+(pro|para|no)\s*g-?([12])\b|gale\s*[12]\b", re.I)
+
+# (Mantemos estes para fallback e contagens simples, mas NÃO fecham sozinhos)
+GREEN_RE = re.compile(r"\b(green|win|vit[oó]ria)\b|🟩|🟢|✅", re.I)
 RED_RE   = re.compile(r"\b(red|loss|derrota|perd(emos|eu|a)?|lose)\b|🟥|🔴|❌", re.I)
 
-# Indícios explícitos de GREEN no G0
+# Hints já existentes
 G0_GREEN_HINT_RE = re.compile(r"(de\s+primeira|sem\s+gale|bateu\s+g0|\bg0\b)", re.I)
-
-# Menções NEGADAS de gale (não contam como gale)
-NEGATED_G1_RE = re.compile(r"(sem|não\s+foi|nao\s+foi).{0,12}\b(g-?1|gale\s*1|\bg1\b)", re.I)
-NEGATED_G2_RE = re.compile(r"(sem|não\s+foi|nao\s+foi).{0,12}\b(g-?2|gale\s*2|\bg2\b)", re.I)
-
-# Ida real para gale (conta LOSS no G0)
 PROGRESS_GALE_RE = re.compile(
     r"(indo\s+pro\s*g[12]|vamos\s+pro\s*g[12]|fomos\s+pro\s*g[12]|"
     r"bateu\s+no\s*g[12]|entrou\s+no\s*g[12]|primeiro\s+gale|segundo\s+gale|gale\s*[12]\b)",
     re.I
 )
-
-def _count_tokens(line: str) -> tuple[int,int]:
-    g = len(GREEN_RE.findall(line))
-    r = len(RED_RE.findall(line))
-    return g, r
-
-def _last_significant_line(text: str) -> str|None:
-    for raw in reversed([ln.strip() for ln in (text or "").splitlines() if ln.strip()]):
-        if GREEN_RE.search(raw) or RED_RE.search(raw):
-            return raw
-    return None
-
-def parse_last_outcome(text: str) -> str | None:
-    if not text:
-        return None
-    low = text.lower()
-
-    # (1) GREEN explícito de G0
-    if G0_GREEN_HINT_RE.search(low):
-        return "G"
-
-    # (2) Gale negado — não trate como gale/LOSS
-    neg_gale = NEGATED_G1_RE.search(low) or NEGATED_G2_RE.search(low)
-
-    # (3) Ida real para gale (só vale se NÃO for negado)
-    if not neg_gale and PROGRESS_GALE_RE.search(low):
-        return "R"
-
-    # (4) Última linha significativa
-    last_line = _last_significant_line(text)
-    if last_line:
-        g, r = _count_tokens(last_line)
-        if g > r: return "G"
-        if r > g: return "R"
-
-    # (5) Fallback: último token global
-    marks = []
-    for m in GREEN_RE.finditer(text): marks.append((m.start(), "G"))
-    for m in RED_RE.finditer(text):   marks.append((m.start(), "R"))
-    if not marks:
-        return None
-    marks.sort(key=lambda x: x[0])
-    return marks[-1][1]
 
 def now_local(): return datetime.now(LOCAL_TZ)
 def today_str(): return now_local().strftime("%Y-%m-%d")
@@ -318,26 +278,17 @@ async def announce_outcome(result: str, chosen_side: str | None):
     g, r, wr, streak = _score_snapshot()
     await tg_send(TARGET_CHAT_ID, f"📊 <b>Placar Geral</b>\n✅ {g}   ⛔️ {r}\n🎯 {wr:.2f}%  •  🔥 Streak {streak}")
 
-async def publish_entry(final_side:str, dbg_line:str, window_tag:str):
-    lines = [f"🚀 <b>ENTRADA AUTÔNOMA (G0)</b>{window_tag}",
-             "🔵 Player" if final_side=='player' else "🔴 Banker"]
-    if SHOW_DEBUG_ON_ENTRY and dbg_line:
-        lines.append(dbg_line)  # sem placar aqui
-    await tg_send(TARGET_CHAT_ID, "\n".join(lines))
-    register_hourly_entry()
-
 # ================== TIMEOUT/HELPERS ==================
 def _is_open_expired() -> bool:
     osig = STATE.get("open_signal")
-    if not osig:
-        return False
+    if not osig: return False
     try:
-        opened_epoch = int(osig.get("opened_epoch") or 0)
-        return (int(datetime.now(LOCAL_TZ).timestamp()) - opened_epoch) >= OPEN_TTL_SEC
+        exp = osig.get("expires_at")
+        return bool(exp) and (datetime.fromisoformat(exp) <= now_local())
     except Exception:
         return True
 
-async def _timeout_close_open_signal(reason: str = "timeout (TTL)"):
+async def _timeout_close_open_signal(reason: str = "timeout"):
     osig = STATE.get("open_signal")
     if not osig:
         return
@@ -360,7 +311,15 @@ async def _check_and_timeout_open():
     if _is_open_expired():
         await _timeout_close_open_signal("timeout (TTL)")
 
-# ================== AUTÔNOMO ==================
+# ================== ABERTURA AUTÔNOMA ==================
+async def publish_entry(final_side:str, dbg_line:str, window_tag:str):
+    lines = [f"🚀 <b>ENTRADA AUTÔNOMA (G0)</b>{window_tag}",
+             "🔵 Player" if final_side=='player' else "🔴 Banker"]
+    if SHOW_DEBUG_ON_ENTRY and dbg_line:
+        lines.append(dbg_line)
+    await tg_send(TARGET_CHAT_ID, "\n".join(lines))
+    register_hourly_entry()
+
 async def autonomous_open_from_trigger():
     allow_risk,_ = risk_allows()
     if not allow_risk and not FORCE_TRIGGER_OPEN:
@@ -396,10 +355,11 @@ async def autonomous_open_from_trigger():
 
     window_tag = "" if is_top_hour_now() else " <i>(fora da janela de ouro)</i>"
 
+    # lado do fonte (para a regra de fechamento)
     fonte_side = None
     m = SIDE_ALIASES_RE.search(STATE.get("last_raw_text") or "")
-    if m:
-        fonte_side = normalize_side_token(m.group(1))
+    if m: fonte_side = normalize_side_token(m.group(1))
+
     dbg_line = (
         f"Fonte: {fonte_side or '?'}  |  Escolha: {winner}  |  "
         f"Score P={dbg['score_player']:.2f} • Score B={dbg['score_banker']:.2f} • Δ={delta:.2f}"
@@ -415,13 +375,32 @@ async def autonomous_open_from_trigger():
         "fonte_side": fonte_side,
     }
     STATE["last_publish_ts"] = now.isoformat()
-    if isinstance(hist, deque):
-        hist.append(winner)
+    if isinstance(hist, deque): hist.append(winner)
     save_state()
 
     await publish_entry(winner, dbg_line, window_tag)
 
-# ================== PROCESSAMENTO ==================
+# ================== PROCESSAMENTO (fechar só com confirmação do fluxo) ==================
+def derive_our_result_from_source_flow(text: str, fonte_side: str|None, chosen_side: str|None) -> str|None:
+    """
+    - Fonte confirma G0 de primeira -> se jogamos OPOSTO do fonte: LOSS ; se IGUAL: GREEN.
+    - Fonte confirma G1/G2 (gale)   -> fonte errou o G0 -> se OPOSTO: GREEN ; se IGUAL: LOSS.
+    - Ambíguo -> None (não fecha).
+    """
+    if not text or not fonte_side or not chosen_side:
+        return None
+    low = text.lower()
+
+    # G0 de primeira do fonte
+    if SOURCE_G0_GREEN_RE.search(low) or G0_GREEN_HINT_RE.search(low):
+        return "G" if (chosen_side == fonte_side) else "R"
+
+    # Fonte entrou em Gale (G1/G2)
+    if SOURCE_WENT_GALE_RE.search(low) or PROGRESS_GALE_RE.search(low):
+        return "R" if (chosen_side == fonte_side) else "G"
+
+    return None
+
 async def aux_log(e:dict):
     STATE["messages"].append(e)
     if len(STATE["messages"])>5000: STATE["messages"]=STATE["messages"][-4000:]
@@ -434,65 +413,15 @@ async def process_signal(text: str):
         return
     await autonomous_open_from_trigger()
 
-async def process_result(text: str):
-    out = parse_last_outcome(text)
-    if out not in ("G", "R"):
-        return
+# ================== RELATÓRIO ==================
+def _score_snapshot():
+    g = STATE["totals"].get("greens", 0)
+    r = STATE["totals"].get("reds", 0)
+    t = g + r
+    wr = (g / t * 100.0) if t else 0.0
+    streak = STATE.get("streak_green", 0)
+    return g, r, wr, streak
 
-    osig = STATE.get("open_signal")
-    if not osig:
-        asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"result_without_open","text":text}))
-        return
-
-    # reforço: delay mínimo
-    try:
-        opened = datetime.fromisoformat(osig["ts"])
-        if (now_local() - opened).total_seconds() < MIN_RESULT_DELAY_SEC:
-            return
-    except Exception:
-        pass
-
-    res = out
-    chosen = osig.get("chosen_side")
-
-    await announce_outcome(res, chosen)
-
-    if SCOREBOARD_FROM_SOURCE:
-        if res == "R":
-            STATE["daily_losses"] += 1
-            STATE["totals"]["reds"] = STATE["totals"].get("reds", 0) + 1
-            STATE["streak_green"] = 0
-        else:
-            STATE["totals"]["greens"] = STATE["totals"].get("greens", 0) + 1
-            STATE["streak_green"] = STATE.get("streak_green", 0) + 1
-
-        g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
-        total = g + r
-        wr_day = (g/total*100.0) if total else 0.0
-        resumo = f"✅ {g} ⛔️ {r} 🎯 Acertamos {wr_day:.2f}%\n🥇 ESTAMOS A {STATE['streak_green']} GREENS SEGUIDOS ⏳"
-        digest = hashlib.md5(resumo.encode("utf-8")).hexdigest()
-        if digest != STATE.get("last_summary_hash"):
-            STATE["last_summary_hash"] = digest
-            await tg_send(TARGET_CHAT_ID, resumo)
-
-    if LEARN_FROM_SOURCE_RESULTS:
-        if chosen: rolling_append(chosen, res)
-        STATE["recent_results"].append(res)
-        if chosen:
-            tail = "".join(list(STATE["pattern_roll"].get(chosen, []))[-BAN_AFTER_CONSECUTIVE_R:])
-            if tail and tail.endswith("R"*BAN_AFTER_CONSECUTIVE_R):
-                until = now_local() + timedelta(hours=BAN_FOR_HOURS)
-                STATE["pattern_ban"][chosen] = {"until": until.isoformat(), "reason": f"{BAN_AFTER_CONSECUTIVE_R} REDS seguidos"}
-
-    STATE["open_signal"] = None
-    asyncio.create_task(aux_log({
-        "ts": now_local().isoformat(),
-        "type": "result_green" if res == "G" else "result_red",
-        "text": text
-    }))
-    save_state()
-
-# ================== RELATÓRIO/LOOPS ==================
 def build_report():
     g,r=STATE["totals"]["greens"],STATE["totals"]["reds"]; t=g+r; wr=(g/t*100.0) if t else 0.0
     return f"<b>📊 Relatório Diário ({today_str()})</b>\nDia: <b>{g}G / {r}R</b> (WR: {wr:.1f}%)"
@@ -515,7 +444,8 @@ async def housekeeping_loop():
     await asyncio.sleep(2)
     while True:
         try:
-            await _check_and_timeout_open()  # fecha aberto vencido
+            # fecha por TTL se expirado
+            await _check_and_timeout_open()
             await asyncio.sleep(2)
         except Exception:
             await asyncio.sleep(2)
@@ -528,7 +458,7 @@ async def on_startup():
 # ================== ROTAS ==================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 autônomo • Serial 1-por-vez • Fecha só após conferir (outra msg + delay) • Timeout"}
+    return {"ok": True, "service": "G0 autônomo • Serial • Fecha só com confirmação do fluxo (G0/Gale) • TTL com graça"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -558,12 +488,11 @@ async def webhook(req: Request, secret: str|None=None):
     msg_id = msg.get("message_id")
     msg_date_epoch = msg.get("date")  # epoch (segundos)
 
-    # 0) housekeeping e timeout
+    # 0) housekeeping e TTL
     await _check_and_timeout_open()
 
-    # ===== comandos no canal destino =====
+    # ===== comandos no canal destino (opcional) =====
     if chat.get("id") == TARGET_CHAT_ID:
-        # (opcional) se quiser, adicione /win /loss aqui
         return JSONResponse({"ok": True})
 
     # ===== somente canal-fonte =====
@@ -577,9 +506,19 @@ async def webhook(req: Request, secret: str|None=None):
         asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
 
     low = (text or "").lower()
+
+    # "gatilho" para abrir
     has_trigger = bool(("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low)) if text else False
-    has_result  = bool(GREEN_RE.search(text) or RED_RE.search(text)) if text else False
-    want_open   = (FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG or has_trigger)
+
+    # "confirmação de fluxo" (fecha): G0 de primeira OU Gale (G1/G2)
+    has_flow_confirm = False
+    if text:
+        has_flow_confirm = bool(
+            SOURCE_G0_GREEN_RE.search(low) or G0_GREEN_HINT_RE.search(low) or
+            SOURCE_WENT_GALE_RE.search(low) or PROGRESS_GALE_RE.search(low)
+        )
+
+    want_open = (FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG or has_trigger)
 
     # 1) Abrir (serial): só se não houver aberto
     if want_open and not STATE.get("open_signal"):
@@ -587,31 +526,94 @@ async def webhook(req: Request, secret: str|None=None):
         STATE["last_open_ts_epoch"] = msg_date_epoch
         save_state()
         await process_signal(text or "")
-        # (não retorna; deixa checar caso esta mesma mensagem tenha tokens de resultado)
+        # segue para possível confirmação (se esta mesma mensagem tentar fechar, vamos bloquear)
 
-    # 2) Resultado: só aceita se for OUTRA mensagem e após delay mínimo
-    if has_result:
+    # 2) Fechamento: só com confirmação do fluxo + regras de delay e outra mensagem
+    if has_flow_confirm:
         osig = STATE.get("open_signal")
         if ONLY_ACCEPT_RESULT_IF_OPEN and not osig:
             return JSONResponse({"ok": True})
 
+        # não fecha na mesma mensagem que abriu
         if ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE:
             last_open_id = STATE.get("last_open_src_msg_id")
             if (last_open_id is not None) and (msg_id == last_open_id):
-                # mesma mensagem que abriu → NÃO fecha
                 return JSONResponse({"ok": True})
 
+        # respeita delay mínimo
         try:
             opened_epoch = int(STATE.get("last_open_ts_epoch") or 0)
             if (isinstance(msg_date_epoch, int)) and ((msg_date_epoch - opened_epoch) < MIN_RESULT_DELAY_SEC):
-                # cedo demais → não fecha
                 return JSONResponse({"ok": True})
         except Exception:
             pass
 
-        await process_result(text)
+        if osig:
+            fonte_side  = osig.get("fonte_side")
+            chosen_side = osig.get("chosen_side")
+            our_res = derive_our_result_from_source_flow(text, fonte_side, chosen_side)
+
+            if our_res in ("G","R"):
+                # anuncia
+                await announce_outcome(our_res, chosen_side)
+
+                # placar
+                if SCOREBOARD_FROM_SOURCE:
+                    if our_res == "R":
+                        STATE["daily_losses"] += 1
+                        STATE["totals"]["reds"] = STATE["totals"].get("reds", 0) + 1
+                        STATE["streak_green"] = 0
+                    else:
+                        STATE["totals"]["greens"] = STATE["totals"].get("greens", 0) + 1
+                        STATE["streak_green"] = STATE.get("streak_green", 0) + 1
+
+                    g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
+                    total = g + r
+                    wr_day = (g/total*100.0) if total else 0.0
+                    resumo = f"✅ {g} ⛔️ {r} 🎯 Acertamos {wr_day:.2f}%\n🥇 ESTAMOS A {STATE['streak_green']} GREENS SEGUIDOS ⏳"
+                    digest = hashlib.md5(resumo.encode("utf-8")).hexdigest()
+                    if digest != STATE.get("last_summary_hash"):
+                        STATE["last_summary_hash"] = digest
+                        await tg_send(TARGET_CHAT_ID, resumo)
+
+                if LEARN_FROM_SOURCE_RESULTS and chosen_side:
+                    rolling_append(chosen_side, our_res)
+                    STATE["recent_results"].append(our_res)
+
+                STATE["open_signal"] = None
+                save_state()
+            else:
+                # ambíguo -> prorroga TTL e espera
+                if EXTEND_TTL_ON_ACTIVITY and osig:
+                    try:
+                        new_exp = now_local() + timedelta(seconds=RESULT_GRACE_EXTEND_SEC)
+                        cur_exp = osig.get("expires_at")
+                        if cur_exp:
+                            cur_dt = datetime.fromisoformat(cur_exp)
+                            if new_exp < cur_dt:
+                                new_exp = cur_dt
+                        osig["expires_at"] = new_exp.isoformat()
+                        save_state()
+                    except Exception:
+                        pass
+
         return JSONResponse({"ok": True})
 
-    # 3) Nada mais a fazer
+    # 3) Sem abertura/fechamento: se há aberto e veio atividade sem confirmação -> prorroga TTL
+    if EXTEND_TTL_ON_ACTIVITY and STATE.get("open_signal"):
+        try:
+            osig = STATE["open_signal"]
+            if osig:
+                new_exp = now_local() + timedelta(seconds=RESULT_GRACE_EXTEND_SEC)
+                cur_exp = osig.get("expires_at")
+                if cur_exp:
+                    cur_dt = datetime.fromisoformat(cur_exp)
+                    if new_exp < cur_dt:
+                        new_exp = cur_dt
+                osig["expires_at"] = new_exp.isoformat()
+                save_state()
+        except Exception:
+            pass
+
     asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"idle"}))
     return JSONResponse({"ok": True})
