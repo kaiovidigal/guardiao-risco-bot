@@ -1,4 +1,4 @@
-# app.py — G0 autônomo (independente) + parser G0-first + fonte desacoplada + abre em qualquer msg + /win /loss
+# app.py — G0 autônomo + fonte só gatilho + detector de resultado rígido + delay mínimo de fechamento
 import os, json, asyncio, re, pytz, hashlib, random
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -14,7 +14,7 @@ TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # canal-destino (publicaç�
 TZ_NAME        = os.getenv("TZ", "UTC")
 LOCAL_TZ       = pytz.timezone(TZ_NAME)
 
-# Rolling / filtros (métricas internas; NÃO travam abertura com FORCE_TRIGGER_OPEN=1)
+# Rolling / filtros (internos – não travam se destravado)
 MIN_G0 = float(os.getenv("MIN_G0", "0.95"))
 MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "40"))
 ROLLING_MAX = int(os.getenv("ROLLING_MAX", "800"))
@@ -35,8 +35,8 @@ COOLDOWN_MINUTES        = int(os.getenv("COOLDOWN_MINUTES", "15"))
 HOURLY_CAP              = int(os.getenv("HOURLY_CAP", "20"))
 
 # Fluxo
-MIN_GAP_SECS = int(os.getenv("MIN_GAP_SECS", "5"))    # anti-spam leve
-FLOW_THROUGH = os.getenv("FLOW_THROUGH", "0") == "1"  # espelho visual opcional do fonte
+MIN_GAP_SECS = int(os.getenv("MIN_GAP_SECS", "5"))
+FLOW_THROUGH = os.getenv("FLOW_THROUGH", "0") == "1"
 LOG_RAW      = os.getenv("LOG_RAW", "1") == "1"
 DISABLE_WINDOWS = os.getenv("DISABLE_WINDOWS", "0") == "1"
 DISABLE_RISK    = os.getenv("DISABLE_RISK", "1") == "1"
@@ -44,12 +44,12 @@ DISABLE_RISK    = os.getenv("DISABLE_RISK", "1") == "1"
 STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ====== Decisão autônoma ======
-FORCE_TRIGGER_OPEN          = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"  # 1 = sempre abre no gatilho
-FORCE_OPEN_ON_ANY_SOURCE_MSG= os.getenv("FORCE_OPEN_ON_ANY_SOURCE_MSG", "1") == "1"  # abre em qualquer msg do fonte
-AUTO_MIN_SIDE_SAMPLES       = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))
-AUTO_MIN_SCORE              = float(os.getenv("AUTO_MIN_SCORE", "0.50"))
-AUTO_MIN_MARGIN             = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))
+# ===== Decisão/autonomia =====
+FORCE_TRIGGER_OPEN            = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"   # sempre abre no gatilho
+FORCE_OPEN_ON_ANY_SOURCE_MSG  = os.getenv("FORCE_OPEN_ON_ANY_SOURCE_MSG", "1") == "1"  # abre em qualquer msg
+AUTO_MIN_SIDE_SAMPLES         = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))
+AUTO_MIN_SCORE                = float(os.getenv("AUTO_MIN_SCORE", "0.50"))
+AUTO_MIN_MARGIN               = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))
 
 # Pesos do score
 W_WR, W_HOUR, W_TREND = 0.70, 0.20, 0.10
@@ -60,10 +60,21 @@ EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.35"))
 SIDE_STREAK_CAP= int(os.getenv("SIDE_STREAK_CAP", "3"))
 EPS_TIE        = float(os.getenv("EPS_TIE", "0.02"))
 
-# ====== Desacoplamento do canal-fonte ======
+# ===== Fonte desacoplada =====
 LEARN_FROM_SOURCE_RESULTS = os.getenv("LEARN_FROM_SOURCE_RESULTS", "0") == "1"  # 0 = NÃO alimenta modelo
 SCOREBOARD_FROM_SOURCE    = os.getenv("SCOREBOARD_FROM_SOURCE", "1") == "1"     # 1 = atualiza placar
 STRICT_RESULT_MODE        = os.getenv("STRICT_RESULT_MODE", "1") == "1"         # 1 = ignora post ambíguo
+
+# ===== Ordem/atraso quando mesma mensagem tem gatilho+resultado =====
+PRIORITIZE_OPEN_BEFORE_RESULT = os.getenv("PRIORITIZE_OPEN_BEFORE_RESULT", "1") == "1"
+DELAY_RESULT_ON_SAME_MESSAGE  = float(os.getenv("DELAY_RESULT_ON_SAME_MESSAGE", "3"))
+
+# ===== Bloqueio anti “placar junto do sinal” =====
+ONLY_ACCEPT_RESULT_IF_OPEN = os.getenv("ONLY_ACCEPT_RESULT_IF_OPEN", "1") == "1"
+MIN_RESULT_DELAY_SEC       = int(os.getenv("MIN_RESULT_DELAY_SEC", "6"))  # exige Xs desde a abertura para aceitar resultado
+
+# Visual do sinal
+SHOW_DEBUG_ON_ENTRY = os.getenv("SHOW_DEBUG_ON_ENTRY", "1") == "1"
 
 # ================== APP/LOG ==================
 app = FastAPI()
@@ -90,9 +101,9 @@ async def safe_errors(request, call_next):
 SIDE_ALIASES_RE = re.compile(r"\b(player|banker|empate|p\b|b\b|azul|vermelho|blue|red)\b", re.I)
 NOISE_RE   = re.compile(r"(bot\s*online|aposta\s*encerrada|analisando)", re.I)
 
-# Resultado: tokens
-RESULT_GREEN_TOKENS_RE = re.compile(r"(✅|green\b|win\b)", re.I)
-RESULT_RED_TOKENS_RE   = re.compile(r"(❌|red\b|lose\b|loss\b|derrota\b|perd)", re.I)
+# Resultado — REGEX rígida (sem ✅ genérico)
+GREEN_RE = re.compile(r"\b(green|win|vit[oó]ria)\b|🟩|🟢", re.I)
+RED_RE   = re.compile(r"\b(red|loss|derrota|perd(emos|eu|a)?|lose)\b|🟥|🔴|❌", re.I)
 
 # Indícios explícitos de GREEN no G0
 G0_GREEN_HINT_RE = re.compile(r"(de\s+primeira|sem\s+gale|bateu\s+g0|\bg0\b)", re.I)
@@ -109,27 +120,17 @@ PROGRESS_GALE_RE = re.compile(
 )
 
 def _count_tokens(line: str) -> tuple[int,int]:
-    g = len(RESULT_GREEN_TOKENS_RE.findall(line))
-    r = len(RESULT_RED_TOKENS_RE.findall(line))
+    g = len(GREEN_RE.findall(line))
+    r = len(RED_RE.findall(line))
     return g, r
 
 def _last_significant_line(text: str) -> str|None:
-    # pega a última linha que contenha algum token de resultado
     for raw in reversed([ln.strip() for ln in (text or "").splitlines() if ln.strip()]):
-        if RESULT_GREEN_TOKENS_RE.search(raw) or RESULT_RED_TOKENS_RE.search(raw):
+        if GREEN_RE.search(raw) or RED_RE.search(raw):
             return raw
     return None
 
 def parse_last_outcome(text: str) -> str | None:
-    """
-    Retorna 'G' (GREEN) ou 'R' (LOSS) considerando G0.
-    Prioridade:
-      1) "de primeira" / "sem gale" / "bateu g0" / "g0" -> GREEN
-      2) "sem/não foi G1/G2" -> NÃO conta gale
-      3) progressão real p/ G1/G2 -> LOSS
-      4) última linha significativa: MAIORIA de tokens nessa linha
-      5) fallback: último token no texto inteiro
-    """
     if not text:
         return None
     low = text.lower()
@@ -151,12 +152,11 @@ def parse_last_outcome(text: str) -> str | None:
         g, r = _count_tokens(last_line)
         if g > r: return "G"
         if r > g: return "R"
-        # empate na linha → cair para (5)
 
     # (5) Fallback: último token global
     marks = []
-    for m in RESULT_GREEN_TOKENS_RE.finditer(text): marks.append((m.start(), "G"))
-    for m in RESULT_RED_TOKENS_RE.finditer(text):   marks.append((m.start(), "R"))
+    for m in GREEN_RE.finditer(text): marks.append((m.start(), "G"))
+    for m in RED_RE.finditer(text):   marks.append((m.start(), "R"))
     if not marks:
         return None
     marks.sort(key=lambda x: x[0])
@@ -193,9 +193,9 @@ STATE = {
     "totals": {"greens": 0, "reds": 0}, "streak_green": 0,
     "last_publish_ts": None, "processed_updates": deque(maxlen=500),
     "last_summary_hash": None,
-    "side_history": deque(maxlen=20),  # sequência recente de lados
-    "last_tiebreak": "banker",         # alternância em empates
-    "last_raw_text": "",               # debug
+    "side_history": deque(maxlen=20),
+    "last_tiebreak": "banker",
+    "last_raw_text": "",
 }
 
 def _ensure_dir(path): d=os.path.dirname(path);  (d and not os.path.exists(d)) and os.makedirs(d, exist_ok=True)
@@ -240,13 +240,8 @@ def rolling_append(side:str,res:str):
     h=hour_str(); hst=STATE["hour_stats"].setdefault(h,{"g":0,"t":0}); hst["t"]+=1; (res=="G") and (hst.__setitem__("g", hst["g"]+1))
 
 def side_wr(side: str, alpha: int = 8, beta: int = 8) -> tuple[float, int]:
-    """
-    Winrate suavizado (Beta prior 0.5) para evitar viés inicial.
-    Retorna (wr_suavizado, n_real).
-    """
     dq = STATE["pattern_roll"].get(side, deque())
-    n = len(dq)
-    g = sum(1 for x in dq if x == "G")
+    n = len(dq); g = sum(1 for x in dq if x == "G")
     wr_smooth = (g + alpha) / (n + alpha + beta) if (n + alpha + beta) > 0 else 0.5
     return wr_smooth, n
 
@@ -276,9 +271,7 @@ def trend_bonus():
     wr=sum(1 for x in dq if x=="G")/n; return max(0.0,min(1.0,wr))
 
 def clamp01(x: float) -> float:
-    if x < 0.0:  return 0.0
-    if x > 1.0:  return 1.0
-    return x
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
 
 def compute_scores():
     wr_p,n_p=side_wr("player"); wr_b,n_b=side_wr("banker")
@@ -287,7 +280,6 @@ def compute_scores():
     s_b = clamp01((W_WR*wr_b) + (W_HOUR*hb) + (W_TREND*tb))
     winner, s_win, s_lose = ("player",s_p,s_b) if s_p>=s_b else ("banker",s_b,s_p)
     dbg = {"score_player":s_p,"score_banker":s_b,"delta":abs(s_p-s_b), "n_p":n_p, "n_b":n_b}
-    # empate técnico → alternar para não viciar
     if abs(s_p - s_b) <= EPS_TIE:
         last = STATE.get("last_tiebreak","banker")
         winner = "player" if last == "banker" else "banker"
@@ -312,26 +304,25 @@ def _score_snapshot():
 async def announce_outcome(result: str, chosen_side: str | None):
     big = "🟩🟩🟩 <b>GREEN</b> 🟩🟩🟩" if result == "G" else "🟥🟥🟥 <b>LOSS</b> 🟥🟥🟥"
     ns = {"player":"🔵 Player","banker":"🔴 Banker","empate":"🟡 Empate"}.get((chosen_side or "").lower(),"?")
-    await tg_send(TARGET_CHAT_ID, f"{big}\nNossa: {ns}")
+    ts = now_local().strftime("⏱ %H:%M:%S")  # carimbo de segundos
+    await tg_send(TARGET_CHAT_ID, f"{big}\n{ts}\nNossa: {ns}")
     g, r, wr, streak = _score_snapshot()
     await tg_send(TARGET_CHAT_ID, f"📊 <b>Placar Geral</b>\n✅ {g}   ⛔️ {r}\n🎯 {wr:.2f}%  •  🔥 Streak {streak}")
 
 async def publish_entry(final_side:str, dbg_line:str, window_tag:str):
-    msg = (
-        f"🚀 <b>ENTRADA AUTÔNOMA (G0)</b>{window_tag}\n"
-        f"{'🔵 Player' if final_side=='player' else '🔴 Banker'}\n"
-        f"{dbg_line}"
-    )
-    await tg_send(TARGET_CHAT_ID, msg)
+    lines = [f"🚀 <b>ENTRADA AUTÔNOMA (G0)</b>{window_tag}",
+             "🔵 Player" if final_side=='player' else "🔴 Banker"]
+    if SHOW_DEBUG_ON_ENTRY and dbg_line:
+        lines.append(dbg_line)  # sem placar
+    await tg_send(TARGET_CHAT_ID, "\n".join(lines))
     register_hourly_entry()
 
-# ================== AUTÔNOMO NO GATILHO ==================
+# ================== AUTÔNOMO ==================
 async def autonomous_open_from_trigger():
     allow_risk,_ = risk_allows()
     if not allow_risk and not FORCE_TRIGGER_OPEN:
         return
 
-    # anti-spam
     last = STATE.get("last_publish_ts")
     if last:
         try:
@@ -339,22 +330,18 @@ async def autonomous_open_from_trigger():
                 return
         except: pass
 
-    # scores
     winner, s_win, s_lose, dbg = compute_scores()
     delta = dbg["delta"]
 
-    # exploração leve (anti-vício)
     if delta < EXPLORE_MARGIN:
         underdog = "banker" if winner == "player" else "player"
         if random.random() < EXPLORE_EPS:
             winner, s_win = underdog, (dbg["score_banker"] if underdog == "banker" else dbg["score_player"])
 
-    # quebra de streak muito longa
     hist = STATE.get("side_history")
     if isinstance(hist, deque) and len(hist) >= SIDE_STREAK_CAP and all(x == hist[-1] for x in list(hist)[-SIDE_STREAK_CAP:]):
         winner = "banker" if hist[-1] == "player" else "player"
 
-    # checagens (se não for forçado)
     if not FORCE_TRIGGER_OPEN:
         if min(dbg["n_p"], dbg["n_b"]) < AUTO_MIN_SIDE_SAMPLES: return
         if s_win < AUTO_MIN_SCORE: return
@@ -362,7 +349,6 @@ async def autonomous_open_from_trigger():
 
     window_tag = "" if is_top_hour_now() else " <i>(fora da janela de ouro)</i>"
 
-    # ===== DEBUG: Fonte vs Escolha =====
     fonte_side = None
     m = SIDE_ALIASES_RE.search(STATE.get("last_raw_text") or "")
     if m:
@@ -375,7 +361,7 @@ async def autonomous_open_from_trigger():
     STATE["open_signal"] = {
         "ts": now_local().isoformat(),
         "chosen_side": winner,
-        "expires_at": (now_local()+timedelta(seconds=75)).isoformat(),  # fast-close ~ 75s
+        "expires_at": (now_local()+timedelta(seconds=75)).isoformat(),  # fast close
         "text": dbg_line,
         "fonte_side": fonte_side,
     }
@@ -393,28 +379,28 @@ async def expire_open_if_needed():
     if exp and datetime.fromisoformat(exp) <= now_local():
         STATE["open_signal"] = None
         save_state()
-        asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"expired_no_result"}))
 
-# ================== PROCESSAMENTO DE MENSAGENS ==================
+async def _delayed_result(text: str, delay: float):
+    try:
+        await asyncio.sleep(max(0.0, delay))
+        await process_result(text)
+    except Exception:
+        pass
+
+# ================== PROCESSAMENTO ==================
 async def aux_log(e:dict):
     STATE["messages"].append(e)
     if len(STATE["messages"])>5000: STATE["messages"]=STATE["messages"][-4000:]
     save_state()
 
 async def process_signal(text: str):
-    """
-    Canal-fonte = GATILHO. NÃO copiamos cor.
-    No gatilho (ou qualquer msg se destravado), decidimos autonomamente e abrimos G0.
-    """
     low = (text or "").lower()
     if NOISE_RE.search(low):
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"noise","text":text}))
         return
-    # Abrir mesmo sem trigger textual quando destravado
     if FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG:
         await autonomous_open_from_trigger()
         return
-    # Caso contrário, precisa ter trigger textual
     gatilho = ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low)
     if not gatilho:
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"no_trigger","text":text}))
@@ -431,13 +417,19 @@ async def process_result(text: str):
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"result_without_open","text":text}))
         return
 
-    res = out  # "G" ou "R"
+    # BLOQUEIO anti “placar junto”: exige delay mínimo desde a abertura
+    try:
+        opened = datetime.fromisoformat(osig["ts"])
+        if (now_local() - opened).total_seconds() < MIN_RESULT_DELAY_SEC:
+            return
+    except Exception:
+        pass
+
+    res = out
     chosen = osig.get("chosen_side")
 
-    # ===== anúncio grande sempre (visual) =====
     await announce_outcome(res, chosen)
 
-    # ===== scoreboard opcional =====
     if SCOREBOARD_FROM_SOURCE:
         if res == "R":
             STATE["daily_losses"] += 1
@@ -447,7 +439,6 @@ async def process_result(text: str):
             STATE["totals"]["greens"] = STATE["totals"].get("greens", 0) + 1
             STATE["streak_green"] = STATE.get("streak_green", 0) + 1
 
-        # resumo (dedup)
         g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
         total = g + r
         wr_day = (g/total*100.0) if total else 0.0
@@ -457,18 +448,15 @@ async def process_result(text: str):
             STATE["last_summary_hash"] = digest
             await tg_send(TARGET_CHAT_ID, resumo)
 
-    # ===== aprendizado desligado? não alimente NADA do modelo =====
     if LEARN_FROM_SOURCE_RESULTS:
         if chosen: rolling_append(chosen, res)
         STATE["recent_results"].append(res)
-        # ban por sequência (opcional)
         if chosen:
             tail = "".join(list(STATE["pattern_roll"].get(chosen, []))[-BAN_AFTER_CONSECUTIVE_R:])
             if tail and tail.endswith("R"*BAN_AFTER_CONSECUTIVE_R):
                 until = now_local() + timedelta(hours=BAN_FOR_HOURS)
                 STATE["pattern_ban"][chosen] = {"until": until.isoformat(), "reason": f"{BAN_AFTER_CONSECUTIVE_R} REDS seguidos"}
 
-    # encerra a entrada
     STATE["open_signal"] = None
     asyncio.create_task(aux_log({
         "ts": now_local().isoformat(),
@@ -477,7 +465,7 @@ async def process_result(text: str):
     }))
     save_state()
 
-# ================== RELATÓRIO ==================
+# ================== RELATÓRIO/LOOPS ==================
 def build_report():
     g,r=STATE["totals"]["greens"],STATE["totals"]["reds"]; t=g+r; wr=(g/t*100.0) if t else 0.0
     return f"<b>📊 Relatório Diário ({today_str()})</b>\nDia: <b>{g}G / {r}R</b> (WR: {wr:.1f}%)"
@@ -513,7 +501,7 @@ async def on_startup():
 # ================== ROTAS ==================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 autônomo (independente) • G0-first • Fonte desacoplada • any-msg • /win /loss"}
+    return {"ok": True, "service": "G0 autônomo • Fonte desacoplada • Resultado rígido+delay • any-msg • /win /loss"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -537,12 +525,10 @@ async def webhook(req: Request, secret: str|None=None):
     msg = update.get("channel_post") or update.get("message") or {}
     chat = (msg.get("chat") or {})
     text = (msg.get("text") or "").strip()
-
-    # >>> NOVO: se vier imagem com legenda, usar a legenda como texto
     if not text:
         text = (msg.get("caption") or "").strip()
 
-    # ===== comandos manuais no canal destino =====
+    # ===== comandos no canal destino =====
     if chat.get("id") == TARGET_CHAT_ID:
         low = (text or "").lower()
         if low.startswith("/win"):
@@ -565,43 +551,51 @@ async def webhook(req: Request, secret: str|None=None):
                 save_state()
             STATE["open_signal"] = None
             return JSONResponse({"ok": True})
-        # outras mensagens no canal destino são ignoradas
         return JSONResponse({"ok": True})
 
-    # ===== somente processa o canal-fonte como gatilho/resultado =====
+    # ===== somente processa o canal-fonte =====
     if chat.get("id") != SOURCE_CHAT_ID:
         return JSONResponse({"ok": True})
 
-    # guarda texto bruto (pode ser vazio) p/ debug
     STATE["last_raw_text"] = text
 
-    # (opcional) espelho visual — NÃO interrompe o fluxo
     if FLOW_THROUGH and text:
         await tg_send(TARGET_CHAT_ID, colorize_line(text))
         asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
 
-    # 1) Resultado do canal → fechamento (parser G0-first)
-    out = parse_last_outcome(text) if text else None
-    if out in ("G","R"):
-        await process_result(text)
-        return JSONResponse({"ok": True})
-    elif STRICT_RESULT_MODE and text:
-        # ignora posts ambíguos de resultado
-        return JSONResponse({"ok": True})
+    low = (text or "").lower()
+    has_trigger = bool( ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low) ) if text else False
+    has_result  = bool( GREEN_RE.search(text) or RED_RE.search(text) ) if text else False
+    want_open   = (FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG or has_trigger)
 
-    # 2) Destravado: abre autônomo mesmo sem trigger textual (qualquer msg do fonte)
-    if FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG:
+    # Abrir antes de fechar se mesma msg tiver os dois
+    if PRIORITIZE_OPEN_BEFORE_RESULT and want_open and not STATE.get("open_signal"):
+        await process_signal(text or "")
+
+    # Aceitar resultado: só se estiver aberto e respeitar delay
+    if has_result:
+        osig = STATE.get("open_signal")
+        if ONLY_ACCEPT_RESULT_IF_OPEN and not osig:
+            return JSONResponse({"ok": True})
+        if osig:
+            try:
+                opened = datetime.fromisoformat(osig["ts"])
+                if (now_local() - opened).total_seconds() < MIN_RESULT_DELAY_SEC:
+                    return JSONResponse({"ok": True})
+            except Exception:
+                pass
+        # se quiser ainda separar o “mesmo minuto” visualmente:
+        if DELAY_RESULT_ON_SAME_MESSAGE > 0 and PRIORITIZE_OPEN_BEFORE_RESULT:
+            asyncio.create_task(_delayed_result(text, DELAY_RESULT_ON_SAME_MESSAGE))
+            return JSONResponse({"ok": True})
+        else:
+            await process_result(text)
+            return JSONResponse({"ok": True})
+
+    # Se não abriu ainda e queremos abrir → abre agora
+    if not STATE.get("open_signal") and want_open:
         await process_signal(text or "")
         return JSONResponse({"ok": True})
 
-    # 3) Se não destravado, só abre quando houver gatilho textual
-    if text:
-        low = text.lower()
-        has_trigger = ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low)
-        if has_trigger:
-            await process_signal(text)
-            return JSONResponse({"ok": True})
-
-    # Sem texto e sem destrave → não faz nada
     asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"no_text_no_open"}))
     return JSONResponse({"ok": True})
