@@ -64,20 +64,20 @@ app = FastAPI()
 log = logging.getLogger("uvicorn.error")
 
 # ================== REGEX ==================
-# Palavras e abreviações
+# Palavras/abreviações
 SIDE_WORD_RE = re.compile(r"\b(player|banker|empate|azul|vermelho|blue|red|p\b|b\b)\b", re.I)
-# Emojis comuns no fonte
+# Emojis do lado
 EMOJI_PLAYER_RE = re.compile(r"(🔵|🟦)", re.U)
 EMOJI_BANKER_RE = re.compile(r"(🔴|🟥)", re.U)
 
-# Finalização do fonte:
+# >>> FINALIZAÇÃO DO FONTE (reforçado para "gale 1/2")
 # G0 de primeira (sem gale)
 SOURCE_G0_GREEN_RE = re.compile(
-    r"(de\s+primeira|sem\s+gale|bateu\s+g0|\bG0\b|acert(ou|amos)\s+de\s+primeira)", re.I
+    r"(?i)(de\s+primeira|sem\s+gale|bateu\s+(de\s+)?primeira|win\s+de\s+primeira|pegou\s+de\s+primeira|acert(ou|amos)\s+de\s+primeira|\bG0\b)"
 )
-# foi para G1/G2
+# foi para gale 1 / gale 2
 SOURCE_WENT_GALE_RE = re.compile(
-    r"((estamos|indo|fomos|vamos)\s+(pro|para|no)\s*g-?\s*[12]\b|gale\s*[12]\b)", re.I
+    r"(?i)\b(gale\s*1|gale\s*2|vamos\s+(pro|para|no)\s+gale\s*[12]|indo\s+(pro|para|no)\s+gale\s*[12]|fomos\s+(pro|para|no)\s+gale\s*[12]|partiu\s+gale\s*[12]|ir\s+pro\s+gale\s*[12]|indo\s+gale\s*[12]|vamos\s+gale\s*[12])\b"
 )
 
 # ================== HELPERS ==================
@@ -96,17 +96,17 @@ def normalize_side_token(tok:str|None)->str|None:
 def extract_side(text:str)->str|None:
     """Tenta achar a cor do fonte (palavra OU emoji)."""
     if not text: return None
-    # 1) palavras
+    # palavras
     m = SIDE_WORD_RE.search(text)
     if m:
         s = normalize_side_token(m.group(1))
         if s: return s
-    # 2) emojis (se só um tipo aparecer)
+    # emojis (se só um tipo aparecer)
     has_p = bool(EMOJI_PLAYER_RE.search(text))
     has_b = bool(EMOJI_BANKER_RE.search(text))
     if has_p and not has_b: return "player"
     if has_b and not has_p: return "banker"
-    return None  # ambíguo ou nada
+    return None
 
 # ================== STATE ==================
 STATE = {
@@ -227,7 +227,7 @@ def _can_extend_ttl(text: str) -> bool:
 # ================== RESULTADO CORRETO vs FONTE ==================
 def derive_our_result_from_source_flow(text:str, fonte_side:str|None, chosen_side:str|None):
     """
-    Regras (o que você pediu):
+    Regras:
       - Se fonte foi para G1/G2: igual ao fonte = LOSS; oposto = GREEN
       - Se fonte G0 de primeira: igual ao fonte = GREEN; oposto = LOSS
       - Só fecha se fonte_side e chosen_side forem conhecidos
@@ -235,7 +235,7 @@ def derive_our_result_from_source_flow(text:str, fonte_side:str|None, chosen_sid
     if not fonte_side or not chosen_side:
         return None
     low = (text or "").lower()
-    # PRIORIDADE: se falar que foi G1/G2, tratamos como tal
+    # Prioridade: se falar que foi G1/G2, tratamos como tal
     if SOURCE_WENT_GALE_RE.search(low):
         return "R" if (chosen_side == fonte_side) else "G"
     # Se falar que foi G0 (de primeira / sem gale)
@@ -255,8 +255,7 @@ async def publish_entry(chosen_side:str, fonte_side:str|None, msg:dict):
         "ts": now_local().isoformat(),
         "chosen_side": chosen_side,
         "fonte_side": fonte_side,  # pode ser None; atualizamos depois se aparecer
-        "expires_at": (now_local()+timedelta(seconds=OPEN_TTL_SE
-C)).isoformat(),
+        "expires_at": (now_local()+timedelta(seconds=OPEN_TTL_SEC)).isoformat(),
         "src_msg_id": msg.get("message_id"),
         "src_opened_epoch": msg.get("date", 0),
     }
@@ -430,7 +429,7 @@ async def webhook(req: Request, secret: str|None=None):
     if chat.get("id") != SOURCE_CHAT_ID:
         return JSONResponse({"ok": True})
 
-    # aceitar caption além de text
+    # aceita caption além de text
     text = (msg.get("text") or msg.get("caption") or "").strip()
     if not text:
         return JSONResponse({"ok": True})
@@ -439,8 +438,13 @@ async def webhook(req: Request, secret: str|None=None):
         await tg_send(TARGET_CHAT_ID, text)
 
     low = text.lower()
-    # abrir só com gatilho real
-    has_trigger = bool(("entrada confirmada" in low) or SIDE_WORD_RE.search(low) or EMOJI_PLAYER_RE.search(text) or EMOJI_BANKER_RE.search(text))
+    # abre só com gatilho real (lado por palavra/emoji ou "entrada confirmada")
+    has_trigger = bool(
+        ("entrada confirmada" in low)
+        or SIDE_WORD_RE.search(low)
+        or EMOJI_PLAYER_RE.search(text)
+        or EMOJI_BANKER_RE.search(text)
+    )
 
     # 1) tentar fechar (se houver confirmação do fluxo)
     if CLOSE_ONLY_ON_FLOW_CONFIRM:
