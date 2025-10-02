@@ -1,4 +1,4 @@
-# app.py — G0 autônomo (independente do canal) + fechamento G0-first + DEBUG Fonte vs Escolha
+# app.py — G0 autônomo (independente do canal) + parser G0-first + desacoplado do fonte + /win /loss
 import os, json, asyncio, re, pytz, hashlib, random
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -8,13 +8,13 @@ from collections import deque
 
 # ================== ENV ==================
 TG_BOT_TOKEN   = os.environ["TG_BOT_TOKEN"]
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])   # canal-fonte (gatilho)
-TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # canal destino (publicação)
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])   # canal-fonte (gatilho/resultado textual)
+TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # canal-destino (publicação e comandos /win /loss)
 
 TZ_NAME        = os.getenv("TZ", "UTC")
 LOCAL_TZ       = pytz.timezone(TZ_NAME)
 
-# Rolling / filtros (para métricas; não travam abertura quando FORCE_TRIGGER_OPEN=1)
+# Rolling / filtros (métricas internas; NÃO travam abertura com FORCE_TRIGGER_OPEN=1)
 MIN_G0 = float(os.getenv("MIN_G0", "0.95"))
 MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "40"))
 ROLLING_MAX = int(os.getenv("ROLLING_MAX", "800"))
@@ -36,7 +36,7 @@ HOURLY_CAP              = int(os.getenv("HOURLY_CAP", "20"))
 
 # Fluxo
 MIN_GAP_SECS = int(os.getenv("MIN_GAP_SECS", "5"))    # anti-spam leve
-FLOW_THROUGH = os.getenv("FLOW_THROUGH", "0") == "1"  # espelho visual opcional
+FLOW_THROUGH = os.getenv("FLOW_THROUGH", "0") == "1"  # espelho visual opcional do fonte
 LOG_RAW      = os.getenv("LOG_RAW", "1") == "1"
 DISABLE_WINDOWS = os.getenv("DISABLE_WINDOWS", "0") == "1"
 DISABLE_RISK    = os.getenv("DISABLE_RISK", "1") == "1"
@@ -44,7 +44,7 @@ DISABLE_RISK    = os.getenv("DISABLE_RISK", "1") == "1"
 STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
-# ====== Autônomo (decisão independente) ======
+# ====== Decisão autônoma ======
 FORCE_TRIGGER_OPEN    = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"  # 1 = sempre abre no gatilho
 AUTO_MIN_SIDE_SAMPLES = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))
 AUTO_MIN_SCORE        = float(os.getenv("AUTO_MIN_SCORE", "0.50"))
@@ -53,11 +53,16 @@ AUTO_MIN_MARGIN       = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))
 # Pesos do score
 W_WR, W_HOUR, W_TREND = 0.70, 0.20, 0.10
 
-# Exploração / anti-vício
-EXPLORE_MARGIN = float(os.getenv("EXPLORE_MARGIN", "0.15"))  # delta pequeno
-EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.35"))     # 35% chance underdog
-SIDE_STREAK_CAP= int(os.getenv("SIDE_STREAK_CAP", "3"))      # força alternar após streak
-EPS_TIE        = float(os.getenv("EPS_TIE", "0.02"))         # empate técnico alterna
+# Anti-vício (exploração / tie / streak)
+EXPLORE_MARGIN = float(os.getenv("EXPLORE_MARGIN", "0.15"))
+EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.35"))
+SIDE_STREAK_CAP= int(os.getenv("SIDE_STREAK_CAP", "3"))
+EPS_TIE        = float(os.getenv("EPS_TIE", "0.02"))
+
+# ====== Desacoplamento do canal-fonte ======
+LEARN_FROM_SOURCE_RESULTS = os.getenv("LEARN_FROM_SOURCE_RESULTS", "0") == "1"  # 0 = NÃO alimenta modelo
+SCOREBOARD_FROM_SOURCE    = os.getenv("SCOREBOARD_FROM_SOURCE", "1") == "1"     # 1 = atualiza placar
+STRICT_RESULT_MODE        = os.getenv("STRICT_RESULT_MODE", "1") == "1"         # 1 = ignora post ambíguo
 
 # ================== APP/LOG ==================
 app = FastAPI()
@@ -102,14 +107,27 @@ PROGRESS_GALE_RE = re.compile(
     re.I
 )
 
+def _count_tokens(line: str) -> tuple[int,int]:
+    g = len(RESULT_GREEN_TOKENS_RE.findall(line))
+    r = len(RESULT_RED_TOKENS_RE.findall(line))
+    return g, r
+
+def _last_significant_line(text: str) -> str|None:
+    # pega a última linha que contenha algum token de resultado
+    for raw in reversed([ln.strip() for ln in (text or "").splitlines() if ln.strip()]):
+        if RESULT_GREEN_TOKENS_RE.search(raw) or RESULT_RED_TOKENS_RE.search(raw):
+            return raw
+    return None
+
 def parse_last_outcome(text: str) -> str | None:
     """
-    Retorna 'G' (green) ou 'R' (loss) considerando G0.
+    Retorna 'G' (GREEN) ou 'R' (LOSS) considerando G0.
     Prioridade:
-      1) "de primeira", "sem gale", "bateu g0", "g0"  -> GREEN
-      2) "sem/não foi G1/G2"                          -> NÃO conta gale
-      3) progressão real p/ G1/G2                     -> LOSS
-      4) último token objetivo (✅ vs ❌)
+      1) "de primeira" / "sem gale" / "bateu g0" / "g0" -> GREEN
+      2) "sem/não foi G1/G2" -> NÃO conta gale
+      3) progressão real p/ G1/G2 -> LOSS
+      4) última linha significativa: MAIORIA de tokens nessa linha
+      5) fallback: último token no texto inteiro
     """
     if not text:
         return None
@@ -126,7 +144,15 @@ def parse_last_outcome(text: str) -> str | None:
     if not neg_gale and PROGRESS_GALE_RE.search(low):
         return "R"
 
-    # (4) Último token ✅/❌
+    # (4) Última linha significativa
+    last_line = _last_significant_line(text)
+    if last_line:
+        g, r = _count_tokens(last_line)
+        if g > r: return "G"
+        if r > g: return "R"
+        # empate na linha → cair para (5)
+
+    # (5) Fallback: último token global
     marks = []
     for m in RESULT_GREEN_TOKENS_RE.finditer(text): marks.append((m.start(), "G"))
     for m in RESULT_RED_TOKENS_RE.finditer(text):   marks.append((m.start(), "R"))
@@ -167,8 +193,8 @@ STATE = {
     "last_publish_ts": None, "processed_updates": deque(maxlen=500),
     "last_summary_hash": None,
     "side_history": deque(maxlen=20),  # sequência recente de lados
-    "last_tiebreak": "banker",         # para alternância em empates
-    "last_raw_text": "",               # para debug
+    "last_tiebreak": "banker",         # alternância em empates
+    "last_raw_text": "",               # debug
 }
 
 def _ensure_dir(path): d=os.path.dirname(path);  (d and not os.path.exists(d)) and os.makedirs(d, exist_ok=True)
@@ -214,8 +240,7 @@ def rolling_append(side:str,res:str):
 
 def side_wr(side: str, alpha: int = 8, beta: int = 8) -> tuple[float, int]:
     """
-    Winrate suavizado (Bayes) com prior Beta(alpha,beta) ~ 0.5.
-    Evita viciar no primeiro lado que ganhar.
+    Winrate suavizado (Beta prior 0.5) para evitar viés inicial.
     Retorna (wr_suavizado, n_real).
     """
     dq = STATE["pattern_roll"].get(side, deque())
@@ -259,7 +284,6 @@ def compute_scores():
     hb, tb = hour_bonus(), trend_bonus()
     s_p = clamp01((W_WR*wr_p) + (W_HOUR*hb) + (W_TREND*tb))
     s_b = clamp01((W_WR*wr_b) + (W_HOUR*hb) + (W_TREND*tb))
-    # vencedor padrão
     winner, s_win, s_lose = ("player",s_p,s_b) if s_p>=s_b else ("banker",s_b,s_p)
     dbg = {"score_player":s_p,"score_banker":s_b,"delta":abs(s_p-s_b), "n_p":n_p, "n_b":n_b}
     # empate técnico → alternar para não viciar
@@ -393,54 +417,56 @@ async def process_signal(text: str):
 
 async def process_result(text: str):
     out = parse_last_outcome(text)
-    if out not in ("G", "R"):  # não achou resultado
+    if out not in ("G", "R"):
         return
-    is_green = (out == "G")
 
     osig = STATE.get("open_signal")
     if not osig:
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"result_without_open","text":text}))
         return
 
-    res = "G" if is_green else "R"
+    res = out  # "G" ou "R"
     chosen = osig.get("chosen_side")
 
-    # registra rolling por lado escolhido
-    if chosen: rolling_append(chosen, res)
-    STATE["recent_results"].append(res)
-    STATE["recent_g0"] = (STATE.get("recent_g0", []) + [res])[-10:]
-
-    if res == "R":
-        STATE["daily_losses"] += 1
-        STATE["totals"]["reds"] += 1
-        STATE["streak_green"] = 0
-    else:
-        STATE["totals"]["greens"] += 1
-        STATE["streak_green"] += 1
-
-    # ban simples por sequência
-    if chosen:
-        tail = "".join(list(STATE["pattern_roll"].get(chosen, []))[-BAN_AFTER_CONSECUTIVE_R:])
-        if tail and tail.endswith("R"*BAN_AFTER_CONSECUTIVE_R):
-            until = now_local() + timedelta(hours=BAN_FOR_HOURS)
-            STATE["pattern_ban"][chosen] = {"until": until.isoformat(), "reason": f"{BAN_AFTER_CONSECUTIVE_R} REDS seguidos"}
-
-    # resumo (dedup) + anúncio grande
-    g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
-    total = g + r
-    wr_day = (g/total*100.0) if total else 0.0
-    resumo = f"✅ {g} ⛔️ {r} 🎯 Acertamos {wr_day:.2f}%\n🥇 ESTAMOS A {STATE['streak_green']} GREENS SEGUIDOS ⏳"
-    digest = hashlib.md5(resumo.encode("utf-8")).hexdigest()
-    if digest != STATE.get("last_summary_hash"):
-        STATE["last_summary_hash"] = digest
-        await tg_send(TARGET_CHAT_ID, resumo)
-
+    # ===== anúncio grande sempre (visual) =====
     await announce_outcome(res, chosen)
 
+    # ===== scoreboard opcional =====
+    if SCOREBOARD_FROM_SOURCE:
+        if res == "R":
+            STATE["daily_losses"] += 1
+            STATE["totals"]["reds"] = STATE["totals"].get("reds", 0) + 1
+            STATE["streak_green"] = 0
+        else:
+            STATE["totals"]["greens"] = STATE["totals"].get("greens", 0) + 1
+            STATE["streak_green"] = STATE.get("streak_green", 0) + 1
+
+        # resumo (dedup)
+        g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
+        total = g + r
+        wr_day = (g/total*100.0) if total else 0.0
+        resumo = f"✅ {g} ⛔️ {r} 🎯 Acertamos {wr_day:.2f}%\n🥇 ESTAMOS A {STATE['streak_green']} GREENS SEGUIDOS ⏳"
+        digest = hashlib.md5(resumo.encode("utf-8")).hexdigest()
+        if digest != STATE.get("last_summary_hash"):
+            STATE["last_summary_hash"] = digest
+            await tg_send(TARGET_CHAT_ID, resumo)
+
+    # ===== aprendizado desligado? não alimente NADA do modelo =====
+    if LEARN_FROM_SOURCE_RESULTS:
+        if chosen: rolling_append(chosen, res)
+        STATE["recent_results"].append(res)
+        # ban por sequência (opcional)
+        if chosen:
+            tail = "".join(list(STATE["pattern_roll"].get(chosen, []))[-BAN_AFTER_CONSECUTIVE_R:])
+            if tail and tail.endswith("R"*BAN_AFTER_CONSECUTIVE_R):
+                until = now_local() + timedelta(hours=BAN_FOR_HOURS)
+                STATE["pattern_ban"][chosen] = {"until": until.isoformat(), "reason": f"{BAN_AFTER_CONSECUTIVE_R} REDS seguidos"}
+
+    # encerra a entrada
     STATE["open_signal"] = None
     asyncio.create_task(aux_log({
         "ts": now_local().isoformat(),
-        "type": "result_green" if is_green else "result_red",
+        "type": "result_green" if res == "G" else "result_red",
         "text": text
     }))
     save_state()
@@ -456,7 +482,6 @@ async def daily_report_loop():
         try:
             n = now_local()
             if n.hour==0 and n.minute==0:
-                # reset diário
                 STATE["daily_losses"]=0; STATE["hourly_entries"]={}; STATE["streak_green"]=0
                 await tg_send(TARGET_CHAT_ID, build_report())
                 await asyncio.sleep(65)
@@ -482,7 +507,7 @@ async def on_startup():
 # ================== ROTAS ==================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 autônomo no gatilho (independente do canal) [G0-first]"}
+    return {"ok": True, "service": "G0 autônomo (independente) • G0-first • Fonte desacoplada • /win /loss"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -505,11 +530,39 @@ async def webhook(req: Request, secret: str|None=None):
 
     msg = update.get("channel_post") or update.get("message") or {}
     chat = (msg.get("chat") or {})
-    if chat.get("id") != SOURCE_CHAT_ID:
+    text = (msg.get("text") or "").strip()
+    if not text:
         return JSONResponse({"ok": True})
 
-    text = (msg.get("text") or "").strip()
-    if not text: return JSONResponse({"ok": True})
+    # ===== comandos manuais no canal destino =====
+    if chat.get("id") == TARGET_CHAT_ID:
+        low = text.lower()
+        if low.startswith("/win"):
+            osig = STATE.get("open_signal")
+            chosen = osig.get("chosen_side") if osig else None
+            await announce_outcome("G", chosen)
+            if SCOREBOARD_FROM_SOURCE:
+                STATE["totals"]["greens"] = STATE["totals"].get("greens",0) + 1
+                STATE["streak_green"] = STATE.get("streak_green",0) + 1
+                save_state()
+            STATE["open_signal"] = None
+            return JSONResponse({"ok": True})
+        if low.startswith("/loss"):
+            osig = STATE.get("open_signal")
+            chosen = osig.get("chosen_side") if osig else None
+            await announce_outcome("R", chosen)
+            if SCOREBOARD_FROM_SOURCE:
+                STATE["totals"]["reds"] = STATE["totals"].get("reds",0) + 1
+                STATE["streak_green"] = 0
+                save_state()
+            STATE["open_signal"] = None
+            return JSONResponse({"ok": True})
+        # outras mensagens no canal destino são ignoradas
+        return JSONResponse({"ok": True})
+
+    # ===== somente processa o canal-fonte como gatilho/resultado =====
+    if chat.get("id") != SOURCE_CHAT_ID:
+        return JSONResponse({"ok": True})
 
     # guarda texto bruto para DEBUG (fonte vs escolha)
     STATE["last_raw_text"] = text
@@ -519,9 +572,13 @@ async def webhook(req: Request, secret: str|None=None):
         await tg_send(TARGET_CHAT_ID, colorize_line(text))
         asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
 
-    # Resultados do canal → fechamento (parser G0-first)
-    if parse_last_outcome(text) in ("G","R"):
+    # Resultado do canal → fechamento (parser G0-first)
+    out = parse_last_outcome(text)
+    if out in ("G","R"):
         await process_result(text)
+        return JSONResponse({"ok": True})
+    elif STRICT_RESULT_MODE:
+        # ignora posts ambíguos de resultado
         return JSONResponse({"ok": True})
 
     # Qualquer sinal válido vira GATILHO → abrir autônomo
