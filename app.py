@@ -1,4 +1,4 @@
-# app.py — G0 serial + fechamento rápido vs fonte + 5 especialistas de abertura
+# app.py — G0 serial + fechamento rápido vs fonte + especialistas + “empate ⇒ GREEN”
 import os, re, json, asyncio, pytz, logging, random
 from datetime import datetime, timedelta
 from collections import deque
@@ -8,7 +8,7 @@ import httpx
 
 # ================== ENVs ==================
 TG_BOT_TOKEN   = os.environ["TG_BOT_TOKEN"]
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])   # ex: -1002796105884 (defina no Render)
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])
 TZ_NAME        = os.getenv("TZ", "UTC")
 LOCAL_TZ       = pytz.timezone(TZ_NAME)
@@ -22,7 +22,7 @@ FORCE_OPEN_ON_ANY_SOURCE_MSG = os.getenv("FORCE_OPEN_ON_ANY_SOURCE_MSG", "1") ==
 # Fechamento controlado (primeiro desfecho do fonte)
 CLOSE_ONLY_ON_FLOW_CONFIRM = os.getenv("CLOSE_ONLY_ON_FLOW_CONFIRM", "1") == "1"
 ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE = os.getenv("ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE", "1") == "1"
-MIN_RESULT_DELAY_SEC = int(os.getenv("MIN_RESULT_DELAY_SEC", "8"))
+MIN_RESULT_DELAY_SEC = int(os.getenv("MIN_RESULT_DELAY_SEC", "6"))  # bem curto p/ fechar rápido
 
 # Timeout / janela de vida do sinal
 OPEN_TTL_SEC              = int(os.getenv("OPEN_TTL_SEC", "90"))
@@ -55,7 +55,7 @@ TOP_HOURS_COUNT       = int(os.getenv("TOP_HOURS_COUNT", "6"))
 # Pesos de score
 W_WR, W_HOUR, W_TREND = 0.70, 0.20, 0.10
 
-# Especialista #1 (anti-streak por lado)
+# Especialista #1 (anti-streak por lado / ban por sequência)
 ROLL_BAN_AFTER_R = int(os.getenv("ROLL_BAN_AFTER_R", "0"))  # 0 desativa
 ROLL_BAN_HOURS   = int(os.getenv("ROLL_BAN_HOURS", "2"))
 MIN_SIDE_SAMPLES = int(os.getenv("MIN_SIDE_SAMPLES", "30"))
@@ -68,6 +68,9 @@ SOURCE_GALE_EXPLORE_BONUS     = float(os.getenv("SOURCE_GALE_EXPLORE_BONUS","0.2
 
 # Especialista #4 (cooldown pós-loss)
 COOLDOWN_AFTER_LOSS_MIN = int(os.getenv("COOLDOWN_AFTER_LOSS_MIN","10"))
+
+# “Empate ⇒ GREEN” (ao fonte declarar green/✅ sem gale)
+ALWAYS_GREEN_ON_SOURCE_GREEN = os.getenv("ALWAYS_GREEN_ON_SOURCE_GREEN", "1") == "1"
 
 # Log / misc
 FLOW_THROUGH = os.getenv("FLOW_THROUGH", "0") == "1"
@@ -88,10 +91,12 @@ EMOJI_PLAYER_RE = re.compile(r"(🔵|🟦)", re.U)
 EMOJI_BANKER_RE = re.compile(r"(🔴|🟥)", re.U)
 
 # Finalização do fonte:
-# G0 de primeira (sem gale)
+# G0 de primeira (sem gale) — frases típicas
 SOURCE_G0_GREEN_RE = re.compile(
     r"(de\s+primeira|sem\s+gale|bateu\s+g0|\bG0\b|acert(ou|amos)\s+de\s+primeira)", re.I
 )
+# GREEN “puro” do fonte (sem mencionar gale/G0 explicitamente)
+SOURCE_PLAIN_GREEN_RE = re.compile(r"\b(greem|green|win|✅)\b", re.I)
 # foi para G1/G2
 SOURCE_WENT_GALE_RE = re.compile(
     r"((estamos|indo|fomos|vamos)\s+(pro|para|no)\s*g-?\s*[12]\b|gale\s*[12]\b)", re.I
@@ -264,7 +269,8 @@ def _can_extend_ttl(text: str) -> bool:
         EMOJI_PLAYER_RE.search(text or "") or
         EMOJI_BANKER_RE.search(text or "") or
         SOURCE_WENT_GALE_RE.search(low) or
-        SOURCE_G0_GREEN_RE.search(low)
+        SOURCE_G0_GREEN_RE.search(low) or
+        SOURCE_PLAIN_GREEN_RE.search(low)
     )
 
 # ================== ESPECIALISTAS (ABERTURA) ==================
@@ -328,15 +334,23 @@ def spec_side_repeat_guard(candidate:str)->tuple[bool,str]:
 def derive_our_result_from_source_flow(text:str, fonte_side:str|None, chosen_side:str|None):
     """
     - Se fonte foi para G1/G2: igual ao fonte = LOSS; oposto = GREEN
-    - Se fonte G0 de primeira: igual ao fonte = GREEN; oposto = LOSS
+    - Se fonte declara GREEN de primeira (frases típicas) OU apenas 'greem/green/✅':
+        → 'empate' ⇒ GREEN para nós SEMPRE (se ligado por ENV)
     """
-    if not fonte_side or not chosen_side:
+    if not chosen_side:
         return None
     low = (text or "").lower()
+
+    # Gale 1/2 detectado
     if SOURCE_WENT_GALE_RE.search(low):
+        if not fonte_side:
+            return None
         return "R" if (chosen_side == fonte_side) else "G"
-    if SOURCE_G0_GREEN_RE.search(low):
-        return "G" if (chosen_side == fonte_side) else "R"
+
+    # Green “puro” ou de primeira
+    if ALWAYS_GREEN_ON_SOURCE_GREEN and (SOURCE_G0_GREEN_RE.search(low) or SOURCE_PLAIN_GREEN_RE.search(low)):
+        return "G"
+
     return None
 
 # ================== PUBLICAÇÃO ==================
@@ -414,12 +428,12 @@ async def try_open_from_source(msg:dict):
     delta = dbg["delta"]
 
     # ======== ESPECIALISTAS DE ABERTURA ========
-    # 1) Anti-streak do lado
+    # 1) Anti-streak do lado / ban por sequência
     ok1, _ = spec_roll_guard(winner)
     if not ok1:
         return
 
-    # 2) Janela de ouro real
+    # 2) Janela de ouro
     ok2, _ = spec_hour_window()
     if not ok2:
         return
@@ -430,8 +444,8 @@ async def try_open_from_source(msg:dict):
         return
     eps = EXPLORE_EPS + (SOURCE_GALE_EXPLORE_BONUS if why3 == "explore_boost" else 0.0)
 
-    # 5) Cap de repetição de cor
-    ok5, why5 = spec_side_repeat_guard(winner)
+    # 4) Cap de repetição de cor contínua
+    ok5, _ = spec_side_repeat_guard(winner)
     if not ok5:
         alt = "player" if winner=="banker" else "banker"
         ok_alt, _ = spec_roll_guard(alt)
@@ -464,7 +478,11 @@ async def maybe_close_from_source(msg:dict):
     maybe_update_fonte_side_from_msg(msg)
 
     # só fecha se houver confirmação clara do fluxo (primeiro que vier)
-    has_flow_confirm = bool(SOURCE_G0_GREEN_RE.search(low) or SOURCE_WENT_GALE_RE.search(low))
+    has_flow_confirm = bool(
+        SOURCE_G0_GREEN_RE.search(low) or
+        SOURCE_PLAIN_GREEN_RE.search(low) or
+        SOURCE_WENT_GALE_RE.search(low)
+    )
     if not has_flow_confirm:
         if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC and _can_extend_ttl(raw_text):
             osig["expires_at"] = (now_local()+timedelta(seconds=RESULT_GRACE_EXTEND_SEC)).isoformat()
@@ -475,12 +493,12 @@ async def maybe_close_from_source(msg:dict):
     if ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE and (msg.get("message_id") == osig.get("src_msg_id")):
         return
 
-    # delay mínimo
+    # delay mínimo p/ evitar “colado”
     opened_epoch = osig.get("src_opened_epoch", 0)
     if opened_epoch and (msg.get("date", 0) - opened_epoch) < MIN_RESULT_DELAY_SEC:
         return
 
-    # calcular resultado vs fonte (se ainda não souber cor do fonte, espera)
+    # calcular resultado vs fonte
     our_res = derive_our_result_from_source_flow(raw_text, osig.get("fonte_side"), osig.get("chosen_side"))
     if our_res is None:
         if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC and _can_extend_ttl(raw_text):
