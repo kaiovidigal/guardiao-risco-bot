@@ -1,4 +1,4 @@
-# app.py — G0 autônomo • Fonte só gatilho • Resultado só após conferir (outra mensagem + delay)
+# app.py — G0 autônomo • 1 sinal por vez (serial) • Resultado só após conferir (outra msg + delay) • Timeout seguro
 import os, json, asyncio, re, pytz, hashlib, random
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -69,8 +69,13 @@ STRICT_RESULT_MODE        = os.getenv("STRICT_RESULT_MODE", "1") == "1"         
 ONLY_ACCEPT_RESULT_IF_OPEN = os.getenv("ONLY_ACCEPT_RESULT_IF_OPEN", "1") == "1"
 MIN_RESULT_DELAY_SEC       = int(os.getenv("MIN_RESULT_DELAY_SEC", "8"))   # exige Xs desde abertura
 ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE = os.getenv("ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE", "1") == "1"
-# (desativamos qualquer fechamento na mesma mensagem)
-DELAY_RESULT_ON_SAME_MESSAGE = float(os.getenv("DELAY_RESULT_ON_SAME_MESSAGE", "0"))
+DELAY_RESULT_ON_SAME_MESSAGE = float(os.getenv("DELAY_RESULT_ON_SAME_MESSAGE", "0"))  # mantido 0
+
+# ===== Serialização (1 sinal por vez) + Timeout =====
+OPEN_STRICT_SERIAL = os.getenv("OPEN_STRICT_SERIAL", "1") == "1"  # não abre se já houver aberto
+OPEN_TTL_SEC = int(os.getenv("OPEN_TTL_SEC", "40"))               # fecha sozinho se não vier resultado
+TIMEOUT_CLOSE_POLICY = os.getenv("TIMEOUT_CLOSE_POLICY", "skip").lower()  # "skip" | "loss"
+POST_TIMEOUT_NOTICE = os.getenv("POST_TIMEOUT_NOTICE", "1") == "1"
 
 # Visual do sinal
 SHOW_DEBUG_ON_ENTRY = os.getenv("SHOW_DEBUG_ON_ENTRY", "1") == "1"
@@ -188,14 +193,14 @@ STATE = {
     "hour_stats": {}, "pattern_ban": {},
     "daily_losses": 0, "hourly_entries": {}, "cooldown_until": None,
     "recent_g0": [],
-    "open_signal": None,  # {"ts","chosen_side","expires_at","text","fonte_side"}
+    "open_signal": None,  # {"ts","chosen_side","opened_epoch","expires_at","text","fonte_side"}
     "totals": {"greens": 0, "reds": 0}, "streak_green": 0,
     "last_publish_ts": None, "processed_updates": deque(maxlen=500),
     "last_summary_hash": None,
     "side_history": deque(maxlen=20),
     "last_tiebreak": "banker",
     "last_raw_text": "",
-    # NOVO: controle da mensagem de abertura
+    # Controle da mensagem de abertura (para não fechar na mesma)
     "last_open_src_msg_id": None,
     "last_open_ts_epoch": None,
 }
@@ -321,6 +326,40 @@ async def publish_entry(final_side:str, dbg_line:str, window_tag:str):
     await tg_send(TARGET_CHAT_ID, "\n".join(lines))
     register_hourly_entry()
 
+# ================== TIMEOUT/HELPERS ==================
+def _is_open_expired() -> bool:
+    osig = STATE.get("open_signal")
+    if not osig:
+        return False
+    try:
+        opened_epoch = int(osig.get("opened_epoch") or 0)
+        return (int(datetime.now(LOCAL_TZ).timestamp()) - opened_epoch) >= OPEN_TTL_SEC
+    except Exception:
+        return True
+
+async def _timeout_close_open_signal(reason: str = "timeout (TTL)"):
+    osig = STATE.get("open_signal")
+    if not osig:
+        return
+    chosen = osig.get("chosen_side")
+
+    if POST_TIMEOUT_NOTICE:
+        side_txt = {"player":"🔵 Player","banker":"🔴 Banker","empate":"🟡 Empate"}.get((chosen or "").lower(),"?")
+        await tg_send(TARGET_CHAT_ID, f"⏳ <i>Encerrado por {reason}</i>\nNossa: {side_txt}")
+
+    if TIMEOUT_CLOSE_POLICY == "loss":
+        await announce_outcome("R", chosen)
+        if SCOREBOARD_FROM_SOURCE:
+            STATE["totals"]["reds"] = STATE["totals"].get("reds", 0) + 1
+            STATE["streak_green"] = 0
+
+    STATE["open_signal"] = None
+    save_state()
+
+async def _check_and_timeout_open():
+    if _is_open_expired():
+        await _timeout_close_open_signal("timeout (TTL)")
+
 # ================== AUTÔNOMO ==================
 async def autonomous_open_from_trigger():
     allow_risk,_ = risk_allows()
@@ -333,6 +372,10 @@ async def autonomous_open_from_trigger():
             if (now_local() - datetime.fromisoformat(last)).total_seconds() < MIN_GAP_SECS:
                 return
         except: pass
+
+    # Serial: se já tem aberto, não abre outro
+    if OPEN_STRICT_SERIAL and STATE.get("open_signal"):
+        return
 
     winner, s_win, s_lose, dbg = compute_scores()
     delta = dbg["delta"]
@@ -362,27 +405,21 @@ async def autonomous_open_from_trigger():
         f"Score P={dbg['score_player']:.2f} • Score B={dbg['score_banker']:.2f} • Δ={delta:.2f}"
     )
 
+    now = now_local()
     STATE["open_signal"] = {
-        "ts": now_local().isoformat(),
+        "ts": now.isoformat(),
+        "opened_epoch": int(now.timestamp()),
         "chosen_side": winner,
-        "expires_at": (now_local()+timedelta(seconds=75)).isoformat(),  # fast close
+        "expires_at": (now + timedelta(seconds=OPEN_TTL_SEC)).isoformat(),
         "text": dbg_line,
         "fonte_side": fonte_side,
     }
-    STATE["last_publish_ts"] = now_local().isoformat()
+    STATE["last_publish_ts"] = now.isoformat()
     if isinstance(hist, deque):
         hist.append(winner)
     save_state()
 
     await publish_entry(winner, dbg_line, window_tag)
-
-async def expire_open_if_needed():
-    osig = STATE.get("open_signal")
-    if not osig: return
-    exp = osig.get("expires_at")
-    if exp and datetime.fromisoformat(exp) <= now_local():
-        STATE["open_signal"] = None
-        save_state()
 
 # ================== PROCESSAMENTO ==================
 async def aux_log(e:dict):
@@ -394,13 +431,6 @@ async def process_signal(text: str):
     low = (text or "").lower()
     if NOISE_RE.search(low):
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"noise","text":text}))
-        return
-    if FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG:
-        await autonomous_open_from_trigger()
-        return
-    gatilho = ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low)
-    if not gatilho:
-        asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"no_trigger","text":text}))
         return
     await autonomous_open_from_trigger()
 
@@ -414,7 +444,7 @@ async def process_result(text: str):
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"result_without_open","text":text}))
         return
 
-    # checagem de tempo (reforço; já validamos no webhook)
+    # reforço: delay mínimo
     try:
         opened = datetime.fromisoformat(osig["ts"])
         if (now_local() - opened).total_seconds() < MIN_RESULT_DELAY_SEC:
@@ -482,10 +512,10 @@ async def daily_report_loop():
             await asyncio.sleep(5)
 
 async def housekeeping_loop():
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
     while True:
         try:
-            await expire_open_if_needed()
+            await _check_and_timeout_open()  # fecha aberto vencido
             await asyncio.sleep(2)
         except Exception:
             await asyncio.sleep(2)
@@ -498,7 +528,7 @@ async def on_startup():
 # ================== ROTAS ==================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 autônomo • Fonte desacoplada • Fecha só após conferir (outra msg + delay)"}
+    return {"ok": True, "service": "G0 autônomo • Serial 1-por-vez • Fecha só após conferir (outra msg + delay) • Timeout"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -528,29 +558,12 @@ async def webhook(req: Request, secret: str|None=None):
     msg_id = msg.get("message_id")
     msg_date_epoch = msg.get("date")  # epoch (segundos)
 
+    # 0) housekeeping e timeout
+    await _check_and_timeout_open()
+
     # ===== comandos no canal destino =====
     if chat.get("id") == TARGET_CHAT_ID:
-        low = (text or "").lower()
-        if low.startswith("/win"):
-            osig = STATE.get("open_signal")
-            chosen = osig.get("chosen_side") if osig else None
-            await announce_outcome("G", chosen)
-            if SCOREBOARD_FROM_SOURCE:
-                STATE["totals"]["greens"] = STATE["totals"].get("greens",0) + 1
-                STATE["streak_green"] = STATE.get("streak_green",0) + 1
-                save_state()
-            STATE["open_signal"] = None
-            return JSONResponse({"ok": True})
-        if low.startswith("/loss"):
-            osig = STATE.get("open_signal")
-            chosen = osig.get("chosen_side") if osig else None
-            await announce_outcome("R", chosen)
-            if SCOREBOARD_FROM_SOURCE:
-                STATE["totals"]["reds"] = STATE["totals"].get("reds",0) + 1
-                STATE["streak_green"] = 0
-                save_state()
-            STATE["open_signal"] = None
-            return JSONResponse({"ok": True})
+        # (opcional) se quiser, adicione /win /loss aqui
         return JSONResponse({"ok": True})
 
     # ===== somente canal-fonte =====
@@ -568,13 +581,13 @@ async def webhook(req: Request, secret: str|None=None):
     has_result  = bool(GREEN_RE.search(text) or RED_RE.search(text)) if text else False
     want_open   = (FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG or has_trigger)
 
-    # 1) Abrir (se ainda não abriu): anotar id/data da msg que abriu
+    # 1) Abrir (serial): só se não houver aberto
     if want_open and not STATE.get("open_signal"):
         STATE["last_open_src_msg_id"] = msg_id
         STATE["last_open_ts_epoch"] = msg_date_epoch
         save_state()
         await process_signal(text or "")
-        # não retorna; deixa seguir para bloquear fechamento na MESMA mensagem
+        # (não retorna; deixa checar caso esta mesma mensagem tenha tokens de resultado)
 
     # 2) Resultado: só aceita se for OUTRA mensagem e após delay mínimo
     if has_result:
@@ -600,5 +613,5 @@ async def webhook(req: Request, secret: str|None=None):
         return JSONResponse({"ok": True})
 
     # 3) Nada mais a fazer
-    asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"no_text_no_open"}))
+    asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"idle"}))
     return JSONResponse({"ok": True})
