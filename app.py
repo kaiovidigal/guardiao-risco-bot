@@ -1,4 +1,4 @@
-# app.py — G0 serial + fechamento só com finalização do fonte + anti-neutro + placar pós-fechamento
+# app.py — G0 serial + fecha só com finalização do fonte + resultado correto vs fonte + placar pós-fechamento
 import os, re, json, asyncio, pytz, logging, random
 from datetime import datetime, timedelta
 from collections import deque
@@ -31,10 +31,10 @@ RESULT_GRACE_EXTEND_SEC   = int(os.getenv("RESULT_GRACE_EXTEND_SEC", "25"))
 TIMEOUT_CLOSE_POLICY      = os.getenv("TIMEOUT_CLOSE_POLICY", "skip")  # skip | loss
 POST_TIMEOUT_NOTICE       = os.getenv("POST_TIMEOUT_NOTICE", "0") == "1"
 
-# >>> PATCH 3: limites de extensão e hard-close
-MAX_OPEN_WINDOW_SEC   = int(os.getenv("MAX_OPEN_WINDOW_SEC", "150"))    # teto de janela para estender TTL
+# Limites de extensão e hard-close
+MAX_OPEN_WINDOW_SEC   = int(os.getenv("MAX_OPEN_WINDOW_SEC", "150"))
 EXTEND_ONLY_ON_RELEVANT = os.getenv("EXTEND_ONLY_ON_RELEVANT", "1") == "1"
-CLOSE_STUCK_AFTER_SEC = int(os.getenv("CLOSE_STUCK_AFTER_SEC", "180"))  # hard-close silencioso se travar
+CLOSE_STUCK_AFTER_SEC = int(os.getenv("CLOSE_STUCK_AFTER_SEC", "180"))
 
 # Exploração (quando delta é baixo)
 EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.35"))
@@ -64,13 +64,18 @@ app = FastAPI()
 log = logging.getLogger("uvicorn.error")
 
 # ================== REGEX ==================
-SIDE_RE = re.compile(r"\b(player|banker|empate|azul|vermelho|blue|red|p\b|b\b)\b", re.I)
+# Palavras e abreviações
+SIDE_WORD_RE = re.compile(r"\b(player|banker|empate|azul|vermelho|blue|red|p\b|b\b)\b", re.I)
+# Emojis comuns no fonte
+EMOJI_PLAYER_RE = re.compile(r"(🔵|🟦)", re.U)
+EMOJI_BANKER_RE = re.compile(r"(🔴|🟥)", re.U)
 
-# fonte finalizou G0 de primeira (sem gale)
+# Finalização do fonte:
+# G0 de primeira (sem gale)
 SOURCE_G0_GREEN_RE = re.compile(
     r"(de\s+primeira|sem\s+gale|bateu\s+g0|\bG0\b|acert(ou|amos)\s+de\s+primeira)", re.I
 )
-# fonte foi para G1/G2
+# foi para G1/G2
 SOURCE_WENT_GALE_RE = re.compile(
     r"((estamos|indo|fomos|vamos)\s+(pro|para|no)\s*g-?\s*[12]\b|gale\s*[12]\b)", re.I
 )
@@ -80,17 +85,28 @@ def now_local(): return datetime.now(LOCAL_TZ)
 def colorize_side(s):
     return {"player":"🔵 Player", "banker":"🔴 Banker", "empate":"🟡 Empate"}.get(s or "", "?")
 
-def normalize_side(token:str|None)->str|None:
-    if not token: return None
-    t=token.lower()
+def normalize_side_token(tok:str|None)->str|None:
+    if not tok: return None
+    t=tok.lower()
     if t in ("player","p","azul","blue"): return "player"
     if t in ("banker","b","vermelho","red"): return "banker"
     if t == "empate": return "empate"
     return None
 
 def extract_side(text:str)->str|None:
-    m = SIDE_RE.search(text or "")
-    return normalize_side(m.group(1)) if m else None
+    """Tenta achar a cor do fonte (palavra OU emoji)."""
+    if not text: return None
+    # 1) palavras
+    m = SIDE_WORD_RE.search(text)
+    if m:
+        s = normalize_side_token(m.group(1))
+        if s: return s
+    # 2) emojis (se só um tipo aparecer)
+    has_p = bool(EMOJI_PLAYER_RE.search(text))
+    has_b = bool(EMOJI_BANKER_RE.search(text))
+    if has_p and not has_b: return "player"
+    if has_b and not has_p: return "banker"
+    return None  # ambíguo ou nada
 
 # ================== STATE ==================
 STATE = {
@@ -98,7 +114,7 @@ STATE = {
     "recent_results": deque(maxlen=TREND_LOOKBACK),
     "totals": {"greens":0, "reds":0},
     "streak_green": 0,
-    "open_signal": None,              # {...} abaixo
+    "open_signal": None,              # {"chosen_side","fonte_side","expires_at","src_msg_id","src_opened_epoch"}
     "last_publish_ts": None,
     "processed_updates": deque(maxlen=500),
     "messages": [],
@@ -184,7 +200,7 @@ def pick_by_streak_fallback():
     # sem info, decide 50/50
     return "player" if random.random()<0.5 else "banker"
 
-# ============ PATCH 3 helpers (limitar extensão / hard-close) ============
+# ============ helpers de janela / extensão ============
 def _open_age_secs():
     osig = STATE.get("open_signal")
     if not osig: return 0
@@ -201,22 +217,30 @@ def _can_extend_ttl(text: str) -> bool:
     low = (text or "").lower()
     # só estende se a mensagem tiver algo relacionado ao lance
     return bool(
-        SIDE_RE.search(low) or
+        SIDE_WORD_RE.search(low) or
+        EMOJI_PLAYER_RE.search(text or "") or
+        EMOJI_BANKER_RE.search(text or "") or
         SOURCE_WENT_GALE_RE.search(low) or
         SOURCE_G0_GREEN_RE.search(low)
     )
 
-# ================== RESULTADO A PARTIR DO FLUXO DO FONTE ==================
+# ================== RESULTADO CORRETO vs FONTE ==================
 def derive_our_result_from_source_flow(text:str, fonte_side:str|None, chosen_side:str|None):
+    """
+    Regras (o que você pediu):
+      - Se fonte foi para G1/G2: igual ao fonte = LOSS; oposto = GREEN
+      - Se fonte G0 de primeira: igual ao fonte = GREEN; oposto = LOSS
+      - Só fecha se fonte_side e chosen_side forem conhecidos
+    """
     if not fonte_side or not chosen_side:
         return None
     low = (text or "").lower()
-    # fonte disse: foi de primeira / sem gale / G0
-    if SOURCE_G0_GREEN_RE.search(low):
-        return "G" if (chosen_side == fonte_side) else "R"
-    # fonte disse: foi para G1 ou G2
+    # PRIORIDADE: se falar que foi G1/G2, tratamos como tal
     if SOURCE_WENT_GALE_RE.search(low):
         return "R" if (chosen_side == fonte_side) else "G"
+    # Se falar que foi G0 (de primeira / sem gale)
+    if SOURCE_G0_GREEN_RE.search(low):
+        return "G" if (chosen_side == fonte_side) else "R"
     return None
 
 # ================== PUBLICAÇÃO ==================
@@ -230,8 +254,9 @@ async def publish_entry(chosen_side:str, fonte_side:str|None, msg:dict):
     STATE["open_signal"] = {
         "ts": now_local().isoformat(),
         "chosen_side": chosen_side,
-        "fonte_side": fonte_side,
-        "expires_at": (now_local()+timedelta(seconds=OPEN_TTL_SEC)).isoformat(),
+        "fonte_side": fonte_side,  # pode ser None; atualizamos depois se aparecer
+        "expires_at": (now_local()+timedelta(seconds=OPEN_TTL_SE
+C)).isoformat(),
         "src_msg_id": msg.get("message_id"),
         "src_opened_epoch": msg.get("date", 0),
     }
@@ -244,6 +269,18 @@ async def announce_outcome(result:str, chosen_side:str|None):
     g=STATE["totals"]["greens"]; r=STATE["totals"]["reds"]; t=g+r; wr=(g/t*100.0) if t else 0.0
     await tg_send(TARGET_CHAT_ID, f"📊 <b>Placar Geral</b>\n✅ {g}   ⛔️ {r}\n🎯 {wr:.2f}%  •  🔥 Streak {STATE['streak_green']}")
 
+# ================== ATUALIZAR COR DO FONTE EM TEMPO REAL ==================
+def maybe_update_fonte_side_from_msg(msg:dict):
+    """Se houver sinal aberto e ainda não sabemos a cor do fonte, tenta extrair do texto/emoji."""
+    osig = STATE.get("open_signal")
+    if not osig: return
+    if osig.get("fonte_side"): return
+    raw = (msg.get("text") or msg.get("caption") or "")
+    side = extract_side(raw)
+    if side:
+        osig["fonte_side"] = side
+        save_state()
+
 # ================== LÓGICA DE ABERTURA ==================
 async def try_open_from_source(msg:dict):
     if OPEN_STRICT_SERIAL and STATE.get("open_signal"):
@@ -254,6 +291,8 @@ async def try_open_from_source(msg:dict):
                 osig=STATE["open_signal"]
                 osig["expires_at"] = (now_local()+timedelta(seconds=RESULT_GRACE_EXTEND_SEC)).isoformat()
                 save_state()
+        # mesmo assim, tenta aprender a cor do fonte se aparecer agora
+        maybe_update_fonte_side_from_msg(msg)
         return
 
     # anti-spam mínimo
@@ -290,6 +329,9 @@ async def maybe_close_from_source(msg:dict):
     raw_text = (msg.get("text") or msg.get("caption") or "")
     low  = raw_text.lower()
 
+    # sempre tentar aprender a cor do fonte se ainda não temos
+    maybe_update_fonte_side_from_msg(msg)
+
     # só fecha se houver confirmação clara do fluxo
     has_flow_confirm = bool(SOURCE_G0_GREEN_RE.search(low) or SOURCE_WENT_GALE_RE.search(low))
     if not has_flow_confirm:
@@ -308,16 +350,15 @@ async def maybe_close_from_source(msg:dict):
     if opened_epoch and (msg.get("date", 0) - opened_epoch) < MIN_RESULT_DELAY_SEC:
         return
 
-    # derivar resultado levando em conta a COR DO FONTE
+    # derivar resultado levando em conta a COR DO FONTE (se ainda não souber, não fecha)
     our_res = derive_our_result_from_source_flow(raw_text, osig.get("fonte_side"), osig.get("chosen_side"))
     if our_res is None:
-        # confirmação chegou mas ainda não sabemos a cor do fonte → espera/prorroga (se relevante)
         if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC and _can_extend_ttl(raw_text):
             osig["expires_at"] = (now_local()+timedelta(seconds=RESULT_GRACE_EXTEND_SEC)).isoformat()
             save_state()
         return
 
-    # aplicar no placar
+    # aplicar no placar conforme regra
     if our_res == "G":
         STATE["totals"]["greens"] += 1
         STATE["streak_green"] += 1
@@ -362,12 +403,12 @@ async def safe_errors(request, call_next):
     try:
         return await call_next(request)
     except Exception as e:
-        log.exception("Middleware error: %s", e)
+        logging.exception("Middleware error: %s", e)
         return JSONResponse({"ok": True}, status_code=200)
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 serial, fechamento por finalização do fonte, anti-neutro"}
+    return {"ok": True, "service": "G0 serial, fechamento por finalização do fonte, resultado correto vs fonte"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -389,7 +430,7 @@ async def webhook(req: Request, secret: str|None=None):
     if chat.get("id") != SOURCE_CHAT_ID:
         return JSONResponse({"ok": True})
 
-    # >>> PATCH 1: aceitar caption além de text
+    # aceitar caption além de text
     text = (msg.get("text") or msg.get("caption") or "").strip()
     if not text:
         return JSONResponse({"ok": True})
@@ -398,8 +439,8 @@ async def webhook(req: Request, secret: str|None=None):
         await tg_send(TARGET_CHAT_ID, text)
 
     low = text.lower()
-    # >>> PATCH 2: abrir só com gatilho real
-    has_trigger = bool(("entrada confirmada" in low) or SIDE_RE.search(low))
+    # abrir só com gatilho real
+    has_trigger = bool(("entrada confirmada" in low) or SIDE_WORD_RE.search(low) or EMOJI_PLAYER_RE.search(text) or EMOJI_BANKER_RE.search(text))
 
     # 1) tentar fechar (se houver confirmação do fluxo)
     if CLOSE_ONLY_ON_FLOW_CONFIRM:
@@ -409,6 +450,6 @@ async def webhook(req: Request, secret: str|None=None):
     if (FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG) and has_trigger:
         await try_open_from_source(msg)
 
-    # 3) tratar TTL e hard-close
+    # 3) TTL / hard-close
     await expire_open_if_needed()
     return JSONResponse({"ok": True})
