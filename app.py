@@ -1,4 +1,4 @@
-# app.py — G0 autônomo no gatilho (independente do canal) + fechamento robusto + anti-vício
+# app.py — G0 autônomo no gatilho (independente do canal) + fechamento robusto (G1/G2=LOSS) + anti-vício
 import os, json, asyncio, re, pytz, hashlib, random
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -54,9 +54,10 @@ AUTO_MIN_MARGIN       = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))
 W_WR, W_HOUR, W_TREND = 0.70, 0.20, 0.10
 
 # Exploração / anti-vício
-EXPLORE_MARGIN = float(os.getenv("EXPLORE_MARGIN", "0.12"))  # delta pequeno
-EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.20"))     # 20% chance underdog
-SIDE_STREAK_CAP= int(os.getenv("SIDE_STREAK_CAP", "7"))      # força alternar após streak
+EXPLORE_MARGIN = float(os.getenv("EXPLORE_MARGIN", "0.15"))  # delta pequeno
+EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.35"))     # 35% chance underdog
+SIDE_STREAK_CAP= int(os.getenv("SIDE_STREAK_CAP", "3"))      # força alternar após streak
+EPS_TIE        = float(os.getenv("EPS_TIE", "0.02"))         # empate técnico alterna
 
 # ================== APP/LOG ==================
 app = FastAPI()
@@ -87,13 +88,31 @@ NOISE_RE   = re.compile(r"(bot\s*online|aposta\s*encerrada|analisando)", re.I)
 RESULT_GREEN_TOKENS_RE = re.compile(r"(✅|green\b|win\b)", re.I)
 RESULT_RED_TOKENS_RE   = re.compile(r"(❌|red\b|lose\b|loss\b|derrota\b|perd)", re.I)
 
+# Detectores de G1/G2 (se foi pro gale, G0 = LOSS)
+G1_HINT_RE = re.compile(r"\b(g-?1|gale\s*1|primeiro\s*gale|indo\s+pro\s*g1|vamos\s+pro\s*g1|\bG1\b)\b", re.I)
+G2_HINT_RE = re.compile(r"\b(g-?2|gale\s*2|segundo\s*gale|indo\s+pro\s*g2|vamos\s+pro\s*g2|\bG2\b)\b", re.I)
+
 def parse_last_outcome(text: str) -> str | None:
-    """Retorna 'G' para green, 'R' para loss, ou None. Vale o ÚLTIMO token no texto."""
-    if not text: return None
+    """
+    Retorna 'G' (green) ou 'R' (loss) considerando G0 apenas.
+    Regras:
+      1) Se houver menção a G1/G2 -> G0 foi LOSS ('R'), mesmo que exista '✅' no texto.
+      2) Caso contrário, vale o ÚLTIMO token de resultado no texto (✅ vs ❌).
+    """
+    if not text:
+        return None
+    low = text.lower()
+
+    # Regra #1: foi para G1 ou G2? então G0 = LOSS
+    if G1_HINT_RE.search(low) or G2_HINT_RE.search(low):
+        return "R"
+
+    # Regra #2: decide pelo último token
     marks = []
     for m in RESULT_GREEN_TOKENS_RE.finditer(text): marks.append((m.start(), "G"))
     for m in RESULT_RED_TOKENS_RE.finditer(text):   marks.append((m.start(), "R"))
-    if not marks: return None
+    if not marks:
+        return None
     marks.sort(key=lambda x: x[0])
     return marks[-1][1]
 
@@ -121,6 +140,7 @@ STATE = {
     "last_publish_ts": None, "processed_updates": deque(maxlen=500),
     "last_summary_hash": None,
     "side_history": deque(maxlen=20),  # sequência recente de lados
+    "last_tiebreak": "banker",         # para alternância em empates
 }
 
 def _ensure_dir(path): d=os.path.dirname(path);  (d and not os.path.exists(d)) and os.makedirs(d, exist_ok=True)
@@ -150,9 +170,9 @@ def load_state():
         data["recent_g0"]=list(data.get("recent_g0") or [])[-10:]
         data.setdefault("hourly_entries", {}); data.setdefault("pattern_ban", {})
         data.setdefault("messages", []); data.setdefault("totals", {"greens":0,"reds":0})
-        # side_history é volátil – se não houver, inicia vazio
         if "side_history" not in data: data["side_history"]=deque(maxlen=20)
         else: data["side_history"]=deque(data["side_history"], maxlen=20)
+        data.setdefault("last_tiebreak","banker")
         STATE=data
     except Exception:
         save_state()
@@ -210,8 +230,16 @@ def compute_scores():
     hb, tb = hour_bonus(), trend_bonus()
     s_p = clamp01((W_WR*wr_p) + (W_HOUR*hb) + (W_TREND*tb))
     s_b = clamp01((W_WR*wr_b) + (W_HOUR*hb) + (W_TREND*tb))
+    # vencedor padrão
     winner, s_win, s_lose = ("player",s_p,s_b) if s_p>=s_b else ("banker",s_b,s_p)
-    return winner, s_win, s_lose, {"score_player":s_p,"score_banker":s_b,"delta":abs(s_p-s_b), "n_p":n_p, "n_b":n_b}
+    dbg = {"score_player":s_p,"score_banker":s_b,"delta":abs(s_p-s_b), "n_p":n_p, "n_b":n_b}
+    # empate técnico → alternar para não viciar
+    if abs(s_p - s_b) <= EPS_TIE:
+        last = STATE.get("last_tiebreak","banker")
+        winner = "player" if last == "banker" else "banker"
+        s_win  = s_p if winner == "player" else s_b
+        STATE["last_tiebreak"] = winner
+    return winner, s_win, s_lose, dbg
 
 def register_hourly_entry():
     k = hour_key()
@@ -315,7 +343,7 @@ async def process_signal(text: str):
     Ao gatilho, decidimos de forma autônoma e abrimos G0.
     """
     low = (text or "").lower()
-    if NOISE_RE.search(low): 
+    if NOISE_RE.search(low):
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"noise","text":text}))
         return
     gatilho = ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low)
@@ -416,7 +444,7 @@ async def on_startup():
 # ================== ROTAS ==================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 autônomo no gatilho (independente do canal)"}
+    return {"ok": True, "service": "G0 autônomo no gatilho (independente do canal) [G1/G2=LOSS]"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -450,7 +478,7 @@ async def webhook(req: Request, secret: str|None=None):
         await tg_send(TARGET_CHAT_ID, colorize_line(text))
         asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
 
-    # Resultados do canal → fechamento
+    # Resultados do canal → fechamento (usa parser com prioridade G1/G2=LOSS)
     if parse_last_outcome(text) in ("G","R"):
         await process_result(text)
         return JSONResponse({"ok": True})
