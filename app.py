@@ -1,4 +1,4 @@
-# app.py — G0 autônomo (independente do canal) + parser G0-first + desacoplado do fonte + /win /loss
+# app.py — G0 autônomo (independente) + parser G0-first + fonte desacoplada + abre em qualquer msg + /win /loss
 import os, json, asyncio, re, pytz, hashlib, random
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -45,10 +45,11 @@ STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ====== Decisão autônoma ======
-FORCE_TRIGGER_OPEN    = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"  # 1 = sempre abre no gatilho
-AUTO_MIN_SIDE_SAMPLES = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))
-AUTO_MIN_SCORE        = float(os.getenv("AUTO_MIN_SCORE", "0.50"))
-AUTO_MIN_MARGIN       = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))
+FORCE_TRIGGER_OPEN          = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"  # 1 = sempre abre no gatilho
+FORCE_OPEN_ON_ANY_SOURCE_MSG= os.getenv("FORCE_OPEN_ON_ANY_SOURCE_MSG", "1") == "1"  # abre em qualquer msg do fonte
+AUTO_MIN_SIDE_SAMPLES       = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))
+AUTO_MIN_SCORE              = float(os.getenv("AUTO_MIN_SCORE", "0.50"))
+AUTO_MIN_MARGIN             = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))
 
 # Pesos do score
 W_WR, W_HOUR, W_TREND = 0.70, 0.20, 0.10
@@ -374,7 +375,7 @@ async def autonomous_open_from_trigger():
     STATE["open_signal"] = {
         "ts": now_local().isoformat(),
         "chosen_side": winner,
-        "expires_at": (now_local()+timedelta(minutes=2)).isoformat(),
+        "expires_at": (now_local()+timedelta(seconds=75)).isoformat(),  # fast-close ~ 75s
         "text": dbg_line,
         "fonte_side": fonte_side,
     }
@@ -403,12 +404,17 @@ async def aux_log(e:dict):
 async def process_signal(text: str):
     """
     Canal-fonte = GATILHO. NÃO copiamos cor.
-    No gatilho, decidimos autonomamente e abrimos G0.
+    No gatilho (ou qualquer msg se destravado), decidimos autonomamente e abrimos G0.
     """
     low = (text or "").lower()
     if NOISE_RE.search(low):
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"noise","text":text}))
         return
+    # Abrir mesmo sem trigger textual quando destravado
+    if FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG:
+        await autonomous_open_from_trigger()
+        return
+    # Caso contrário, precisa ter trigger textual
     gatilho = ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low)
     if not gatilho:
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"no_trigger","text":text}))
@@ -507,7 +513,7 @@ async def on_startup():
 # ================== ROTAS ==================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 autônomo (independente) • G0-first • Fonte desacoplada • /win /loss"}
+    return {"ok": True, "service": "G0 autônomo (independente) • G0-first • Fonte desacoplada • any-msg • /win /loss"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -531,12 +537,14 @@ async def webhook(req: Request, secret: str|None=None):
     msg = update.get("channel_post") or update.get("message") or {}
     chat = (msg.get("chat") or {})
     text = (msg.get("text") or "").strip()
+
+    # >>> NOVO: se vier imagem com legenda, usar a legenda como texto
     if not text:
-        return JSONResponse({"ok": True})
+        text = (msg.get("caption") or "").strip()
 
     # ===== comandos manuais no canal destino =====
     if chat.get("id") == TARGET_CHAT_ID:
-        low = text.lower()
+        low = (text or "").lower()
         if low.startswith("/win"):
             osig = STATE.get("open_signal")
             chosen = osig.get("chosen_side") if osig else None
@@ -564,28 +572,36 @@ async def webhook(req: Request, secret: str|None=None):
     if chat.get("id") != SOURCE_CHAT_ID:
         return JSONResponse({"ok": True})
 
-    # guarda texto bruto para DEBUG (fonte vs escolha)
+    # guarda texto bruto (pode ser vazio) p/ debug
     STATE["last_raw_text"] = text
 
     # (opcional) espelho visual — NÃO interrompe o fluxo
-    if FLOW_THROUGH:
+    if FLOW_THROUGH and text:
         await tg_send(TARGET_CHAT_ID, colorize_line(text))
         asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
 
-    # Resultado do canal → fechamento (parser G0-first)
-    out = parse_last_outcome(text)
+    # 1) Resultado do canal → fechamento (parser G0-first)
+    out = parse_last_outcome(text) if text else None
     if out in ("G","R"):
         await process_result(text)
         return JSONResponse({"ok": True})
-    elif STRICT_RESULT_MODE:
+    elif STRICT_RESULT_MODE and text:
         # ignora posts ambíguos de resultado
         return JSONResponse({"ok": True})
 
-    # Qualquer sinal válido vira GATILHO → abrir autônomo
-    low = text.lower()
-    if ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low):
-        await process_signal(text)
+    # 2) Destravado: abre autônomo mesmo sem trigger textual (qualquer msg do fonte)
+    if FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG:
+        await process_signal(text or "")
         return JSONResponse({"ok": True})
 
-    asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"other", "text": text}))
+    # 3) Se não destravado, só abre quando houver gatilho textual
+    if text:
+        low = text.lower()
+        has_trigger = ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low)
+        if has_trigger:
+            await process_signal(text)
+            return JSONResponse({"ok": True})
+
+    # Sem texto e sem destrave → não faz nada
+    asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"no_text_no_open"}))
     return JSONResponse({"ok": True})
