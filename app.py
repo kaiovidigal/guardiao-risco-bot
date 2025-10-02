@@ -1,4 +1,4 @@
-# app.py — G0 autônomo + fonte só gatilho + detector de resultado rígido + delay mínimo de fechamento
+# app.py — G0 autônomo • Fonte só gatilho • Resultado só após conferir (outra mensagem + delay)
 import os, json, asyncio, re, pytz, hashlib, random
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
@@ -8,13 +8,13 @@ from collections import deque
 
 # ================== ENV ==================
 TG_BOT_TOKEN   = os.environ["TG_BOT_TOKEN"]
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])   # canal-fonte (gatilho/resultado textual)
-TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # canal-destino (publicação e comandos /win /loss)
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])   # canal-fonte
+TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # canal-destino
 
 TZ_NAME        = os.getenv("TZ", "UTC")
 LOCAL_TZ       = pytz.timezone(TZ_NAME)
 
-# Rolling / filtros (internos – não travam se destravado)
+# Rolling / filtros (internos – não travam abertura quando destravado)
 MIN_G0 = float(os.getenv("MIN_G0", "0.95"))
 MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "40"))
 ROLLING_MAX = int(os.getenv("ROLLING_MAX", "800"))
@@ -45,8 +45,8 @@ STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ===== Decisão/autonomia =====
-FORCE_TRIGGER_OPEN            = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"   # sempre abre no gatilho
-FORCE_OPEN_ON_ANY_SOURCE_MSG  = os.getenv("FORCE_OPEN_ON_ANY_SOURCE_MSG", "1") == "1"  # abre em qualquer msg
+FORCE_TRIGGER_OPEN            = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"   # abre no gatilho
+FORCE_OPEN_ON_ANY_SOURCE_MSG  = os.getenv("FORCE_OPEN_ON_ANY_SOURCE_MSG", "1") == "1"  # abre em qualquer msg do fonte
 AUTO_MIN_SIDE_SAMPLES         = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))
 AUTO_MIN_SCORE                = float(os.getenv("AUTO_MIN_SCORE", "0.50"))
 AUTO_MIN_MARGIN               = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))
@@ -65,13 +65,12 @@ LEARN_FROM_SOURCE_RESULTS = os.getenv("LEARN_FROM_SOURCE_RESULTS", "0") == "1"  
 SCOREBOARD_FROM_SOURCE    = os.getenv("SCOREBOARD_FROM_SOURCE", "1") == "1"     # 1 = atualiza placar
 STRICT_RESULT_MODE        = os.getenv("STRICT_RESULT_MODE", "1") == "1"         # 1 = ignora post ambíguo
 
-# ===== Ordem/atraso quando mesma mensagem tem gatilho+resultado =====
-PRIORITIZE_OPEN_BEFORE_RESULT = os.getenv("PRIORITIZE_OPEN_BEFORE_RESULT", "1") == "1"
-DELAY_RESULT_ON_SAME_MESSAGE  = float(os.getenv("DELAY_RESULT_ON_SAME_MESSAGE", "3"))
-
-# ===== Bloqueio anti “placar junto do sinal” =====
+# ===== Regra definitiva: fechar só depois de conferir ====
 ONLY_ACCEPT_RESULT_IF_OPEN = os.getenv("ONLY_ACCEPT_RESULT_IF_OPEN", "1") == "1"
-MIN_RESULT_DELAY_SEC       = int(os.getenv("MIN_RESULT_DELAY_SEC", "6"))  # exige Xs desde a abertura para aceitar resultado
+MIN_RESULT_DELAY_SEC       = int(os.getenv("MIN_RESULT_DELAY_SEC", "8"))   # exige Xs desde abertura
+ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE = os.getenv("ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE", "1") == "1"
+# (desativamos qualquer fechamento na mesma mensagem)
+DELAY_RESULT_ON_SAME_MESSAGE = float(os.getenv("DELAY_RESULT_ON_SAME_MESSAGE", "0"))
 
 # Visual do sinal
 SHOW_DEBUG_ON_ENTRY = os.getenv("SHOW_DEBUG_ON_ENTRY", "1") == "1"
@@ -196,6 +195,9 @@ STATE = {
     "side_history": deque(maxlen=20),
     "last_tiebreak": "banker",
     "last_raw_text": "",
+    # NOVO: controle da mensagem de abertura
+    "last_open_src_msg_id": None,
+    "last_open_ts_epoch": None,
 }
 
 def _ensure_dir(path): d=os.path.dirname(path);  (d and not os.path.exists(d)) and os.makedirs(d, exist_ok=True)
@@ -229,6 +231,8 @@ def load_state():
         else: data["side_history"]=deque(data["side_history"], maxlen=20)
         data.setdefault("last_tiebreak","banker")
         data.setdefault("last_raw_text","")
+        data.setdefault("last_open_src_msg_id", None)
+        data.setdefault("last_open_ts_epoch", None)
         STATE=data
     except Exception:
         save_state()
@@ -304,7 +308,7 @@ def _score_snapshot():
 async def announce_outcome(result: str, chosen_side: str | None):
     big = "🟩🟩🟩 <b>GREEN</b> 🟩🟩🟩" if result == "G" else "🟥🟥🟥 <b>LOSS</b> 🟥🟥🟥"
     ns = {"player":"🔵 Player","banker":"🔴 Banker","empate":"🟡 Empate"}.get((chosen_side or "").lower(),"?")
-    ts = now_local().strftime("⏱ %H:%M:%S")  # carimbo de segundos
+    ts = now_local().strftime("⏱ %H:%M:%S")
     await tg_send(TARGET_CHAT_ID, f"{big}\n{ts}\nNossa: {ns}")
     g, r, wr, streak = _score_snapshot()
     await tg_send(TARGET_CHAT_ID, f"📊 <b>Placar Geral</b>\n✅ {g}   ⛔️ {r}\n🎯 {wr:.2f}%  •  🔥 Streak {streak}")
@@ -313,7 +317,7 @@ async def publish_entry(final_side:str, dbg_line:str, window_tag:str):
     lines = [f"🚀 <b>ENTRADA AUTÔNOMA (G0)</b>{window_tag}",
              "🔵 Player" if final_side=='player' else "🔴 Banker"]
     if SHOW_DEBUG_ON_ENTRY and dbg_line:
-        lines.append(dbg_line)  # sem placar
+        lines.append(dbg_line)  # sem placar aqui
     await tg_send(TARGET_CHAT_ID, "\n".join(lines))
     register_hourly_entry()
 
@@ -380,13 +384,6 @@ async def expire_open_if_needed():
         STATE["open_signal"] = None
         save_state()
 
-async def _delayed_result(text: str, delay: float):
-    try:
-        await asyncio.sleep(max(0.0, delay))
-        await process_result(text)
-    except Exception:
-        pass
-
 # ================== PROCESSAMENTO ==================
 async def aux_log(e:dict):
     STATE["messages"].append(e)
@@ -417,7 +414,7 @@ async def process_result(text: str):
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"result_without_open","text":text}))
         return
 
-    # BLOQUEIO anti “placar junto”: exige delay mínimo desde a abertura
+    # checagem de tempo (reforço; já validamos no webhook)
     try:
         opened = datetime.fromisoformat(osig["ts"])
         if (now_local() - opened).total_seconds() < MIN_RESULT_DELAY_SEC:
@@ -501,7 +498,7 @@ async def on_startup():
 # ================== ROTAS ==================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 autônomo • Fonte desacoplada • Resultado rígido+delay • any-msg • /win /loss"}
+    return {"ok": True, "service": "G0 autônomo • Fonte desacoplada • Fecha só após conferir (outra msg + delay)"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -528,6 +525,9 @@ async def webhook(req: Request, secret: str|None=None):
     if not text:
         text = (msg.get("caption") or "").strip()
 
+    msg_id = msg.get("message_id")
+    msg_date_epoch = msg.get("date")  # epoch (segundos)
+
     # ===== comandos no canal destino =====
     if chat.get("id") == TARGET_CHAT_ID:
         low = (text or "").lower()
@@ -553,7 +553,7 @@ async def webhook(req: Request, secret: str|None=None):
             return JSONResponse({"ok": True})
         return JSONResponse({"ok": True})
 
-    # ===== somente processa o canal-fonte =====
+    # ===== somente canal-fonte =====
     if chat.get("id") != SOURCE_CHAT_ID:
         return JSONResponse({"ok": True})
 
@@ -564,38 +564,41 @@ async def webhook(req: Request, secret: str|None=None):
         asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
 
     low = (text or "").lower()
-    has_trigger = bool( ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low) ) if text else False
-    has_result  = bool( GREEN_RE.search(text) or RED_RE.search(text) ) if text else False
+    has_trigger = bool(("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low)) if text else False
+    has_result  = bool(GREEN_RE.search(text) or RED_RE.search(text)) if text else False
     want_open   = (FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG or has_trigger)
 
-    # Abrir antes de fechar se mesma msg tiver os dois
-    if PRIORITIZE_OPEN_BEFORE_RESULT and want_open and not STATE.get("open_signal"):
+    # 1) Abrir (se ainda não abriu): anotar id/data da msg que abriu
+    if want_open and not STATE.get("open_signal"):
+        STATE["last_open_src_msg_id"] = msg_id
+        STATE["last_open_ts_epoch"] = msg_date_epoch
+        save_state()
         await process_signal(text or "")
+        # não retorna; deixa seguir para bloquear fechamento na MESMA mensagem
 
-    # Aceitar resultado: só se estiver aberto e respeitar delay
+    # 2) Resultado: só aceita se for OUTRA mensagem e após delay mínimo
     if has_result:
         osig = STATE.get("open_signal")
         if ONLY_ACCEPT_RESULT_IF_OPEN and not osig:
             return JSONResponse({"ok": True})
-        if osig:
-            try:
-                opened = datetime.fromisoformat(osig["ts"])
-                if (now_local() - opened).total_seconds() < MIN_RESULT_DELAY_SEC:
-                    return JSONResponse({"ok": True})
-            except Exception:
-                pass
-        # se quiser ainda separar o “mesmo minuto” visualmente:
-        if DELAY_RESULT_ON_SAME_MESSAGE > 0 and PRIORITIZE_OPEN_BEFORE_RESULT:
-            asyncio.create_task(_delayed_result(text, DELAY_RESULT_ON_SAME_MESSAGE))
-            return JSONResponse({"ok": True})
-        else:
-            await process_result(text)
-            return JSONResponse({"ok": True})
 
-    # Se não abriu ainda e queremos abrir → abre agora
-    if not STATE.get("open_signal") and want_open:
-        await process_signal(text or "")
+        if ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE:
+            last_open_id = STATE.get("last_open_src_msg_id")
+            if (last_open_id is not None) and (msg_id == last_open_id):
+                # mesma mensagem que abriu → NÃO fecha
+                return JSONResponse({"ok": True})
+
+        try:
+            opened_epoch = int(STATE.get("last_open_ts_epoch") or 0)
+            if (isinstance(msg_date_epoch, int)) and ((msg_date_epoch - opened_epoch) < MIN_RESULT_DELAY_SEC):
+                # cedo demais → não fecha
+                return JSONResponse({"ok": True})
+        except Exception:
+            pass
+
+        await process_result(text)
         return JSONResponse({"ok": True})
 
+    # 3) Nada mais a fazer
     asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"no_text_no_open"}))
     return JSONResponse({"ok": True})
