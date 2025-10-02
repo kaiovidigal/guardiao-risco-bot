@@ -1,5 +1,5 @@
 # app.py — G0 serial + fechamento só com finalização do fonte + anti-neutro + placar pós-fechamento
-import os, re, json, asyncio, pytz, logging, random, hashlib
+import os, re, json, asyncio, pytz, logging, random
 from datetime import datetime, timedelta
 from collections import deque
 from fastapi import FastAPI, Request
@@ -30,6 +30,11 @@ EXTEND_TTL_ON_ACTIVITY    = os.getenv("EXTEND_TTL_ON_ACTIVITY", "1") == "1"
 RESULT_GRACE_EXTEND_SEC   = int(os.getenv("RESULT_GRACE_EXTEND_SEC", "25"))
 TIMEOUT_CLOSE_POLICY      = os.getenv("TIMEOUT_CLOSE_POLICY", "skip")  # skip | loss
 POST_TIMEOUT_NOTICE       = os.getenv("POST_TIMEOUT_NOTICE", "0") == "1"
+
+# >>> PATCH 3: limites de extensão e hard-close
+MAX_OPEN_WINDOW_SEC   = int(os.getenv("MAX_OPEN_WINDOW_SEC", "150"))    # teto de janela para estender TTL
+EXTEND_ONLY_ON_RELEVANT = os.getenv("EXTEND_ONLY_ON_RELEVANT", "1") == "1"
+CLOSE_STUCK_AFTER_SEC = int(os.getenv("CLOSE_STUCK_AFTER_SEC", "180"))  # hard-close silencioso se travar
 
 # Exploração (quando delta é baixo)
 EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.35"))
@@ -72,8 +77,6 @@ SOURCE_WENT_GALE_RE = re.compile(
 
 # ================== HELPERS ==================
 def now_local(): return datetime.now(LOCAL_TZ)
-def today_str(): return now_local().strftime("%Y-%m-%d")
-
 def colorize_side(s):
     return {"player":"🔵 Player", "banker":"🔴 Banker", "empate":"🟡 Empate"}.get(s or "", "?")
 
@@ -100,7 +103,7 @@ STATE = {
     "processed_updates": deque(maxlen=500),
     "messages": [],
 }
-def _ensure_dir(p): 
+def _ensure_dir(p):
     d=os.path.dirname(p)
     if d and not os.path.exists(d): os.makedirs(d, exist_ok=True)
 
@@ -156,8 +159,7 @@ def side_wr(side:str)->tuple[float,int]:
     return (sum(1 for x in dq if x=="G")/n), n
 
 def is_top_hour_now()->bool:
-    # janela simples: usa histórico do próprio rolling (não carregamos hora a hora aqui)
-    # sempre True por padrão (comportamento neutro)
+    # janela simples: neutra (sempre True)
     return True
 
 def hour_bonus()->float: return 1.0 if is_top_hour_now() else 0.0
@@ -179,10 +181,30 @@ def compute_scores():
         return ("banker", s_b, s_p, {"score_player":s_p, "score_banker":s_b, "delta": s_b-s_p})
 
 def pick_by_streak_fallback():
-    # se precisar decidir sem delta, usa quem teve menos 'G' recentemente
-    last=STATE.get("recent_results",[])
-    # heuristicazinha igualitária
+    # sem info, decide 50/50
     return "player" if random.random()<0.5 else "banker"
+
+# ============ PATCH 3 helpers (limitar extensão / hard-close) ============
+def _open_age_secs():
+    osig = STATE.get("open_signal")
+    if not osig: return 0
+    try:
+        opened = int(osig.get("src_opened_epoch") or 0)
+        now_ep = int(datetime.now(LOCAL_TZ).timestamp())
+        return max(0, now_ep - opened)
+    except Exception:
+        return 0
+
+def _can_extend_ttl(text: str) -> bool:
+    if not EXTEND_ONLY_ON_RELEVANT:
+        return True
+    low = (text or "").lower()
+    # só estende se a mensagem tiver algo relacionado ao lance
+    return bool(
+        SIDE_RE.search(low) or
+        SOURCE_WENT_GALE_RE.search(low) or
+        SOURCE_G0_GREEN_RE.search(low)
+    )
 
 # ================== RESULTADO A PARTIR DO FLUXO DO FONTE ==================
 def derive_our_result_from_source_flow(text:str, fonte_side:str|None, chosen_side:str|None):
@@ -198,7 +220,7 @@ def derive_our_result_from_source_flow(text:str, fonte_side:str|None, chosen_sid
     return None
 
 # ================== PUBLICAÇÃO ==================
-async def publish_entry(chosen_side:str, fonte_side:str|None, msg_id:int, msg_epoch:int):
+async def publish_entry(chosen_side:str, fonte_side:str|None, msg:dict):
     pretty = (
         "🚀 <b>ENTRADA AUTÔNOMA (G0)</b>\n"
         f"{colorize_side(chosen_side)}\n"
@@ -210,8 +232,8 @@ async def publish_entry(chosen_side:str, fonte_side:str|None, msg_id:int, msg_ep
         "chosen_side": chosen_side,
         "fonte_side": fonte_side,
         "expires_at": (now_local()+timedelta(seconds=OPEN_TTL_SEC)).isoformat(),
-        "src_msg_id": msg_id,
-        "src_opened_epoch": msg_epoch,
+        "src_msg_id": msg.get("message_id"),
+        "src_opened_epoch": msg.get("date", 0),
     }
     STATE["last_publish_ts"] = now_local().isoformat()
     save_state()
@@ -225,11 +247,13 @@ async def announce_outcome(result:str, chosen_side:str|None):
 # ================== LÓGICA DE ABERTURA ==================
 async def try_open_from_source(msg:dict):
     if OPEN_STRICT_SERIAL and STATE.get("open_signal"):
-        # já tem aberto → só prorroga TTL se houver atividade
-        if EXTEND_TTL_ON_ACTIVITY:
-            osig=STATE["open_signal"]
-            osig["expires_at"] = (now_local()+timedelta(seconds=RESULT_GRACE_EXTEND_SEC)).isoformat()
-            save_state()
+        # já tem aberto → só prorroga TTL se houver atividade relevante (dentro do teto)
+        if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC:
+            raw = (msg.get("text") or msg.get("caption") or "")
+            if _can_extend_ttl(raw):
+                osig=STATE["open_signal"]
+                osig["expires_at"] = (now_local()+timedelta(seconds=RESULT_GRACE_EXTEND_SEC)).isoformat()
+                save_state()
         return
 
     # anti-spam mínimo
@@ -240,7 +264,9 @@ async def try_open_from_source(msg:dict):
                 return
         except: pass
 
-    fonte_side = extract_side(msg.get("text",""))
+    raw_text = (msg.get("text") or msg.get("caption") or "")
+    fonte_side = extract_side(raw_text)
+
     # escolhe lado
     winner, s_win, s_lose, dbg = compute_scores()
     delta = dbg["delta"]
@@ -254,21 +280,21 @@ async def try_open_from_source(msg:dict):
     await publish_entry(
         chosen_side=winner,
         fonte_side=fonte_side,
-        msg_id=msg.get("message_id"),
-        msg_epoch=msg.get("date", 0)
+        msg=msg
     )
 
 # ================== LÓGICA DE FECHAMENTO ==================
 async def maybe_close_from_source(msg:dict):
     osig = STATE.get("open_signal")
     if not osig: return
-    text = msg.get("text","")
-    low  = text.lower()
+    raw_text = (msg.get("text") or msg.get("caption") or "")
+    low  = raw_text.lower()
 
     # só fecha se houver confirmação clara do fluxo
     has_flow_confirm = bool(SOURCE_G0_GREEN_RE.search(low) or SOURCE_WENT_GALE_RE.search(low))
     if not has_flow_confirm:
-        if EXTEND_TTL_ON_ACTIVITY:
+        # estende TTL apenas se relevante e dentro do teto
+        if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC and _can_extend_ttl(raw_text):
             osig["expires_at"] = (now_local()+timedelta(seconds=RESULT_GRACE_EXTEND_SEC)).isoformat()
             save_state()
         return
@@ -283,10 +309,10 @@ async def maybe_close_from_source(msg:dict):
         return
 
     # derivar resultado levando em conta a COR DO FONTE
-    our_res = derive_our_result_from_source_flow(text, osig.get("fonte_side"), osig.get("chosen_side"))
+    our_res = derive_our_result_from_source_flow(raw_text, osig.get("fonte_side"), osig.get("chosen_side"))
     if our_res is None:
-        # confirmação chegou mas ainda não sabemos a cor do fonte → espera/prorroga
-        if EXTEND_TTL_ON_ACTIVITY:
+        # confirmação chegou mas ainda não sabemos a cor do fonte → espera/prorroga (se relevante)
+        if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC and _can_extend_ttl(raw_text):
             osig["expires_at"] = (now_local()+timedelta(seconds=RESULT_GRACE_EXTEND_SEC)).isoformat()
             save_state()
         return
@@ -309,11 +335,18 @@ async def maybe_close_from_source(msg:dict):
 async def expire_open_if_needed():
     osig = STATE.get("open_signal")
     if not osig: return
+
+    # hard-close se ficar preso mais que CLOSE_STUCK_AFTER_SEC (silencioso; não suja placar)
+    if _open_age_secs() >= CLOSE_STUCK_AFTER_SEC:
+        STATE["open_signal"] = None
+        save_state()
+        return
+
     exp = osig.get("expires_at")
     if not exp: return
     if datetime.fromisoformat(exp) > now_local(): return
 
-    # expirou
+    # expirou 'normal'
     STATE["open_signal"] = None
     save_state()
     if TIMEOUT_CLOSE_POLICY == "loss":
@@ -356,17 +389,26 @@ async def webhook(req: Request, secret: str|None=None):
     if chat.get("id") != SOURCE_CHAT_ID:
         return JSONResponse({"ok": True})
 
-    text = (msg.get("text") or "").strip()
-    if not text: return JSONResponse({"ok": True})
+    # >>> PATCH 1: aceitar caption além de text
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    if not text:
+        return JSONResponse({"ok": True})
+
+    if FLOW_THROUGH:
+        await tg_send(TARGET_CHAT_ID, text)
+
+    low = text.lower()
+    # >>> PATCH 2: abrir só com gatilho real
+    has_trigger = bool(("entrada confirmada" in low) or SIDE_RE.search(low))
 
     # 1) tentar fechar (se houver confirmação do fluxo)
     if CLOSE_ONLY_ON_FLOW_CONFIRM:
         await maybe_close_from_source(msg)
 
-    # 2) abrir (gatilho) — só se não tem aberto
-    if FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG:
+    # 2) abrir (gatilho) — só se não tem aberto E se tem gatilho
+    if (FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG) and has_trigger:
         await try_open_from_source(msg)
 
-    # 3) tratar TTL
+    # 3) tratar TTL e hard-close
     await expire_open_if_needed()
     return JSONResponse({"ok": True})
