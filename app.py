@@ -1,5 +1,5 @@
-# app.py — G0 AUTÔNOMO no gatilho do canal (sem espelhamento) + GREEN/LOSS gigante + Placar
-import os, json, asyncio, re, pytz, hashlib
+# app.py — G0 autônomo no gatilho (independente do canal) + fechamento robusto + anti-vício
+import os, json, asyncio, re, pytz, hashlib, random
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -8,13 +8,13 @@ from collections import deque
 
 # ================== ENV ==================
 TG_BOT_TOKEN   = os.environ["TG_BOT_TOKEN"]
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])   # canal-fonte (GATILHO)
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])   # canal-fonte (apenas gatilho)
 TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # canal destino (publicação)
 
 TZ_NAME        = os.getenv("TZ", "UTC")
 LOCAL_TZ       = pytz.timezone(TZ_NAME)
 
-# Rolling / filtros (para métricas, não travam a abertura quando FORCE_TRIGGER_OPEN=1)
+# Rolling / filtros (para métricas; não travam abertura quando FORCE_TRIGGER_OPEN=1)
 MIN_G0 = float(os.getenv("MIN_G0", "0.95"))
 MIN_SAMPLES_BEFORE_FILTER = int(os.getenv("MIN_SAMPLES_BEFORE_FILTER", "40"))
 ROLLING_MAX = int(os.getenv("ROLLING_MAX", "800"))
@@ -36,7 +36,7 @@ HOURLY_CAP              = int(os.getenv("HOURLY_CAP", "20"))
 
 # Fluxo
 MIN_GAP_SECS = int(os.getenv("MIN_GAP_SECS", "5"))    # anti-spam leve
-FLOW_THROUGH = os.getenv("FLOW_THROUGH", "0") == "1"  # NÃO usar espelho; se ligar, não interrompemos o fluxo
+FLOW_THROUGH = os.getenv("FLOW_THROUGH", "0") == "1"  # espelho visual opcional (não impacta decisão)
 LOG_RAW      = os.getenv("LOG_RAW", "1") == "1"
 DISABLE_WINDOWS = os.getenv("DISABLE_WINDOWS", "0") == "1"
 DISABLE_RISK    = os.getenv("DISABLE_RISK", "1") == "1"
@@ -45,14 +45,18 @@ STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # ====== Autônomo (decisão independente) ======
-# Abre G0 sempre que houver gatilho do fonte (sem copiar lado). Decide via score.
-FORCE_TRIGGER_OPEN   = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"  # 1 = sempre abre ao gatilho
-AUTO_MIN_SIDE_SAMPLES = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))  # 0 = pode abrir mesmo com pouco histórico
-AUTO_MIN_SCORE        = float(os.getenv("AUTO_MIN_SCORE", "0.50"))     # score mínimo do vencedor
-AUTO_MIN_MARGIN       = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))    # separação mínima entre scores
+FORCE_TRIGGER_OPEN    = os.getenv("FORCE_TRIGGER_OPEN", "1") == "1"  # 1 = sempre abre no gatilho
+AUTO_MIN_SIDE_SAMPLES = int(os.getenv("AUTO_MIN_SIDE_SAMPLES", "0"))
+AUTO_MIN_SCORE        = float(os.getenv("AUTO_MIN_SCORE", "0.50"))
+AUTO_MIN_MARGIN       = float(os.getenv("AUTO_MIN_MARGIN", "0.05"))
 
 # Pesos do score
 W_WR, W_HOUR, W_TREND = 0.70, 0.20, 0.10
+
+# Exploração / anti-vício
+EXPLORE_MARGIN = float(os.getenv("EXPLORE_MARGIN", "0.12"))  # delta pequeno
+EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.20"))     # 20% chance underdog
+SIDE_STREAK_CAP= int(os.getenv("SIDE_STREAK_CAP", "7"))      # força alternar após streak
 
 # ================== APP/LOG ==================
 app = FastAPI()
@@ -76,11 +80,22 @@ async def safe_errors(request, call_next):
         return JSONResponse({"ok": True}, status_code=200)
 
 # ================== REGEX / PARSE ==================
-# gatilhos clássicos de bac bo/fonte (não vamos copiar lado, só acionar o autônomo)
 SIDE_ALIASES_RE = re.compile(r"\b(player|banker|empate|p\b|b\b|azul|vermelho|blue|red)\b", re.I)
 NOISE_RE   = re.compile(r"(bot\s*online|aposta\s*encerrada|analisando)", re.I)
-GREEN_RE   = re.compile(r"(green|win|✅)", re.I)
-RED_RE     = re.compile(r"(red|lose|perd|loss|derrota|❌)", re.I)
+
+# Resultado: tokens e parser “último evento”
+RESULT_GREEN_TOKENS_RE = re.compile(r"(✅|green\b|win\b)", re.I)
+RESULT_RED_TOKENS_RE   = re.compile(r"(❌|red\b|lose\b|loss\b|derrota\b|perd)", re.I)
+
+def parse_last_outcome(text: str) -> str | None:
+    """Retorna 'G' para green, 'R' para loss, ou None. Vale o ÚLTIMO token no texto."""
+    if not text: return None
+    marks = []
+    for m in RESULT_GREEN_TOKENS_RE.finditer(text): marks.append((m.start(), "G"))
+    for m in RESULT_RED_TOKENS_RE.finditer(text):   marks.append((m.start(), "R"))
+    if not marks: return None
+    marks.sort(key=lambda x: x[0])
+    return marks[-1][1]
 
 def now_local(): return datetime.now(LOCAL_TZ)
 def today_str(): return now_local().strftime("%Y-%m-%d")
@@ -105,6 +120,7 @@ STATE = {
     "totals": {"greens": 0, "reds": 0}, "streak_green": 0,
     "last_publish_ts": None, "processed_updates": deque(maxlen=500),
     "last_summary_hash": None,
+    "side_history": deque(maxlen=20),  # sequência recente de lados
 }
 
 def _ensure_dir(path): d=os.path.dirname(path);  (d and not os.path.exists(d)) and os.makedirs(d, exist_ok=True)
@@ -125,7 +141,6 @@ def load_state():
     global STATE
     try:
         with open(STATE_PATH,"r",encoding="utf-8") as f: data=json.load(f)
-        # reidrata deques
         pr=data.get("pattern_roll") or {}
         for k,v in list(pr.items()):
             try: pr[k]=deque(v,maxlen=ROLLING_MAX)
@@ -135,6 +150,9 @@ def load_state():
         data["recent_g0"]=list(data.get("recent_g0") or [])[-10:]
         data.setdefault("hourly_entries", {}); data.setdefault("pattern_ban", {})
         data.setdefault("messages", []); data.setdefault("totals", {"greens":0,"reds":0})
+        # side_history é volátil – se não houver, inicia vazio
+        if "side_history" not in data: data["side_history"]=deque(maxlen=20)
+        else: data["side_history"]=deque(data["side_history"], maxlen=20)
         STATE=data
     except Exception:
         save_state()
@@ -145,9 +163,17 @@ def rolling_append(side:str,res:str):
     dq=STATE["pattern_roll"].setdefault(side,deque(maxlen=ROLLING_MAX)); dq.append(res)
     h=hour_str(); hst=STATE["hour_stats"].setdefault(h,{"g":0,"t":0}); hst["t"]+=1; (res=="G") and (hst.__setitem__("g", hst["g"]+1))
 
-def side_wr(side:str)->tuple[float,int]:
-    dq=STATE["pattern_roll"].get(side,deque()); n=len(dq)
-    return (0.0,0) if n==0 else (sum(1 for x in dq if x=="G")/n, n)
+def side_wr(side: str, alpha: int = 8, beta: int = 8) -> tuple[float, int]:
+    """
+    Winrate suavizado (Bayes) com prior Beta(alpha,beta) ~ 0.5.
+    Evita viciar no primeiro lado que ganhar.
+    Retorna (wr_suavizado, n_real).
+    """
+    dq = STATE["pattern_roll"].get(side, deque())
+    n = len(dq)
+    g = sum(1 for x in dq if x == "G")
+    wr_smooth = (g + alpha) / (n + alpha + beta) if (n + alpha + beta) > 0 else 0.5
+    return wr_smooth, n
 
 def is_top_hour_now()->bool:
     if DISABLE_WINDOWS: return True
@@ -219,7 +245,6 @@ async def publish_entry(final_side:str, dbg:str, window_tag:str):
 
 # ================== AUTÔNOMO NO GATILHO ==================
 async def autonomous_open_from_trigger():
-    # risco (apenas barra se explicitamente habilitado)
     allow_risk,_ = risk_allows()
     if not allow_risk and not FORCE_TRIGGER_OPEN:
         return
@@ -236,17 +261,26 @@ async def autonomous_open_from_trigger():
     winner, s_win, s_lose, dbg = compute_scores()
     delta = dbg["delta"]
 
-    # checagens leves (ou força abertura)
+    # exploração leve (anti-vício)
+    if delta < EXPLORE_MARGIN:
+        underdog = "banker" if winner == "player" else "player"
+        if random.random() < EXPLORE_EPS:
+            winner, s_win = underdog, (dbg["score_banker"] if underdog == "banker" else dbg["score_player"])
+
+    # quebra de streak muito longa
+    hist = STATE.get("side_history")
+    if isinstance(hist, deque) and len(hist) >= SIDE_STREAK_CAP and all(x == hist[-1] for x in list(hist)[-SIDE_STREAK_CAP:]):
+        winner = "banker" if hist[-1] == "player" else "player"
+
+    # checagens (se não for forçado)
     if not FORCE_TRIGGER_OPEN:
         if min(dbg["n_p"], dbg["n_b"]) < AUTO_MIN_SIDE_SAMPLES: return
         if s_win < AUTO_MIN_SCORE: return
         if delta < AUTO_MIN_MARGIN: return
 
-    # etiqueta de janela
     window_tag = "" if is_top_hour_now() else " <i>(fora da janela de ouro)</i>"
     header = f"Score P={dbg['score_player']:.2f} • Score B={dbg['score_banker']:.2f} • Δ={delta:.2f}"
 
-    # abre
     STATE["open_signal"] = {
         "ts": now_local().isoformat(),
         "chosen_side": winner,
@@ -254,6 +288,8 @@ async def autonomous_open_from_trigger():
         "text": header
     }
     STATE["last_publish_ts"] = now_local().isoformat()
+    if isinstance(hist, deque):
+        hist.append(winner)
     save_state()
 
     await publish_entry(winner, header, window_tag)
@@ -278,19 +314,22 @@ async def process_signal(text: str):
     Canal-fonte serve apenas de GATILHO. NÃO copiamos cor.
     Ao gatilho, decidimos de forma autônoma e abrimos G0.
     """
-    # checa gatilho
     low = (text or "").lower()
+    if NOISE_RE.search(low): 
+        asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"noise","text":text}))
+        return
     gatilho = ("entrada confirmada" in low) or SIDE_ALIASES_RE.search(low)
     if not gatilho:
         asyncio.create_task(aux_log({"ts":now_local().isoformat(),"type":"no_trigger","text":text}))
         return
-
     await autonomous_open_from_trigger()
 
 async def process_result(text: str):
-    is_green = bool(GREEN_RE.search(text))
-    is_red   = bool(RED_RE.search(text))
-    if not (is_green or is_red): return
+    out = parse_last_outcome(text)
+    if out not in ("G", "R"):  # não achou resultado
+        return
+    is_green = (out == "G")
+    is_red   = (out == "R")
 
     osig = STATE.get("open_signal")
     if not osig:
@@ -412,7 +451,7 @@ async def webhook(req: Request, secret: str|None=None):
         asyncio.create_task(aux_log({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
 
     # Resultados do canal → fechamento
-    if GREEN_RE.search(text) or RED_RE.search(text):
+    if parse_last_outcome(text) in ("G","R"):
         await process_result(text)
         return JSONResponse({"ok": True})
 
