@@ -1,7 +1,9 @@
-# app.py — pipeline G0 (corte rígido ≥95% e ≥40 amostras) + 5 especialistas, dedup e contagem real
+# app.py — pipeline G0 (corte rígido ≥95% e ≥40 amostras) + 5 especialistas
+#            + override opcional (decisão própria) + GREEN/LOSS grande + placar
 import os, json, asyncio, re, pytz, hashlib
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import httpx
 import logging
 from collections import deque
@@ -51,7 +53,6 @@ STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 # === Override / decisão própria (opcional) ===
-# Ative com DECISION_STRATEGY=override (mantém canal como gatilho/fluxo)
 DECISION_STRATEGY = os.getenv("DECISION_STRATEGY", "").lower()  # "override" para ativar
 
 P_MIN_OVERRIDE = float(os.getenv("P_MIN_OVERRIDE", "0.62"))
@@ -69,15 +70,11 @@ app = FastAPI()
 log = logging.getLogger("uvicorn.error")
 
 # ============= REGRAS DE TEXTO =============
-PATTERN_RE = re.compile(r"(banker|player|empate|bac\s*bo|bacbo|dados|entrada\s*confirmada|odd|even)", re.I)
+PATTERN_RE = re.compile(r"(banker|player|empate|bac\s*bo|dados|entrada\s*confirmada|odd|even)", re.I)
 NOISE_RE   = re.compile(r"(bot\s*online|estamos\s+no\s+\d+º?\s*gale|aposta\s*encerrada|analisando)", re.I)
 GREEN_RE   = re.compile(r"(green|win|✅)", re.I)
 RED_RE     = re.compile(r"(red|lose|perd|loss|derrota|❌)", re.I)
-
-# lados com palavras e emojis (🔵/🔴, azul/vermelho, p/b)
-SIDE_RE    = re.compile(r"\b(player|banker|empate|p|b|azul|vermelho|blue|red)\b", re.I)
-EMOJI_PLAYER_RE = re.compile(r"(🔵|🟦)", re.U)
-EMOJI_BANKER_RE = re.compile(r"(🔴|🟥)", re.U)
+SIDE_RE    = re.compile(r"\b(player|banker|empate|azul|vermelho|blue|red|p|b)\b", re.I)
 
 def now_local(): return datetime.now(LOCAL_TZ)
 def today_str(): return now_local().strftime("%Y-%m-%d")
@@ -92,21 +89,18 @@ def extract_pattern(text: str) -> str|None:
 def colorize_line(text: str) -> str:
     t = text
     t = re.sub(r"\b(player|p|azul|blue)\b",  "🔵 Player", t, flags=re.I)
-    t = re.sub(r"\b(banker|b|vermelho|red)\b",  "🔴 Banker", t, flags=re.I)
-    t = re.sub(r"\bempate\b",  "🟡 Empate", t, flags=re.I)
+    t = re.sub(r"\b(banker|b|vermelho|red)\b","🔴 Banker", t, flags=re.I)
+    t = re.sub(r"\bempate\b",                "🟡 Empate", t, flags=re.I)
     return t
 
 def extract_side(text: str) -> str|None:
-    """Retorna 'player' | 'banker' | 'empate' ou None (suporta emojis e sinônimos)."""
-    s = text or ""
-    if EMOJI_PLAYER_RE.search(s): return "player"
-    if EMOJI_BANKER_RE.search(s): return "banker"
-    m = SIDE_RE.search(s)
+    """Retorna 'player' | 'banker' | 'empate' ou None."""
+    m = SIDE_RE.search(text or "")
     if not m: return None
-    g = m.group(1).lower()
-    if g in ("player","p","azul","blue"): return "player"
-    if g in ("banker","b","vermelho","red"): return "banker"
-    if g == "empate": return "empate"
+    k = m.group(1).lower()
+    if k in ("player","p","azul","blue"): return "player"
+    if k in ("banker","b","vermelho","red"): return "banker"
+    if k == "empate": return "empate"
     return None
 
 # ============= STATE =============
@@ -114,7 +108,7 @@ STATE = {
     "messages": [],                     # histórico leve
     "last_reset_date": None,
 
-    "pattern_roll": {},                 # pattern -> deque("G"/"R")
+    "pattern_roll": {},                 # pattern/side -> deque("G"/"R")
     "recent_results": deque(maxlen=TREND_LOOKBACK),  # últimos resultados aprovados (G/R)
 
     "hour_stats": {},                   # "00".."23" -> {"g":int,"t":int}
@@ -138,16 +132,37 @@ def _ensure_dir(path):
     d = os.path.dirname(path)
     if d and not os.path.exists(d): os.makedirs(d, exist_ok=True)
 
+def _jsonable(o):
+    from collections import deque as _dq
+    if isinstance(o, _dq): return list(o)
+    if isinstance(o, dict): return {k:_jsonable(v) for k,v in o.items()}
+    if isinstance(o, list): return [_jsonable(x) for x in o]
+    return o
+
 def save_state():
     _ensure_dir(STATE_PATH)
     tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f: json.dump(STATE, f, ensure_ascii=False)
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(_jsonable(STATE), f, ensure_ascii=False)
     os.replace(tmp, STATE_PATH)
 
 def load_state():
     global STATE
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f: STATE = json.load(f)
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # reidrata deques
+        pr = data.get("pattern_roll") or {}
+        for k,v in list(pr.items()):
+            try: pr[k] = deque(v, maxlen=ROLLING_MAX)
+            except: pr[k] = deque(maxlen=ROLLING_MAX)
+        data["pattern_roll"] = pr
+        data["recent_results"] = deque(data.get("recent_results") or [], maxlen=TREND_LOOKBACK)
+        data["recent_g0"] = list(data.get("recent_g0") or [])[-10:]
+        data.setdefault("hourly_entries", {})
+        data.setdefault("pattern_ban", {})
+        data.setdefault("messages", [])
+        data.setdefault("totals", {"greens":0,"reds":0})
+        STATE = data
     except Exception:
         save_state()
 load_state()
@@ -279,16 +294,8 @@ def risk_allows() -> tuple[bool, str]:
         return False, "streak_guard"
     return True, ""
 
-# ============= TELEGRAM ============
-async def tg_send(chat_id: int, text: str, disable_preview=True):
-    async with httpx.AsyncClient(timeout=20) as cli:
-        await cli.post(f"{API}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": disable_preview})
-
-# ============= OVERRIDE: scoring ============
+# ====== OVERRIDE: métricas por lado ======
 def side_wr(side: str) -> tuple[float, int]:
-    """WR e amostras do rolling para um lado específico ('player'/'banker'/'empate')."""
     dq = STATE["pattern_roll"].get(side, deque())
     n = len(dq)
     if n == 0:
@@ -297,11 +304,9 @@ def side_wr(side: str) -> tuple[float, int]:
     return wr, n
 
 def hour_bonus() -> float:
-    """Retorna 1.0 se estamos na janela de ouro; 0.0 caso contrário (para virar bônus)."""
     return 1.0 if is_top_hour_now() else 0.0
 
 def trend_bonus() -> float:
-    """Bônus leve baseado na tendência global recente (mesma base do especialista 2)."""
     dq = list(STATE["recent_results"])
     n = len(dq)
     if n == 0:
@@ -309,13 +314,17 @@ def trend_bonus() -> float:
     wr = sum(1 for x in dq if x == "G") / n
     return max(0.0, min(1.0, wr))
 
+def clamp01(x: float) -> float:
+    if x < 0.0: return 0.0
+    if x > 1.0: return 1.0
+    return x
+
 def compute_override(text: str) -> tuple[str|None, dict]:
     """
     Decide entre 'player' e 'banker' (ignora 'empate' para override).
-    Retorna (side_escolhido_ou_None, debug_dict).
-    Se None, mantenha lado do fonte.
+    Retorna (side_escolhido_ou_None, debug_dict). Se None, mantemos o lado do fonte.
     """
-    fonte = extract_side(text)  # pode ser None
+    fonte = extract_side(text)
     if fonte in (None, "empate"):
         return None, {"reason": "no_override_on_empate_or_none"}
 
@@ -331,22 +340,16 @@ def compute_override(text: str) -> tuple[str|None, dict]:
     hb = hour_bonus()
     tb = trend_bonus()
 
-    # fonte_bias: empurra levemente o lado sugerido pelo canal (sem espelhar cegamente)
     bias_player = SOURCE_BIAS if fonte == "player" else 0.0
     bias_banker = SOURCE_BIAS if fonte == "banker" else 0.0
 
-    score_player = (W_WR * wr_player) + (W_HOUR * hb) + (W_TREND * tb) + bias_player
-    score_banker = (W_WR * wr_banker) + (W_HOUR * hb) + (W_TREND * tb) + bias_banker
-
-    score_player = max(0.0, min(1.0, score_player))
-    score_banker = max(0.0, min(1.0, score_banker))
+    score_player = clamp01((W_WR * wr_player) + (W_HOUR * hb) + (W_TREND * tb) + bias_player)
+    score_banker = clamp01((W_WR * wr_banker) + (W_HOUR * hb) + (W_TREND * tb) + bias_banker)
 
     if score_player >= score_banker:
-        winner, loser = "player", "banker"
-        s_win, s_lose = score_player, score_banker
+        winner, s_win, s_lose = "player", score_player, score_banker
     else:
-        winner, loser = "banker", "player"
-        s_win, s_lose = score_banker, score_player
+        winner, s_win, s_lose = "banker", score_banker, score_player
 
     delta = s_win - s_lose
     passes = (s_win >= P_MIN_OVERRIDE) and (delta >= MARGEM_MIN)
@@ -364,6 +367,16 @@ def compute_override(text: str) -> tuple[str|None, dict]:
 
     return (winner if passes else None), dbg
 
+# ============= TELEGRAM ============
+async def tg_send(chat_id: int, text: str, disable_preview=True):
+    try:
+        async with httpx.AsyncClient(timeout=20) as cli:
+            await cli.post(f"{API}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                      "disable_web_page_preview": disable_preview})
+    except Exception as e:
+        log.error("tg_send error: %s", e)
+
 # ============= PROCESSAMENTO ============
 async def process_signal(text: str):
     daily_reset_if_needed()
@@ -374,12 +387,12 @@ async def process_signal(text: str):
         return
 
     pattern = extract_pattern(text)
-    gatilho = ("entrada confirmada" in low) or re.search(r"\b(banker|player|empate|bac\s*bo|bacbo|dados)\b", low)
+    gatilho = ("entrada confirmada" in low) or re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)
     if not gatilho:
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"no_trigger","text":text}))
         return
     if not pattern and "entrada confirmada" in low:
-        pattern = "bacbo"   # <- ajustado p/ Bac Bo
+        pattern = "bacbo"  # apenas rótulo interno
 
     # Especialista 4: streak/ban
     ok, why = streak_ban_allows(pattern)
@@ -390,8 +403,8 @@ async def process_signal(text: str):
 
     # Especialista 1: G0 rolling — CORTE RÍGIDO (≥95% e ≥40 amostras)
     allow_g0, wr_g0, n_g0 = g0_allows(pattern)
-    if (n_g0 < 40) or (wr_g0 < 0.95):
-        log.info("REPROVADO G0 (rigid): wr=%.2f am=%d (cut 95%% / 40 am.)", wr_g0, n_g0)
+    if (n_g0 < MIN_SAMPLES_BEFORE_FILTER) or (wr_g0 < MIN_G0):
+        log.info("REPROVADO G0 (rigid): wr=%.2f am=%d (cut %.0f%% / %d am.)", wr_g0, n_g0, MIN_G0*100, MIN_SAMPLES_BEFORE_FILTER)
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(),"type":"rejected_g0_strict","wr":wr_g0,"n":n_g0,"pattern":pattern,"text":text}))
         return
 
@@ -434,13 +447,11 @@ async def process_signal(text: str):
         chosen_side, dbg_override = compute_override(text)
         if chosen_side and fonte_side not in (None, "empate") and chosen_side != fonte_side:
             override_tag = " <i>(override ao fonte)</i>"
-            # Ajusta o "pattern" para o lado escolhido, garantindo que o rolling conte no lado correto
+            # conta rolling no lado escolhido
             pattern = chosen_side
 
     # ====== Publica ======
     pretty = colorize_line(text)
-
-    # Prefixo claro informando a direção final quando houver override
     if chosen_side:
         dir_txt = "🔵 Player" if chosen_side == "player" else "🔴 Banker"
         pretty = f"{dir_txt}{override_tag}\n{pretty}"
@@ -473,6 +484,17 @@ async def process_signal(text: str):
     await tg_send(TARGET_CHAT_ID, msg)
     register_hourly_entry()
 
+async def announce_outcome(result: str, chosen_side: str | None):
+    big = "🟩🟩🟩 <b>GREEN</b> 🟩🟩🟩" if result == "G" else "🟥🟥🟥 <b>LOSS</b> 🟥🟥🟥"
+    ns = {"player":"🔵 Player","banker":"🔴 Banker","empate":"🟡 Empate"}.get((chosen_side or "").lower(),"?")
+    await tg_send(TARGET_CHAT_ID, f"{big}\nNossa: {ns or '?'}")
+
+    g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
+    t = g + r
+    wr = (g/t*100.0) if t else 0.0
+    streak = STATE.get("streak_green", 0)
+    await tg_send(TARGET_CHAT_ID, f"📊 <b>Placar Geral</b>\n✅ {g}   ⛔️ {r}\n🎯 {wr:.2f}%  •  🔥 Streak {streak}")
+
 async def process_result(text: str):
     patt_hint = extract_pattern(text)
     is_green = bool(GREEN_RE.search(text))
@@ -492,7 +514,7 @@ async def process_result(text: str):
     if res == "R":
         STATE["daily_losses"] = STATE.get("daily_losses", 0) + 1
 
-    # contagem real
+    # contagem real + streak
     if res == "G":
         STATE["totals"]["greens"] += 1
         STATE["streak_green"] = STATE.get("streak_green", 0) + 1
@@ -506,18 +528,20 @@ async def process_result(text: str):
         if tail and tail.endswith("R"*BAN_AFTER_CONSECUTIVE_R):
             ban_pattern(patt_hint, f"{BAN_AFTER_CONSECUTIVE_R} REDS seguidos")
 
-    # resumo (dedup)
+    # resumo (dedup) — mantém o antigo também, pra constar
     g = STATE["totals"]["greens"]; r = STATE["totals"]["reds"]
     total = g + r
     wr_day = (g/total*100.0) if total else 0.0
     resumo = f"✅ {g} ⛔️ {r} 🎯 Acertamos {wr_day:.2f}%\n🥇 ESTAMOS A {STATE['streak_green']} GREENS SEGUIDOS ⏳"
     digest = hashlib.md5(resumo.encode("utf-8")).hexdigest()
     if digest != STATE.get("last_summary_hash"):
-        await tg_send(TARGET_CHAT_ID, resumo)
         STATE["last_summary_hash"] = digest
+        await tg_send(TARGET_CHAT_ID, resumo)
+
+    # GREEN/LOSS grande + placar geral
+    await announce_outcome(res, extract_side(STATE.get("open_signal",{}).get("text","")))
 
     STATE["open_signal"] = None
-
     asyncio.create_task(aux_log_history({
         "ts": now_local().isoformat(),
         "type": "result_green" if is_green else "result_red",
@@ -590,14 +614,21 @@ async def root():
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
 async def webhook(req: Request, secret: str|None=None):
-    update = await req.json()
+    # tolerante a payload estranho (evita 5xx no Render)
+    try:
+        update = await req.json()
+    except Exception:
+        body = (await req.body())[:1000]
+        if LOG_RAW: log.info("RAW(non-json): %r", body)
+        return JSONResponse({"ok": True})
+
     if LOG_RAW: log.info("RAW UPDATE: %s", update)
 
     # DEDUP por update_id do Telegram
     up_id = update.get("update_id")
     if up_id is not None:
         if up_id in STATE["processed_updates"]:
-            return {"ok": True}
+            return JSONResponse({"ok": True})
         STATE["processed_updates"].append(up_id)
 
     msg = update.get("channel_post") or {}
@@ -606,23 +637,23 @@ async def webhook(req: Request, secret: str|None=None):
     text = (msg.get("text") or "").strip()
 
     if not text or chat_id != SOURCE_CHAT_ID:
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     if FLOW_THROUGH:
         await tg_send(TARGET_CHAT_ID, colorize_line(text))
         asyncio.create_task(aux_log_history({"ts": now_local().isoformat(), "type":"mirror", "text": text}))
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     low = text.lower()
 
     if GREEN_RE.search(text) or RED_RE.search(text):
         await process_result(text)
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     if (("entrada confirmada" in low) or
-        re.search(r"\b(banker|player|empate|bac\s*bo|bacbo|dados)\b", low)):
+        re.search(r"\b(banker|player|empate|bac\s*bo|dados)\b", low)):
         await process_signal(text)
-        return {"ok": True}
+        return JSONResponse({"ok": True})
 
     asyncio.create_task(aux_log_history({"ts": now_local().isoformat(), "type":"other", "text": text}))
-    return {"ok": True}
+    return JSONResponse({"ok": True})
