@@ -1,4 +1,4 @@
-# app.py — G0 serial + fechamento rápido vs fonte + 5 especialistas de abertura (layout novo GREEN/LOSS)
+# app.py — G0 serial + fechamento rápido vs fonte + 5 especialistas + LOSS (🔴🔴🔴)/(🔵🔵🔵)
 import os, re, json, asyncio, pytz, logging, random
 from datetime import datetime, timedelta
 from collections import deque
@@ -22,7 +22,7 @@ FORCE_OPEN_ON_ANY_SOURCE_MSG = os.getenv("FORCE_OPEN_ON_ANY_SOURCE_MSG", "1") ==
 # Fechamento controlado (primeiro desfecho do fonte)
 CLOSE_ONLY_ON_FLOW_CONFIRM = os.getenv("CLOSE_ONLY_ON_FLOW_CONFIRM", "1") == "1"
 ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE = os.getenv("ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE", "1") == "1"
-MIN_RESULT_DELAY_SEC = int(os.getenv("MIN_RESULT_DELAY_SEC", "6"))
+MIN_RESULT_DELAY_SEC = int(os.getenv("MIN_RESULT_DELAY_SEC", "8"))
 
 # Timeout / janela de vida do sinal
 OPEN_TTL_SEC              = int(os.getenv("OPEN_TTL_SEC", "90"))
@@ -52,7 +52,7 @@ TOP_HOURS_MIN_SAMPLES = int(os.getenv("TOP_HOURS_MIN_SAMPLES", "25"))
 TOP_HOURS_MIN_WINRATE = float(os.getenv("TOP_HOURS_MIN_WINRATE", "0.88"))
 TOP_HOURS_COUNT       = int(os.getenv("TOP_HOURS_COUNT", "6"))
 
-# Pesos de score
+# Pesos de score (para compute_scores)
 W_WR, W_HOUR, W_TREND = 0.70, 0.20, 0.10
 
 # Especialista #1 (anti-streak por lado)
@@ -87,13 +87,33 @@ SIDE_WORD_RE = re.compile(r"\b(player|banker|empate|azul|vermelho|blue|red|p\b|b
 EMOJI_PLAYER_RE = re.compile(r"(🔵|🟦)", re.U)
 EMOJI_BANKER_RE = re.compile(r"(🔴|🟥)", re.U)
 
-# Finalização do fonte (antigas)
-SOURCE_G0_GREEN_RE = re.compile(r"(de\s+primeira|sem\s+gale|bateu\s+g0|\bG0\b|acert(ou|amos)\s+de\s+primeira)", re.I)
-SOURCE_WENT_GALE_RE = re.compile(r"((estamos|indo|fomos|vamos)\s+(pro|para|no)\s*g-?\s*[12]\b|gale\s*[12]\b|\bg[12]\b)", re.I)
+# Finalização do fonte:
+# G0 de primeira (sem gale)
+SOURCE_G0_GREEN_RE = re.compile(
+    r"(de\s+primeira|sem\s+gale|bateu\s+g0|\bG0\b|acert(ou|amos)\s+de\s+primeira)", re.I
+)
+# foi para G1/G2 (variações, inclusive "g-1"/"g-2")
+SOURCE_WENT_GALE_RE = re.compile(
+    r"((estamos|indo|fomos|vamos)\s+(pro|para|no)\s*g-?\s*[12]\b|gale\s*[12]\b|\bg-?\s*[12]\b)", re.I
+)
 
-# Finalização — layout novo do fonte
-SOURCE_RESULT_GREEN_SIMPLE_RE = re.compile(r"\bgreen\b|✅", re.I)
-SOURCE_RESULT_LOSS_SIMPLE_RE  = re.compile(r"\bloss\b|❌", re.I)
+# Mensagens de marketing (ignorar)
+SOURCE_MARKETING_RE = re.compile(r"estamos\s+com\s+\d+\s+greens\s+seguidos", re.I)
+
+# LOSS final no layout novo: "(🔴🔴🔴)" ou "(🔵🔵🔵)"
+FINAL_LOSS_PARENS_RE = re.compile(r"\(([🔴🟥🔵🟦])\1{1,3}\)")
+
+def _emoji_to_side(ch: str) -> str | None:
+    if ch in ("🔴", "🟥"): return "banker"
+    if ch in ("🔵", "🟦"): return "player"
+    return None
+
+def parse_final_loss_side(text: str) -> str | None:
+    """Se houver LOSS final com parênteses, retorna a cor do FONTE ('player'/'banker')."""
+    if not text: return None
+    m = FINAL_LOSS_PARENS_RE.search(text)
+    if not m: return None
+    return _emoji_to_side(m.group(1))
 
 # ================== HELPERS ==================
 def now_local(): return datetime.now(LOCAL_TZ)
@@ -109,6 +129,7 @@ def normalize_side_token(tok:str|None)->str|None:
     return None
 
 def extract_side(text:str)->str|None:
+    """Tenta achar a cor do fonte (palavra OU emoji)."""
     if not text: return None
     m = SIDE_WORD_RE.search(text)
     if m:
@@ -129,11 +150,11 @@ STATE = {
     "open_signal": None,              # {"chosen_side","fonte_side","expires_at","src_msg_id","src_opened_epoch"}
     "last_publish_ts": None,
     "processed_updates": deque(maxlen=500),
-    "messages": [],
-    "source_texts": deque(maxlen=120),
-    "hour_stats": {},
-    "side_ban_until": {},
-    "cooldown_until": None,
+    "messages": [],                   # logs leves
+    "source_texts": deque(maxlen=120),# últimos textos do fonte (p/ pressão gale)
+    "hour_stats": {},                 # "00".."23" -> {"g","t"} (janela ouro)
+    "side_ban_until": {},             # {"player": iso, "banker": iso}
+    "cooldown_until": None,           # cooldown pós-loss
     "last_side": None,
     "last_side_streak": 0,
 }
@@ -259,8 +280,7 @@ def _can_extend_ttl(text: str) -> bool:
         EMOJI_BANKER_RE.search(text or "") or
         SOURCE_WENT_GALE_RE.search(low) or
         SOURCE_G0_GREEN_RE.search(low) or
-        SOURCE_RESULT_GREEN_SIMPLE_RE.search(low) or
-        SOURCE_RESULT_LOSS_SIMPLE_RE.search(low)
+        FINAL_LOSS_PARENS_RE.search(text or "")
     )
 
 # ================== ESPECIALISTAS (ABERTURA) ==================
@@ -323,25 +343,12 @@ def spec_side_repeat_guard(candidate:str)->tuple[bool,str]:
 # ================== RESULTADO CORRETO vs FONTE ==================
 def derive_our_result_from_source_flow(text:str, fonte_side:str|None, chosen_side:str|None):
     """
-    Prioridades (layout novo ou antigo):
-      1) Texto contém GREEN/LOSS explícito → retorna direto
-      2) Texto indica G1/G2 → igual ao fonte = LOSS; oposto = GREEN
-      3) Texto indica G0 de primeira → igual ao fonte = GREEN; oposto = LOSS
+    - Se fonte foi para G1/G2: igual ao fonte = LOSS; oposto = GREEN
+    - Se fonte G0 de primeira: igual ao fonte = GREEN; oposto = LOSS
     """
-    if not text:
-        return None
-    low = (text or "").lower()
-
-    # GREEN/LOSS explícitos (tem prioridade)
-    if SOURCE_RESULT_GREEN_SIMPLE_RE.search(low):
-        return "G"
-    if SOURCE_RESULT_LOSS_SIMPLE_RE.search(low):
-        return "R"
-
-    # Regras comparativas (precisam saber a cor do fonte e a nossa)
     if not fonte_side or not chosen_side:
         return None
-
+    low = (text or "").lower()
     if SOURCE_WENT_GALE_RE.search(low):
         return "R" if (chosen_side == fonte_side) else "G"
     if SOURCE_G0_GREEN_RE.search(low):
@@ -364,7 +371,6 @@ async def publish_entry(chosen_side:str, fonte_side:str|None, msg:dict):
         "src_msg_id": msg.get("message_id"),
         "src_opened_epoch": msg.get("date", 0),
     }
-    # streak-control
     if STATE.get("last_side") == chosen_side:
         STATE["last_side_streak"] = STATE.get("last_side_streak",0) + 1
     else:
@@ -393,6 +399,7 @@ def maybe_update_fonte_side_from_msg(msg:dict):
 # ================== LÓGICA DE ABERTURA ==================
 async def try_open_from_source(msg:dict):
     if OPEN_STRICT_SERIAL and STATE.get("open_signal"):
+        # já tem aberto → só prorroga TTL se houver atividade relevante (dentro do teto)
         if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC:
             raw = (msg.get("text") or msg.get("caption") or "")
             if _can_extend_ttl(raw):
@@ -402,6 +409,7 @@ async def try_open_from_source(msg:dict):
         maybe_update_fonte_side_from_msg(msg)
         return
 
+    # anti-spam
     last = STATE.get("last_publish_ts")
     if last:
         try:
@@ -409,6 +417,7 @@ async def try_open_from_source(msg:dict):
                 return
         except: pass
 
+    # Cooldown pós-L
     if cooldown_active():
         return
 
@@ -419,23 +428,28 @@ async def try_open_from_source(msg:dict):
     winner, s_win, s_lose, dbg = compute_scores()
     delta = dbg["delta"]
 
-    # ======== ESPECIALISTAS ========
+    # ======== ESPECIALISTAS DE ABERTURA ========
     ok1, _ = spec_roll_guard(winner)
-    if not ok1: return
+    if not ok1:
+        return
 
     ok2, _ = spec_hour_window()
-    if not ok2: return
+    if not ok2:
+        return
 
     ok3, ratio, why3 = spec_source_gale_pressure()
-    if not ok3: return
+    if not ok3:
+        return
     eps = EXPLORE_EPS + (SOURCE_GALE_EXPLORE_BONUS if why3 == "explore_boost" else 0.0)
 
     ok5, _ = spec_side_repeat_guard(winner)
     if not ok5:
         alt = "player" if winner=="banker" else "banker"
         ok_alt, _ = spec_roll_guard(alt)
-        if ok_alt: winner = alt
-        else: return
+        if ok_alt:
+            winner = alt
+        else:
+            return
 
     if delta < EXPLORE_MARGIN:
         if fonte_side and random.random() < eps:
@@ -443,7 +457,11 @@ async def try_open_from_source(msg:dict):
         elif not fonte_side:
             winner = pick_by_streak_fallback()
 
-    await publish_entry(chosen_side=winner, fonte_side=fonte_side, msg=msg)
+    await publish_entry(
+        chosen_side=winner,
+        fonte_side=fonte_side,
+        msg=msg
+    )
 
 # ================== LÓGICA DE FECHAMENTO ==================
 async def maybe_close_from_source(msg:dict):
@@ -452,27 +470,57 @@ async def maybe_close_from_source(msg:dict):
     raw_text = (msg.get("text") or msg.get("caption") or "")
     low  = raw_text.lower()
 
+    # ignora marketing "Estamos com X Greens seguidos!"
+    if SOURCE_MARKETING_RE.search(low):
+        return
+
+    # sempre aprender a cor do fonte, se possível
     maybe_update_fonte_side_from_msg(msg)
 
-    has_flow_confirm = bool(
-        SOURCE_G0_GREEN_RE.search(low) or
-        SOURCE_WENT_GALE_RE.search(low) or
-        SOURCE_RESULT_GREEN_SIMPLE_RE.search(low) or
-        SOURCE_RESULT_LOSS_SIMPLE_RE.search(low)
-    )
+    # LOSS final com parênteses (🔴🔴🔴) ou (🔵🔵🔵) → fecha na hora
+    final_loss_side = parse_final_loss_side(raw_text)
+    if final_loss_side:
+        chosen = osig.get("chosen_side")
+        # se nossa escolha = cor do fonte → LOSS, senão GREEN
+        our_res = "R" if chosen == final_loss_side else "G"
+
+        if our_res == "G":
+            STATE["totals"]["greens"] += 1
+            STATE["streak_green"] += 1
+            rolling_append(chosen, "G")
+        else:
+            STATE["totals"]["reds"] += 1
+            STATE["streak_green"] = 0
+            rolling_append(chosen, "R")
+            start_cooldown()
+
+        # opcional: preservar cor do fonte para histórico
+        if not osig.get("fonte_side"):
+            osig["fonte_side"] = final_loss_side
+
+        await announce_outcome(our_res, chosen)
+        STATE["open_signal"] = None
+        save_state()
+        return
+
+    # só fecha se houver confirmação clara do fluxo
+    has_flow_confirm = bool(SOURCE_G0_GREEN_RE.search(low) or SOURCE_WENT_GALE_RE.search(low))
     if not has_flow_confirm:
         if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC and _can_extend_ttl(raw_text):
             osig["expires_at"] = (now_local()+timedelta(seconds=RESULT_GRACE_EXTEND_SEC)).isoformat()
             save_state()
         return
 
+    # precisa ser outra mensagem (não fecha a mesma)
     if ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE and (msg.get("message_id") == osig.get("src_msg_id")):
         return
 
+    # delay mínimo
     opened_epoch = osig.get("src_opened_epoch", 0)
     if opened_epoch and (msg.get("date", 0) - opened_epoch) < MIN_RESULT_DELAY_SEC:
         return
 
+    # calcular resultado vs fonte (se ainda não souber cor do fonte, espera)
     our_res = derive_our_result_from_source_flow(raw_text, osig.get("fonte_side"), osig.get("chosen_side"))
     if our_res is None:
         if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC and _can_extend_ttl(raw_text):
@@ -480,6 +528,7 @@ async def maybe_close_from_source(msg:dict):
             save_state()
         return
 
+    # aplicar no placar
     if our_res == "G":
         STATE["totals"]["greens"] += 1
         STATE["streak_green"] += 1
@@ -499,6 +548,7 @@ async def expire_open_if_needed():
     osig = STATE.get("open_signal")
     if not osig: return
 
+    # hard-close silencioso se passar do teto total
     if _open_age_secs() >= CLOSE_STUCK_AFTER_SEC:
         STATE["open_signal"] = None
         save_state()
@@ -508,6 +558,7 @@ async def expire_open_if_needed():
     if not exp: return
     if datetime.fromisoformat(exp) > now_local(): return
 
+    # TTL expirou
     STATE["open_signal"] = None
     save_state()
     if TIMEOUT_CLOSE_POLICY == "loss":
@@ -529,7 +580,7 @@ async def safe_errors(request, call_next):
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 serial, fechamento rápido pelo fonte (GREEN/LOSS/g1/g2), especialistas na abertura"}
+    return {"ok": True, "service": "G0 serial, fechamento rápido pelo fonte, especialistas na abertura"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
@@ -555,7 +606,7 @@ async def webhook(req: Request, secret: str|None=None):
     if not text:
         return JSONResponse({"ok": True})
 
-    # histórico do fonte (pressão de gale)
+    # guarda histórico do fonte para pressão de gale
     STATE["source_texts"].append(text)
     save_state()
 
@@ -563,16 +614,18 @@ async def webhook(req: Request, secret: str|None=None):
         await tg_send(TARGET_CHAT_ID, text)
 
     low = text.lower()
-    has_trigger = bool(("entrada confirmada" in low) or SIDE_WORD_RE.search(low) or EMOJI_PLAYER_RE.search(text) or EMOJI_BANKER_RE.search(text))
+    has_trigger = bool(("entrada confirmada" in low) or SIDE_WORD_RE.search(low)
+                       or EMOJI_PLAYER_RE.search(text) or EMOJI_BANKER_RE.search(text)
+                       or FINAL_LOSS_PARENS_RE.search(text))
 
-    # 1) fechar no primeiro desfecho
+    # 1) fechar (primeiro desfecho do fonte)
     if CLOSE_ONLY_ON_FLOW_CONFIRM:
         await maybe_close_from_source(msg)
 
-    # 2) abrir se houve gatilho e não há aberto
+    # 2) abrir (gatilho) — apenas se não há aberto e houve gatilho
     if (FORCE_TRIGGER_OPEN or FORCE_OPEN_ON_ANY_SOURCE_MSG) and has_trigger:
         await try_open_from_source(msg)
 
-    # 3) anti-trava / TTL
+    # 3) TTL / anti-trava
     await expire_open_if_needed()
     return JSONResponse({"ok": True})
