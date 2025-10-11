@@ -1,77 +1,67 @@
-# app.py — 100% TipMiner (abrir + fechar) • Regras(3) • Gales • Cooldown • Heartbeat • Anti-cache
+# TipMiner-only bot — abre e fecha com base no histórico do TipMiner
+# Recursos: regras últimos-3, gales, cooldown, heartbeat, anti-cache, debug
+
 import os, re, json, asyncio, pytz, logging, hashlib, random
 from datetime import datetime, timedelta
 from collections import deque
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import httpx
 
-# ========== ENVs obrigatórias ==========
-TG_BOT_TOKEN   = os.environ["TG_BOT_TOKEN"]          # token do bot
-TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])   # ex.: -100xxxxxxxxxx (grupo)
-TZ_NAME        = os.getenv("TZ", "America/Sao_Paulo")
+# ====== ENVs obrigatórias ======
+TG_BOT_TOKEN   = os.environ["TG_BOT_TOKEN"]
+TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])  # ex: -100xxxxxxxx
+TZ_NAME        = os.getenv("TZ", "UTC")
 LOCAL_TZ       = pytz.timezone(TZ_NAME)
 
-# ========== Fonte (100% site) ==========
+# ====== Config ======
 TIPMINER_URL  = os.getenv("TIPMINER_URL", "https://www.tipminer.com/br/historico/jonbet/bac-bo")
 FALLBACK_URL  = os.getenv("FALLBACK_URL", "https://casinoscores.com/pt-br/bac-bo/")
 
-# ========== Loop/fechamento ==========
-HEARTBEAT_SEC         = int(os.getenv("HEARTBEAT_SEC", "2"))   # verifica fechamento
-AUTO_OPEN_INTERVAL_SEC= int(os.getenv("AUTO_OPEN_INTERVAL_SEC","2"))   # varredura para abrir
-MIN_RESULT_DELAY_SEC  = int(os.getenv("MIN_RESULT_DELAY_SEC", "5"))    # delay mínimo pós-abertura
-OPEN_TTL_SEC          = int(os.getenv("OPEN_TTL_SEC", "90"))
-CLOSE_STUCK_AFTER_SEC = int(os.getenv("CLOSE_STUCK_AFTER_SEC","180"))
-RESULT_GRACE_EXTEND_SEC = int(os.getenv("RESULT_GRACE_EXTEND_SEC","25"))
-DEBUG_TO_TARGET       = os.getenv("DEBUG_TO_TARGET","1") == "1"
+HEARTBEAT_SEC   = int(os.getenv("HEARTBEAT_SEC", "2"))
+AUTO_OPEN_INTERVAL_SEC = int(os.getenv("AUTO_OPEN_INTERVAL_SEC", "2"))
+MIN_RESULT_DELAY_SEC   = int(os.getenv("MIN_RESULT_DELAY_SEC", "5"))
 
-# ========== Motor de regras ==========
+OPEN_TTL_SEC          = int(os.getenv("OPEN_TTL_SEC", "90"))
+CLOSE_STUCK_AFTER_SEC = int(os.getenv("CLOSE_STUCK_AFTER_SEC", "180"))
+RESULT_GRACE_EXTEND_SEC = int(os.getenv("RESULT_GRACE_EXTEND_SEC","25"))
+
 RULES_ENABLED         = os.getenv("RULES_ENABLED","1") == "1"
-RULES_MAX_GALES       = int(os.getenv("RULES_MAX_GALES","2"))      # 0..2
+RULES_MAX_GALES       = int(os.getenv("RULES_MAX_GALES","2"))
 RULES_COOLDOWN_ROUNDS = int(os.getenv("RULES_COOLDOWN_ROUNDS","3"))
 
-# Resultado: quando acertamos? (entrar no oposto do site costuma ser melhor)
 GREEN_RULE            = os.getenv("GREEN_RULE","opposite").lower()  # opposite | follow
+DEBUG_TO_TARGET       = os.getenv("DEBUG_TO_TARGET","1") == "1"
 
-# ========== Infra ==========
-API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
+API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
+# ====== App ======
 app = FastAPI()
 log = logging.getLogger("uvicorn.error")
+
 def now_local(): return datetime.now(LOCAL_TZ)
+def colorize_side(s): return {"player":"🔵 Player","banker":"🔴 Banker","empate":"🟡 Empate"}.get(s or "", "?")
 
-# ===== Regex robustas para extrair lado =====
-TM_PLAYER_RE = re.compile(r"(🔵|🟦|Azul|Player|Jogador)", re.I)
-TM_BANKER_RE = re.compile(r"(🔴|🟥|Vermelho|Banker|Banqueiro)", re.I)
-CS_PLAYER_RE = re.compile(r"(Azul|Player|Jogador)", re.I)
-CS_BANKER_RE = re.compile(r"(Vermelho|Banker|Banqueiro)", re.I)
-
-def side_to_human(s): return "Azul" if s=="player" else ("Vermelho" if s=="banker" else "Tie")
-def human_to_side(h):
-    h=(h or "").lower()
-    if h in ("azul","p","player","jogador"): return "player"
-    if h in ("vermelho","b","banker","banqueiro"): return "banker"
-    if h in ("tie","empate"): return "empate"
-    return None
-
-# ===== Estado =====
+# ====== Estado ======
 STATE = {
-    "totals": {"greens":0,"reds":0}, "streak_green":0,
-    "open_signal": None,                 # dict com abertura atual
-    "auto_last_round_sig": None,         # assinatura da última rodada
-    "rules_recent3": deque(maxlen=3),    # "Azul"/"Vermelho"/"Tie"
-    "rules_target_side": None,           # 'player'/'banker'
-    "rules_gale_stage": 0,               # 0=G0,1=G1,2=G2
+    "totals": {"greens":0,"reds":0},
+    "streak_green": 0,
+    "open_signal": None,
+    "auto_last_round_sig": None,   # assinatura da última rodada do site
+    "rules_recent3": deque(maxlen=3),   # lista de textos: Azul/Vermelho/Tie
+    "rules_target_side": None,     # 'player'|'banker'
+    "rules_gale_stage": 0,         # 0..2
     "rules_cooldown_rounds": 0,
 }
+
 def _ensure_dir(p):
-    import os
-    d=os.path.dirname(p); 
-    if d and not os.path.exists(d): os.makedirs(d, exist_ok=True)
+    d=os.path.dirname(p)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
 def _jsonable(o):
-    from collections import deque
     if isinstance(o,deque): return list(o)
     if isinstance(o,dict): return {k:_jsonable(v) for k,v in o.items()}
     if isinstance(o,list): return [_jsonable(x) for x in o]
@@ -80,40 +70,58 @@ def _jsonable(o):
 def save_state():
     _ensure_dir(STATE_PATH)
     tmp = STATE_PATH + ".tmp"
-    with open(tmp,"w",encoding="utf-8") as f: json.dump(_jsonable(STATE), f, ensure_ascii=False)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_jsonable(STATE), f, ensure_ascii=False)
     os.replace(tmp, STATE_PATH)
 
 def load_state():
+    global STATE
     try:
-        with open(STATE_PATH,"r",encoding="utf-8") as f: data=json.load(f)
-        STATE["rules_recent3"] = deque(data.get("rules_recent3", []), maxlen=3)
-        for k in STATE:
-            if k!="rules_recent3": STATE[k]=data.get(k, STATE[k])
+        with open(STATE_PATH,"r",encoding="utf-8") as f:
+            data=json.load(f)
+        STATE["totals"]             = data.get("totals", {"greens":0,"reds":0})
+        STATE["streak_green"]       = data.get("streak_green", 0)
+        STATE["open_signal"]        = data.get("open_signal", None)
+        STATE["auto_last_round_sig"]= data.get("auto_last_round_sig", None)
+        STATE["rules_recent3"]      = deque(data.get("rules_recent3", []), maxlen=3)
+        STATE["rules_target_side"]  = data.get("rules_target_side", None)
+        STATE["rules_gale_stage"]   = data.get("rules_gale_stage", 0)
+        STATE["rules_cooldown_rounds"]= data.get("rules_cooldown_rounds", 0)
     except Exception:
         save_state()
 load_state()
 
-# ===== Telegram =====
 async def tg_send(chat_id:int, text:str):
     try:
         async with httpx.AsyncClient(timeout=20) as cli:
             await cli.post(f"{API}/sendMessage",
-                json={"chat_id":chat_id,"text":text,"parse_mode":"HTML","disable_web_page_preview":True})
+                           json={"chat_id":chat_id,"text":text,"parse_mode":"HTML",
+                                 "disable_web_page_preview":True})
     except Exception as e:
         log.error("tg_send error: %s", e)
 
-def colorize_side(s): 
-    return {"player":"🔵 Player","banker":"🔴 Banker","empate":"🟡 Empate"}.get(s or "", "?")
+def _open_age_secs():
+    osig = STATE.get("open_signal") or {}
+    opened = int(osig.get("src_opened_epoch") or 0)
+    if not opened: return 0
+    return max(0, int(now_local().timestamp()) - opened)
 
-# ===== Fetch com anti-cache =====
+# ====== Parsers do TipMiner ======
+TM_PLAYER_RE = re.compile(r"(🔵|🟦|Player|Azul)", re.I)
+TM_BANKER_RE = re.compile(r"(🔴|🟥|Banker|Vermelho)", re.I)
+
+CS_PLAYER_RE = re.compile(r"(Jogador|Player)", re.I)   # fallback
+CS_BANKER_RE = re.compile(r"(Banqueiro|Banker)", re.I)
+
 async def _fetch(url: str) -> str | None:
+    # anti-cache simples
     ts = int(now_local().timestamp())
     sep = "&" if "?" in url else "?"
     u = f"{url}{sep}_t={ts}"
     try:
         async with httpx.AsyncClient(timeout=15, headers={
             "User-Agent":"Mozilla/5.0",
-            "Cache-Control":"no-cache, no-store, must-revalidate",
+            "Cache-Control":"no-cache",
             "Pragma":"no-cache",
             "Accept":"text/html,application/xhtml+xml"
         }) as cli:
@@ -124,37 +132,46 @@ async def _fetch(url: str) -> str | None:
         log.warning("fetch fail %s: %s", url, e)
     return None
 
-def _pick_side_from_html(html: str, re_player: re.Pattern, re_banker: re.Pattern) -> str | None:
+def _pick_side_from_html(html: str, re_p: re.Pattern, re_b: re.Pattern) -> str | None:
     if not html: return None
-    head = html[:25000]
-    has_p = bool(re_player.search(head)); has_b = bool(re_banker.search(head))
-    if has_p and not has_b: return "player"
-    if has_b and not has_p: return "banker"
-    mp = re_player.search(head); mb = re_banker.search(head)
+    head = html[:20000]
+    hp, hb = bool(re_p.search(head)), bool(re_b.search(head))
+    if hp and not hb: return "player"
+    if hb and not hp: return "banker"
+    mp, mb = re_p.search(head), re_b.search(head)
     if mp and mb: return "player" if mp.start() < mb.start() else "banker"
     return None
 
 def _round_signature_from_html(html: str) -> str | None:
     if not html: return None
-    head = html[:8000]  # parte “viva” da página
+    head = html[:6000]
     return hashlib.sha1(head.encode("utf-8","ignore")).hexdigest()
 
-async def tipminer_snapshot() -> tuple[str|None, str|None]:
+async def tipminer_snapshot() -> tuple[str | None, str | None]:
     html = await _fetch(TIPMINER_URL)
     sig  = _round_signature_from_html(html or "")
     side = _pick_side_from_html(html or "", TM_PLAYER_RE, TM_BANKER_RE)
     if not side:
-        fb_html = await _fetch(FALLBACK_URL)
-        if fb_html:
-            side = _pick_side_from_html(fb_html, CS_PLAYER_RE, CS_BANKER_RE)
+        fb = await _fetch(FALLBACK_URL)
+        if fb:
+            side = _pick_side_from_html(fb, CS_PLAYER_RE, CS_BANKER_RE)
             if not sig:
-                sig = _round_signature_from_html(fb_html or "")
-    return sig, side  # side: "player"|"banker"|None
+                sig = _round_signature_from_html(fb)
+    return sig, side
 
-# ===== Regras (3 últimos) =====
-def _rules_should_fire(last3:list[str]) -> str | None:
+# ====== Regras (últimos 3) ======
+def side_to_human(s):
+    return "Azul" if s=="player" else ("Vermelho" if s=="banker" else "Tie")
+def human_to_side(h):
+    t=(h or "").lower()
+    if t in ("azul","p","player"): return "player"
+    if t in ("vermelho","b","banker"): return "banker"
+    if t in ("tie","empate"): return "empate"
+    return None
+
+def rules_should_fire(last3:list[str]) -> str | None:
+    if len(last3) < 3: return None
     a = last3
-    if len(a) < 3: return None
     if a == ['Vermelho','Vermelho','Vermelho']: return 'Azul'
     if a == ['Azul','Azul','Azul']:             return 'Vermelho'
     if a == ['Tie','Vermelho','Tie']:           return 'Azul'
@@ -165,21 +182,20 @@ def _rules_should_fire(last3:list[str]) -> str | None:
     if a == ['Azul','Tie','Azul']:              return 'Vermelho'
     return None
 
-def _result_from_sides(chosen: str, real: str) -> str:
-    if GREEN_RULE == "follow":
-        return "G" if chosen == real else "R"
-    return "G" if chosen != real else "R"
+async def _rules_try_open_signal():
+    if not RULES_ENABLED: return
+    if STATE.get("rules_cooldown_rounds", 0) > 0: return
+    if STATE.get("open_signal"): return
+    tgt = STATE.get("rules_target_side")
+    if not tgt: return
+    await publish_entry(tgt)
 
-def _open_age_secs():
-    osig = STATE.get("open_signal")
-    if not osig: return 0
-    try:
-        return max(0, int(now_local().timestamp()) - int(osig.get("src_opened_epoch") or 0))
-    except: return 0
-
-async def publish_entry(chosen_side:str):
+# ====== Publicação / Resultado ======
+async def publish_entry(chosen_side: str):
     await tg_send(TARGET_CHAT_ID,
-        "🚀 <b>ENTRADA AUTÔNOMA</b>\n" + colorize_side(chosen_side) + "\nFonte: TipMiner")
+                  "🚀 <b>ENTRADA AUTÔNOMA</b>\n"
+                  f"{colorize_side(chosen_side)}\n"
+                  "Origem: TipMiner + Regras")
     STATE["open_signal"] = {
         "ts": now_local().isoformat(),
         "chosen_side": chosen_side,
@@ -191,97 +207,86 @@ async def publish_entry(chosen_side:str):
     try:
         html = await _fetch(TIPMINER_URL)
         STATE["open_signal"]["open_signature"] = _round_signature_from_html(html or "")
-    except: pass
+    except:
+        STATE["open_signal"]["open_signature"] = None
     save_state()
 
-async def announce_outcome(result:str, chosen_side:str):
-    big = "🟩🟩🟩 <b>GREEN</b> 🟩🟩🟩" if result=="G" else "🟥🟥🟥 <b>LOSS</b> 🟥🟥🟥"
-    await tg_send(TARGET_CHAT_ID, f"{big}\n⏱ {now_local().strftime('%H:%M:%S')}\nNossa: {colorize_side(chosen_side)}")
+def result_from_sides(chosen: str, real: str) -> str:
+    if GREEN_RULE == "follow":
+        return "G" if chosen == real else "R"
+    # opposite
+    return "G" if chosen != real else "R"
+
+async def announce_outcome(res:str, chosen:str):
+    await tg_send(TARGET_CHAT_ID,
+                  ("🟩🟩🟩 <b>GREEN</b> 🟩🟩🟩" if res=="G" else "🟥🟥🟥 <b>LOSS</b> 🟥🟥🟥") +
+                  f"\n⏱ {now_local().strftime('%H:%M:%S')}\nNossa: {colorize_side(chosen)}")
     g=STATE["totals"]["greens"]; r=STATE["totals"]["reds"]; t=g+r; wr=(g/t*100.0) if t else 0.0
     await tg_send(TARGET_CHAT_ID, f"📊 <b>Placar Geral</b>\n✅ {g}   ⛔️ {r}\n🎯 {wr:.2f}%  •  🔥 Streak {STATE['streak_green']}")
 
-# ===== Abertura (regras + gales) =====
-async def rules_try_open():
-    if not RULES_ENABLED: return
-    if STATE.get("rules_cooldown_rounds",0)>0: return
-    if STATE.get("open_signal"): return
-    tgt = STATE.get("rules_target_side")
-    if not tgt: return
-    stage = STATE.get("rules_gale_stage",0)
-    await publish_entry(tgt)
-    if stage==0:
-        await tg_send(TARGET_CHAT_ID, "🚀 ENTRADA CONFIRMADA\nApostar no " + ("🔵" if tgt=="player" else "🔴"))
-    else:
-        await tg_send(TARGET_CHAT_ID, f"🔄 Gale {stage} no " + ("🔵" if tgt=="player" else "🔴"))
-
-# ===== Fechamento =====
-async def _apply_external_result(chosen:str) -> str | None:
-    for i in range(4):
+async def apply_external_close(chosen_side: str) -> str | None:
+    # 3 tentativas: TipMiner -> Fallback
+    for i in range(3):
         html = await _fetch(TIPMINER_URL)
         real = _pick_side_from_html(html or "", TM_PLAYER_RE, TM_BANKER_RE)
         if not real:
             fb = await _fetch(FALLBACK_URL)
             real = _pick_side_from_html(fb or "", CS_PLAYER_RE, CS_BANKER_RE)
         if real:
-            res = _result_from_sides(chosen, real)
+            res = result_from_sides(chosen_side, real)
             if DEBUG_TO_TARGET:
-                await tg_send(TARGET_CHAT_ID, f"[DEBUG] try={i+1} real={real} -> {res} (rule={GREEN_RULE})")
+                await tg_send(TARGET_CHAT_ID, f"[DEBUG] fechamento try={i+1} real={real} => {res}")
             return res
         await asyncio.sleep(1.0)
     if DEBUG_TO_TARGET:
-        await tg_send(TARGET_CHAT_ID, "[DEBUG] cor não encontrada no site (TipMiner/Fallback)")
+        await tg_send(TARGET_CHAT_ID, "[DEBUG] sem cor no site para fechar")
     return None
 
-async def maybe_close():
+async def maybe_close_by_site():
     osig = STATE.get("open_signal")
     if not osig: return
-    # rodada virou? (assinatura mudou)
+    # assinatura mudou (nova rodada) OU delay mínimo atingido?
     sig_open = osig.get("open_signature")
-    sig_now  = None
-    try:
-        html_now = await _fetch(TIPMINER_URL)
-        sig_now  = _round_signature_from_html(html_now or "")
-    except: pass
-    signature_changed = bool(sig_open and sig_now and sig_open != sig_now)
+    html_now = await _fetch(TIPMINER_URL)
+    sig_now  = _round_signature_from_html(html_now or "")
+    signature_changed = (sig_open and sig_now and sig_open != sig_now)
 
-    # respeita delay mínimo
-    opened_epoch = osig.get("src_opened_epoch", 0)
-    if not signature_changed and int(now_local().timestamp()) - int(opened_epoch or 0) < MIN_RESULT_DELAY_SEC:
+    if not signature_changed:
+        if int(now_local().timestamp()) - osig.get("src_opened_epoch", 0) < MIN_RESULT_DELAY_SEC:
+            return
+
+    final_res = await apply_external_close(osig.get("chosen_side"))
+    if not final_res:
         return
 
-    # tenta fechar
-    final = await _apply_external_result(osig["chosen_side"])
-    if final is None:
-        # dá mais tempo se o HTML ainda não refletiu
-        if signature_changed and DEBUG_TO_TARGET:
-            await tg_send(TARGET_CHAT_ID, "[DEBUG] assinatura mudou, aguardando cor…")
-        return
-
-    # aplica placar
-    if final=="G":
+    # aplicar placar
+    if final_res == "G":
         STATE["totals"]["greens"] += 1
         STATE["streak_green"] += 1
-        STATE["rules_target_side"] = None
-        STATE["rules_gale_stage"] = 0
     else:
         STATE["totals"]["reds"] += 1
         STATE["streak_green"] = 0
-        stage = STATE.get("rules_gale_stage",0)
+    await announce_outcome(final_res, osig.get("chosen_side"))
+
+    # encadear gales / cooldown
+    if final_res == "G":
+        STATE["rules_target_side"] = None
+        STATE["rules_gale_stage"]  = 0
+    else:
+        stage = STATE.get("rules_gale_stage", 0)
         tgt   = STATE.get("rules_target_side")
         if RULES_ENABLED and tgt and stage < RULES_MAX_GALES:
             STATE["rules_gale_stage"] = stage + 1
             save_state()
-            await rules_try_open()   # abre gale
+            await _rules_try_open_signal()
         else:
             STATE["rules_target_side"] = None
-            STATE["rules_gale_stage"] = 0
+            STATE["rules_gale_stage"]  = 0
             STATE["rules_cooldown_rounds"] = RULES_COOLDOWN_ROUNDS
 
-    await announce_outcome(final, osig["chosen_side"])
     STATE["open_signal"] = None
     save_state()
 
-# ===== TTL / anti-trava =====
 async def expire_open_if_needed():
     osig = STATE.get("open_signal")
     if not osig: return
@@ -290,57 +295,64 @@ async def expire_open_if_needed():
     exp = osig.get("expires_at")
     if exp and datetime.fromisoformat(exp) <= now_local():
         STATE["open_signal"] = None; save_state()
+        await tg_send(TARGET_CHAT_ID, "⏳ Encerrado por timeout (TTL) — descartado")
 
-# ===== Loops =====
+# ====== Loops ======
 async def auto_loop():
     while True:
         try:
-            sig, side = await tipminer_snapshot()
-            if sig:
-                prev = STATE.get("auto_last_round_sig")
-                if prev != sig:
-                    STATE["auto_last_round_sig"] = sig
-                    # acumula últimos 3
-                    if side: STATE["rules_recent3"].append(side_to_human(side))
-                    # cooldown
-                    if STATE.get("rules_cooldown_rounds",0)>0:
-                        STATE["rules_cooldown_rounds"] -= 1
-                    else:
-                        if RULES_ENABLED and not STATE.get("open_signal") and STATE.get("rules_gale_stage",0)==0:
-                            target_human = _rules_should_fire(list(STATE["rules_recent3"]))
-                            if target_human:
-                                STATE["rules_target_side"] = human_to_side(target_human)
-                                STATE["rules_gale_stage"] = 0
-                                await rules_try_open()
-                    save_state()
+            sig, last_side = await tipminer_snapshot()
+            if sig and sig != STATE.get("auto_last_round_sig"):
+                STATE["auto_last_round_sig"] = sig
+                if last_side:
+                    STATE["rules_recent3"].append(side_to_human(last_side))
+                # cooldown
+                if STATE.get("rules_cooldown_rounds",0) > 0:
+                    STATE["rules_cooldown_rounds"] -= 1
+                else:
+                    if RULES_ENABLED and STATE.get("open_signal") is None and STATE.get("rules_gale_stage",0) == 0:
+                        target_human = rules_should_fire(list(STATE["rules_recent3"]))
+                        if target_human:
+                            STATE["rules_target_side"] = human_to_side(target_human)
+                            STATE["rules_gale_stage"]  = 0
+                            await _rules_try_open_signal()
+                save_state()
         except Exception as e:
-            log.error("auto_loop: %s", e)
+            log.error("auto_loop err: %s", e)
         await asyncio.sleep(AUTO_OPEN_INTERVAL_SEC)
 
 async def heartbeat_loop():
     while True:
         try:
-            await maybe_close()
+            await maybe_close_by_site()
             await expire_open_if_needed()
         except Exception as e:
-            log.error("hb: %s", e)
+            log.error("hb err: %s", e)
         await asyncio.sleep(HEARTBEAT_SEC)
 
 @app.on_event("startup")
-async def _start():
+async def _start_tasks():
     asyncio.create_task(auto_loop())
     asyncio.create_task(heartbeat_loop())
 
-# ===== Rotas =====
+# ====== HTTP ======
+@app.middleware("http")
+async def safe_errors(request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as e:
+        logging.exception("Middleware error: %s", e)
+        return JSONResponse({"ok": True}, status_code=200)
+
 @app.get("/")
 async def root():
-    return {"ok": True, "service":"TipMiner 100% • Regras(3) • Gales • Cooldown • Heartbeat • Anti-cache", "tz": TZ_NAME}
+    return {"ok": True, "service": "TipMiner 100% • Regras(3) • Gales • Cooldown • Heartbeat"}
 
 @app.get("/debug/tipminer")
-async def dbg_tm():
+async def dbg_tipminer():
     try:
-        sig, side = await tipminer_snapshot()
-        return {"ok": True, "signature": sig, "last_side": side, "recent3": list(STATE["rules_recent3"])}
+        sig, last_side = await tipminer_snapshot()
+        return {"ok": True, "signature": sig, "last_side": last_side, "recent3": list(STATE["rules_recent3"])}
     except Exception as e:
         return {"ok": False, "err": str(e)}
 
@@ -351,32 +363,4 @@ async def dbg_state():
         "gales": STATE.get("rules_gale_stage"),
         "target": STATE.get("rules_target_side"),
         "cooldown_rounds": STATE.get("rules_cooldown_rounds"),
-        "totals": STATE.get("totals"),
-        "recent3": list(STATE["rules_recent3"]),
     }
-
-@app.get("/debug/reset-state")
-async def dbg_reset():
-    STATE["open_signal"]=None
-    STATE["rules_target_side"]=None
-    STATE["rules_gale_stage"]=0
-    STATE["rules_cooldown_rounds"]=0
-    STATE["rules_recent3"].clear()
-    save_state()
-    return {"ok": True}
-
-@app.get("/debug/force-close")
-async def dbg_force_close():
-    osig = STATE.get("open_signal")
-    if not osig: return {"ok": False, "err":"no open"}
-    res = await _apply_external_result(osig["chosen_side"])
-    if not res: return {"ok": False, "err":"no external color"}
-    # aplica placar como no normal
-    if res=="G":
-        STATE["totals"]["greens"]+=1; STATE["streak_green"]+=1
-        STATE["rules_target_side"]=None; STATE["rules_gale_stage"]=0
-    else:
-        STATE["totals"]["reds"]+=1; STATE["streak_green"]=0
-    await announce_outcome(res, osig["chosen_side"])
-    STATE["open_signal"]=None; save_state()
-    return {"ok": True, "result": res}
