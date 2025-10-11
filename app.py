@@ -1,4 +1,4 @@
-# app.py — TipMiner abre e fecha • Heartbeat • Fetch anti-cache • Debug
+# app.py — TipMiner abre e fecha • Heartbeat • Fetch anti-cache • Retry • Force-close • Debug
 import os, re, json, asyncio, pytz, logging, random, hashlib
 from datetime import datetime, timedelta
 from collections import deque
@@ -34,7 +34,7 @@ HEARTBEAT_SEC   = int(os.getenv("HEARTBEAT_SEC", "3"))
 DEBUG_TO_TARGET = os.getenv("DEBUG_TO_TARGET", "0") == "1"
 LOG_RAW         = os.getenv("LOG_RAW", "1") == "1"
 
-# Exploração mínima (caso precise decidir lado sem last_side)
+# Exploração mínima (fallback se last_side não vier)
 EXPLORE_EPS    = float(os.getenv("EXPLORE_EPS", "0.35"))
 EXPLORE_MARGIN = float(os.getenv("EXPLORE_MARGIN", "0.15"))
 EPS_TIE        = float(os.getenv("EPS_TIE", "0.02"))
@@ -50,7 +50,7 @@ API        = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 # TipMiner / Fallback
 TIPMINER_URL = os.getenv("TIPMINER_URL", "https://www.tipminer.com/br/historico/jonbet/bac-bo")
 FALLBACK_URL = os.getenv("FALLBACK_URL", "https://casinoscores.com/pt-br/bac-bo/")
-USE_PLAYWRIGHT = os.getenv("USE_PLAYWRIGHT", "0") == "1"  # por padrão deixo 0 p/ simplificar
+USE_PLAYWRIGHT = os.getenv("USE_PLAYWRIGHT", "0") == "1"  # por padrão 0 (HTML simples + anti-cache)
 
 # ================== App ==================
 app = FastAPI()
@@ -149,7 +149,7 @@ TM_BANKER_RE = re.compile(r"(🔴|🟥|Banker|Vermelho)", re.I)
 CS_PLAYER_RE = re.compile(r"(Jogador|Player)", re.I)
 CS_BANKER_RE = re.compile(r"(Banqueiro|Banker)", re.I)
 
-# -------- FETCH ANTI-CACHE (hotfix) --------
+# -------- FETCH ANTI-CACHE --------
 async def _fetch(url: str) -> str | None:
     ts = int(now_local().timestamp())
     sep = "&" if "?" in url else "?"
@@ -184,7 +184,7 @@ def _round_signature_from_html(html: str) -> str | None:
     return hashlib.sha1(head.encode("utf-8", errors="ignore")).hexdigest()
 
 async def tipminer_snapshot() -> tuple[str | None, str | None]:
-    # Primeiro tenta HTML simples (já com anti-cache)
+    # HTML simples (anti-cache)
     html = await _fetch(TIPMINER_URL)
     sig  = _round_signature_from_html(html or "")
     side = _pick_side_from_html(html or "", TM_PLAYER_RE, TM_BANKER_RE)
@@ -194,7 +194,7 @@ async def tipminer_snapshot() -> tuple[str | None, str | None]:
             side = _pick_side_from_html(fb_html, CS_PLAYER_RE, CS_BANKER_RE)
             if not sig:
                 sig = _round_signature_from_html(fb_html)
-    # (Opcional) Tentar Playwright se habilitado
+    # (Opcional) Playwright se habilitado
     if not side and USE_PLAYWRIGHT:
         try:
             from tipminer_scraper import get_tipminer_latest_side
@@ -207,7 +207,7 @@ async def tipminer_snapshot() -> tuple[str | None, str | None]:
 
 # ================== Resultado & Publicação ==================
 def _result_from_sides(chosen: str, real: str) -> str:
-    # GREEN se nossa escolha != lado real (comportamento 'opposite')
+    # GREEN se nossa escolha != lado real (opposite strategy)
     return "G" if chosen and real and chosen != real else "R"
 
 async def publish_entry(chosen_side:str, fonte_side:str|None, msg:dict):
@@ -223,6 +223,14 @@ async def publish_entry(chosen_side:str, fonte_side:str|None, msg:dict):
         "src_msg_id": msg.get("message_id", 0),
         "src_opened_epoch": msg.get("date", int(now_local().timestamp())),
     }
+
+    # >>> guarda assinatura da rodada no momento da abertura (Patch 1)
+    try:
+        html_open = await _fetch(TIPMINER_URL)
+        STATE["open_signal"]["open_signature"] = _round_signature_from_html(html_open or "")
+    except Exception:
+        STATE["open_signal"]["open_signature"] = None
+
     if STATE.get("last_side") == chosen_side:
         STATE["last_side_streak"] = STATE.get("last_side_streak",0) + 1
     else:
@@ -237,35 +245,66 @@ async def announce_outcome(result:str, chosen_side:str|None):
     g=STATE["totals"]["greens"]; r=STATE["totals"]["reds"]; t=g+r; wr=(g/t*100.0) if t else 0.0
     await tg_send(TARGET_CHAT_ID, f"📊 <b>Placar Geral</b>\n✅ {g}   ⛔️ {r}\n🎯 {wr:.2f}%  •  🔥 Streak {STATE['streak_green']}")
 
-# ================== Fechamento externo ==================
+# ================== Fechamento externo (Retry + Logs) ==================
 async def _apply_result_external_only(chosen_side: str | None) -> str | None:
+    # modo SOS: fecha mesmo sem site (apenas para teste quando REQUIRE_EXTERNAL_CONFIRM=0)
     if not REQUIRE_EXTERNAL_CONFIRM:
-        # modo SOS: fecha sempre R/G alternado com base no relógio (apenas para teste)
         return "G" if int(now_local().timestamp()) % 2 == 0 else "R"
-    html = await _fetch(TIPMINER_URL)
-    real_side = _pick_side_from_html(html or "", TM_PLAYER_RE, TM_BANKER_RE)
-    if not real_side:
-        fb_html = await _fetch(FALLBACK_URL)
-        if fb_html:
-            real_side = _pick_side_from_html(fb_html, CS_PLAYER_RE, CS_BANKER_RE)
-    if not real_side:
-        await aux_log({"ts": now_local().isoformat(), "type": "external_missing"})
-        return None
-    res = _result_from_sides(chosen_side, real_side)
-    if DEBUG_TO_TARGET:
-        await tg_send(TARGET_CHAT_ID, f"[DEBUG] real={real_side} -> {res}")
-    return res
 
+    attempts = []
+    for i in range(3):
+        # TipMiner
+        html = await _fetch(TIPMINER_URL)
+        real = _pick_side_from_html(html or "", TM_PLAYER_RE, TM_BANKER_RE)
+        attempts.append({"try": i+1, "site": "tipminer", "side": real})
+
+        if not real:
+            # Fallback
+            fb_html = await _fetch(FALLBACK_URL)
+            real = _pick_side_from_html(fb_html or "", CS_PLAYER_RE, CS_BANKER_RE)
+            attempts.append({"try": i+1, "site": "fallback", "side": real})
+
+        if real:
+            res = _result_from_sides(chosen_side, real)
+            if DEBUG_TO_TARGET:
+                await tg_send(TARGET_CHAT_ID, f"[DEBUG] try={i+1} real={real} -> {res}")
+            return res
+
+        await asyncio.sleep(1.2)
+
+    if DEBUG_TO_TARGET:
+        await tg_send(TARGET_CHAT_ID, f"[DEBUG] sem cor no site após tentativas: {attempts}")
+    await aux_log({"ts": now_local().isoformat(), "type": "external_missing", "attempts": attempts})
+    return None
+
+# ================== Fechar quando assinatura mudar + delay mínimo ==================
 async def maybe_close_by_external():
     osig = STATE.get("open_signal")
-    if not osig: return
+    if not osig:
+        return
+
+    # assinatura mudou? então a rodada antiga já foi resolvida
+    try:
+        html_now = await _fetch(TIPMINER_URL)
+        sig_now  = _round_signature_from_html(html_now or "")
+        sig_open = osig.get("open_signature")
+        signature_changed = (sig_open and sig_now and sig_open != sig_now)
+    except Exception:
+        signature_changed = False
+
+    # respeita delay mínimo, exceto se a assinatura já mudou
     opened_epoch = osig.get("src_opened_epoch", 0)
     now_epoch = int(now_local().timestamp())
-    if opened_epoch and (now_epoch - opened_epoch) < MIN_RESULT_DELAY_SEC:
-        return
+    if not signature_changed:
+        if opened_epoch and (now_epoch - opened_epoch) < MIN_RESULT_DELAY_SEC:
+            return
+
+    # aplica confirmação externa (com retry)
     final_res = await _apply_result_external_only(osig.get("chosen_side"))
     if final_res is None:
         return
+
+    # atualiza placar e fecha
     if final_res == "G":
         STATE["totals"]["greens"] += 1
         STATE["streak_green"] += 1
@@ -275,11 +314,12 @@ async def maybe_close_by_external():
         STATE["streak_green"] = 0
         rolling_append(osig.get("chosen_side"), "R")
         start_cooldown()
+
     await announce_outcome(final_res, osig.get("chosen_side"))
     STATE["open_signal"] = None
     save_state()
     if DEBUG_TO_TARGET:
-        await tg_send(TARGET_CHAT_ID, f"[HB] Fechado por heartbeat: {final_res}")
+        await tg_send(TARGET_CHAT_ID, f"[HB] Fechado por heartbeat: {final_res} (sig_changed={signature_changed})")
 
 # ================== TTL / Anti-trava ==================
 async def expire_open_if_needed():
@@ -301,7 +341,7 @@ def _decide_entry_from_tipminer(last_side: str | None) -> str:
         return "player" if random.random() < 0.5 else "banker"
     if AUTO_OPEN_STRATEGY == "follow":
         return last_side
-    return "player" if last_side == "banker" else "banker"  # opposite (padrão)
+    return "player" if last_side == "banker" else "banker"  # opposite
 
 async def auto_open_loop():
     if not AUTO_OPEN_FROM_TIPMINER:
@@ -333,7 +373,7 @@ async def auto_open_loop():
                     if DEBUG_TO_TARGET:
                         await tg_send(TARGET_CHAT_ID, f"[AUTO-OPEN] sig mudou • last={last_side or '?'} • chosen={chosen}")
 
-                # atualiza assinatura mesmo com sinal aberto (acompanhar rodada)
+                # com sinal aberto, ainda assim atualiza a assinatura (p/ detectar virada)
                 if prev_sig != sig and STATE.get("open_signal") is not None:
                     STATE["auto_last_round_sig"] = sig
                     save_state()
@@ -375,7 +415,7 @@ async def safe_errors(request, call_next):
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "TipMiner abre & fecha • Heartbeat ativo • Fetch anti-cache"}
+    return {"ok": True, "service": "TipMiner abre & fecha • Heartbeat ativo • Fetch anti-cache • Retry"}
 
 @app.get("/debug/tipminer")
 async def dbg_tm():
@@ -388,3 +428,28 @@ async def dbg_tm():
 @app.get("/debug/state")
 async def dbg_state():
     return {"open_signal": STATE.get("open_signal"), "last_publish_ts": STATE.get("last_publish_ts")}
+
+# ---- Force-close (para teste rápido pelo celular) ----
+@app.get("/debug/force-close")
+async def dbg_force_close():
+    osig = STATE.get("open_signal")
+    if not osig:
+        return {"ok": False, "err": "no open_signal"}
+    res = await _apply_result_external_only(osig.get("chosen_side"))
+    if not res:
+        return {"ok": False, "err": "no external color"}
+    if res == "G":
+        STATE["totals"]["greens"] += 1
+        STATE["streak_green"] += 1
+        rolling_append(osig.get("chosen_side"), "G")
+    else:
+        STATE["totals"]["reds"] += 1
+        STATE["streak_green"] = 0
+        rolling_append(osig.get("chosen_side"), "R")
+        start_cooldown()
+    await announce_outcome(res, osig.get("chosen_side"))
+    STATE["open_signal"] = None
+    save_state()
+    if DEBUG_TO_TARGET:
+        await tg_send(TARGET_CHAT_ID, f"[DEBUG] force-close: {res}")
+    return {"ok": True, "result": res}
