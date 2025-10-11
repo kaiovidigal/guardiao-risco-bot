@@ -1,32 +1,6 @@
 services:
   - type: web
-    name: bacbo-telegram-bot
-    env: docker
-    plan: starter
-    autoDeploy: true
-    healthCheckPath: /
-    envVars:
-      - key: TZ
-        value: America/Sao_Paulo
-      - key: TG_BOT_TOKEN
-        sync: false
-      - key: SOURCE_CHAT_ID
-        sync: false
-      - key: TARGET_CHAT_ID
-        sync: false
-      - key: USE_PLAYWRIGHT
-        value: "1"
-      - key: REQUIRE_EXTERNAL_CONFIRM
-        value: "1"
-      - key: TIPMINER_URL
-        value: "https://www.tipminer.com/br/historico/jonbet/bac-bo"
-      - key: FALLBACK_URL
-        value: "https://casinoscores.com/pt-br/bac-bo/"
-      - key: OPEN_STRICT_SERIAL
-        value: "1"
-      - key: CLOSE_ONLY_ON_FLOW_CONFIRM
-        value: "1"
-      - key: ENFORCE_RESULT_AFTER_NEW_SOURCE_MESSAGE
-        value: "1"
-      - key: MIN_RESULT_DELAY_SEC
-        value: "8"
+    name: guardiao-risco2
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
