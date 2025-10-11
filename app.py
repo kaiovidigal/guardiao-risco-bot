@@ -1,4 +1,4 @@
-# app.py — TipMiner abre e fecha • Heartbeat • Fetch anti-cache • Retry • Force-close • Debug
+# app.py — TipMiner abre e fecha • Heartbeat • Anti-cache • Retry • GREEN_RULE • Force-close • Debug
 import os, re, json, asyncio, pytz, logging, random, hashlib
 from datetime import datetime, timedelta
 from collections import deque
@@ -22,6 +22,9 @@ AUTO_OPEN_MIN_GAP_SEC   = int(os.getenv("AUTO_OPEN_MIN_GAP_SEC", "8"))
 # Fechamento (externo)
 REQUIRE_EXTERNAL_CONFIRM = os.getenv("REQUIRE_EXTERNAL_CONFIRM", "1") == "1"
 MIN_RESULT_DELAY_SEC     = int(os.getenv("MIN_RESULT_DELAY_SEC", "8"))
+
+# Regra de GREEN
+GREEN_RULE = os.getenv("GREEN_RULE", "opposite").lower()  # opposite | follow
 
 # Janelas / segurança
 OPEN_TTL_SEC            = int(os.getenv("OPEN_TTL_SEC", "90"))
@@ -207,8 +210,18 @@ async def tipminer_snapshot() -> tuple[str | None, str | None]:
 
 # ================== Resultado & Publicação ==================
 def _result_from_sides(chosen: str, real: str) -> str:
-    # GREEN se nossa escolha != lado real (opposite strategy)
-    return "G" if chosen and real and chosen != real else "R"
+    """
+    Decide GREEN/LOSS conforme GREEN_RULE:
+    - opposite: GREEN se chosen != real
+    - follow:   GREEN se chosen == real
+    """
+    rule = GREEN_RULE
+    if not chosen or not real:
+        return "R"
+    if rule == "follow":
+        return "G" if chosen == real else "R"
+    # padrão: opposite
+    return "G" if chosen != real else "R"
 
 async def publish_entry(chosen_side:str, fonte_side:str|None, msg:dict):
     pretty = ("🚀 <b>ENTRADA AUTÔNOMA (G0)</b>\n"
@@ -224,7 +237,7 @@ async def publish_entry(chosen_side:str, fonte_side:str|None, msg:dict):
         "src_opened_epoch": msg.get("date", int(now_local().timestamp())),
     }
 
-    # >>> guarda assinatura da rodada no momento da abertura (Patch 1)
+    # guarda assinatura da rodada no momento da abertura
     try:
         html_open = await _fetch(TIPMINER_URL)
         STATE["open_signal"]["open_signature"] = _round_signature_from_html(html_open or "")
@@ -247,7 +260,7 @@ async def announce_outcome(result:str, chosen_side:str|None):
 
 # ================== Fechamento externo (Retry + Logs) ==================
 async def _apply_result_external_only(chosen_side: str | None) -> str | None:
-    # modo SOS: fecha mesmo sem site (apenas para teste quando REQUIRE_EXTERNAL_CONFIRM=0)
+    # modo SOS: fecha mesmo sem site (apenas quando REQUIRE_EXTERNAL_CONFIRM=0)
     if not REQUIRE_EXTERNAL_CONFIRM:
         return "G" if int(now_local().timestamp()) % 2 == 0 else "R"
 
@@ -267,7 +280,7 @@ async def _apply_result_external_only(chosen_side: str | None) -> str | None:
         if real:
             res = _result_from_sides(chosen_side, real)
             if DEBUG_TO_TARGET:
-                await tg_send(TARGET_CHAT_ID, f"[DEBUG] try={i+1} real={real} -> {res}")
+                await tg_send(TARGET_CHAT_ID, f"[DEBUG] try={i+1} real={real} -> {res} (rule={GREEN_RULE})")
             return res
 
         await asyncio.sleep(1.2)
@@ -277,34 +290,38 @@ async def _apply_result_external_only(chosen_side: str | None) -> str | None:
     await aux_log({"ts": now_local().isoformat(), "type": "external_missing", "attempts": attempts})
     return None
 
-# ================== Fechar quando assinatura mudar + delay mínimo ==================
+# ================== Fechar quando assinatura muda + delay mínimo ==================
 async def maybe_close_by_external():
     osig = STATE.get("open_signal")
     if not osig:
         return
 
     # assinatura mudou? então a rodada antiga já foi resolvida
+    signature_changed = False
     try:
         html_now = await _fetch(TIPMINER_URL)
         sig_now  = _round_signature_from_html(html_now or "")
         sig_open = osig.get("open_signature")
         signature_changed = (sig_open and sig_now and sig_open != sig_now)
     except Exception:
-        signature_changed = False
+        pass
 
-    # respeita delay mínimo, exceto se a assinatura já mudou
     opened_epoch = osig.get("src_opened_epoch", 0)
     now_epoch = int(now_local().timestamp())
-    if not signature_changed:
-        if opened_epoch and (now_epoch - opened_epoch) < MIN_RESULT_DELAY_SEC:
-            return
 
-    # aplica confirmação externa (com retry)
-    final_res = await _apply_result_external_only(osig.get("chosen_side"))
-    if final_res is None:
+    # respeita delay mínimo, exceto se a assinatura já mudou
+    if not signature_changed and opened_epoch and (now_epoch - opened_epoch) < MIN_RESULT_DELAY_SEC:
         return
 
-    # atualiza placar e fecha
+    # tenta ler a cor (com retry)
+    final_res = await _apply_result_external_only(osig.get("chosen_side"))
+    if final_res is None:
+        # rodada virou mas sem cor? tenta de novo no próximo loop
+        if signature_changed and DEBUG_TO_TARGET:
+            await tg_send(TARGET_CHAT_ID, "[DEBUG] rodada virou, aguardando cor no próximo heartbeat")
+        return
+
+    # aplica placar e fecha
     if final_res == "G":
         STATE["totals"]["greens"] += 1
         STATE["streak_green"] += 1
@@ -319,7 +336,7 @@ async def maybe_close_by_external():
     STATE["open_signal"] = None
     save_state()
     if DEBUG_TO_TARGET:
-        await tg_send(TARGET_CHAT_ID, f"[HB] Fechado por heartbeat: {final_res} (sig_changed={signature_changed})")
+        await tg_send(TARGET_CHAT_ID, f"[HB] Fechado (sig_changed={signature_changed}) -> {final_res}")
 
 # ================== TTL / Anti-trava ==================
 async def expire_open_if_needed():
@@ -415,7 +432,7 @@ async def safe_errors(request, call_next):
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "TipMiner abre & fecha • Heartbeat ativo • Fetch anti-cache • Retry"}
+    return {"ok": True, "service": "TipMiner abre & fecha • Heartbeat • Anti-cache • Retry • GREEN_RULE"}
 
 @app.get("/debug/tipminer")
 async def dbg_tm():
