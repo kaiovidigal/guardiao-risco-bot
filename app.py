@@ -1,4 +1,4 @@
-# app.py — G0 serial + fechamento rápido vs fonte + 5 especialistas + LOSS (🔴🔴🔴)/(🔵🔵🔵)
+# app.py — G0 serial + fechamento validado (TipMiner Playwright + fallback)
 import os, re, json, asyncio, pytz, logging, random
 from datetime import datetime, timedelta
 from collections import deque
@@ -75,6 +75,12 @@ LOG_RAW      = os.getenv("LOG_RAW", "1") == "1"
 
 STATE_PATH = os.getenv("STATE_PATH", "./state/state.json")
 API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
+# ====== PLAYWRIGHT / SCRAPERS ======
+USE_PLAYWRIGHT = os.getenv("USE_PLAYWRIGHT", "1") == "1"  # ativa o scraper headless
+TIPMINER_URL   = os.getenv("TIPMINER_URL", "https://www.tipminer.com/br/historico/jonbet/bac-bo")
+FALLBACK_URL   = os.getenv("FALLBACK_URL", "https://casinoscores.com/pt-br/bac-bo/")
+REQUIRE_EXTERNAL_CONFIRM = os.getenv("REQUIRE_EXTERNAL_CONFIRM", "1") == "1"
 
 # ================== APP ==================
 app = FastAPI()
@@ -340,20 +346,87 @@ def spec_side_repeat_guard(candidate:str)->tuple[bool,str]:
         return False, "side_repeat_cap"
     return True,"ok"
 
-# ================== RESULTADO CORRETO vs FONTE ==================
-def derive_our_result_from_source_flow(text:str, fonte_side:str|None, chosen_side:str|None):
-    """
-    - Se fonte foi para G1/G2: igual ao fonte = LOSS; oposto = GREEN
-    - Se fonte G0 de primeira: igual ao fonte = GREEN; oposto = LOSS
-    """
-    if not fonte_side or not chosen_side:
-        return None
-    low = (text or "").lower()
-    if SOURCE_WENT_GALE_RE.search(low):
-        return "R" if (chosen_side == fonte_side) else "G"
-    if SOURCE_G0_GREEN_RE.search(low):
-        return "G" if (chosen_side == fonte_side) else "R"
+# ================== EXTERNO: TipMiner (Playwright) + fallbacks HTML ==================
+# Importa o scraper do Playwright, se disponível
+try:
+    if USE_PLAYWRIGHT:
+        from tipminer_scraper import get_tipminer_latest_side as pw_tipminer
+except Exception as _e:
+    log.warning("Playwright indisponível: %s", _e)
+    USE_PLAYWRIGHT = False
+
+TM_PLAYER_RE = re.compile(r"(🔵|🟦|Player|Azul)", re.I)
+TM_BANKER_RE = re.compile(r"(🔴|🟥|Banker|Vermelho)", re.I)
+CS_PLAYER_RE = re.compile(r"(Jogador|Player)", re.I)
+CS_BANKER_RE = re.compile(r"(Banqueiro|Banker)", re.I)
+
+async def _fetch(url: str) -> str | None:
+    try:
+        async with httpx.AsyncClient(timeout=15) as cli:
+            r = await cli.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200 and r.text:
+                return r.text
+    except Exception as e:
+        log.warning("fetch fail %s: %s", url, e)
     return None
+
+def _pick_side_from_html(html: str, re_player: re.Pattern, re_banker: re.Pattern) -> str | None:
+    if not html: return None
+    head = html[:20000]
+    has_p = bool(re_player.search(head))
+    has_b = bool(re_banker.search(head))
+    if has_p and not has_b: return "player"
+    if has_b and not has_p: return "banker"
+    mp = re_player.search(head); mb = re_banker.search(head)
+    if mp and mb: return "player" if mp.start() < mb.start() else "banker"
+    return None
+
+async def tipminer_latest_side_html() -> tuple[str | None, str]:
+    html = await _fetch(TIPMINER_URL)
+    side = _pick_side_from_html(html or "", TM_PLAYER_RE, TM_BANKER_RE)
+    return side, "tipminer_html"
+
+async def casinoscores_latest_side_html() -> tuple[str | None, str]:
+    html = await _fetch(FALLBACK_URL)
+    side = _pick_side_from_html(html or "", CS_PLAYER_RE, CS_BANKER_RE)
+    return side, "casinoscores_html"
+
+async def external_verify_latest_side() -> tuple[str | None, str | None]:
+    """
+    1) Tenta TipMiner via Playwright (SPA confiável).
+    2) Se falhar, tenta TipMiner HTML; se falhar, tenta CasinoScores HTML.
+    Em conflito → retorna (None, None) para não fechar.
+    """
+    # 1) Playwright TipMiner
+    if USE_PLAYWRIGHT:
+        try:
+            side, src, _raw = await pw_tipminer(TIPMINER_URL)
+            if side:
+                fb_side, fb_src = await casinoscores_latest_side_html()
+                if fb_side and fb_side != side:
+                    await aux_log({"ts": now_local().isoformat(), "type": "external_conflict",
+                                   "tipminer_pw": side, "fallback": fb_side})
+                    return None, None
+                return side, src
+        except Exception as e:
+            await aux_log({"ts": now_local().isoformat(), "type": "playwright_error", "err": str(e)})
+
+    # 2) Fallbacks por HTML
+    tm_side, tm_src = await tipminer_latest_side_html()
+    if tm_side:
+        cs_side, cs_src = await casinoscores_latest_side_html()
+        if cs_side and cs_side != tm_side:
+            await aux_log({"ts": now_local().isoformat(), "type": "external_conflict",
+                           "tipminer_html": tm_side, "casinoscores_html": cs_side})
+            return None, None
+        return tm_side, tm_src
+
+    cs_side, cs_src = await casinoscores_latest_side_html()
+    return (cs_side, cs_src) if cs_side else (None, None)
+
+def _result_from_sides(chosen: str, real: str) -> str:
+    # Nosso GREEN quando escolhemos o lado oposto ao "lado real" do último giro
+    return "G" if chosen and real and chosen != real else "R"
 
 # ================== PUBLICAÇÃO ==================
 async def publish_entry(chosen_side:str, fonte_side:str|None, msg:dict):
@@ -464,6 +537,44 @@ async def try_open_from_source(msg:dict):
     )
 
 # ================== LÓGICA DE FECHAMENTO ==================
+def derive_our_result_from_source_flow(text:str, fonte_side:str|None, chosen_side:str|None):
+    """
+    - Se fonte foi para G1/G2: igual ao fonte = LOSS; oposto = GREEN
+    - Se fonte G0 de primeira: igual ao fonte = GREEN; oposto = LOSS
+    """
+    if not fonte_side or not chosen_side:
+        return None
+    low = (text or "").lower()
+    if SOURCE_WENT_GALE_RE.search(low):
+        return "R" if (chosen_side == fonte_side) else "G"
+    if SOURCE_G0_GREEN_RE.search(low):
+        return "G" if (chosen_side == fonte_side) else "R"
+    return None
+
+async def _apply_result_with_external_check(our_res: str | None, chosen_side: str | None):
+    """
+    Se REQUIRE_EXTERNAL_CONFIRM=1:
+      - tenta confirmar o lado real via TipMiner/CasinoScores
+      - compara com a nossa escolha para derivar G/R final
+    Caso não obtenha confirmação, retorna None para postergar o fechamento.
+    """
+    if not REQUIRE_EXTERNAL_CONFIRM:
+        return our_res
+
+    ext_side, ext_src = await external_verify_latest_side()
+    if not ext_side:
+        # sem confirmação -> segura a mão e aguarda próxima msg
+        await aux_log({"ts": now_local().isoformat(),"type":"external_missing"})
+        return None
+
+    if chosen_side:
+        ext_res = _result_from_sides(chosen_side, ext_side)  # 'G' se nosso escolhido != lado real
+        if our_res and our_res != ext_res:
+            await aux_log({"ts": now_local().isoformat(),"type":"external_override",
+                           "our_res": our_res, "ext_res": ext_res, "src": ext_src})
+        return ext_res
+    return our_res
+
 async def maybe_close_from_source(msg:dict):
     osig = STATE.get("open_signal")
     if not osig: return
@@ -484,6 +595,7 @@ async def maybe_close_from_source(msg:dict):
         # se nossa escolha = cor do fonte → LOSS, senão GREEN
         our_res = "R" if chosen == final_loss_side else "G"
 
+        # aplica placar
         if our_res == "G":
             STATE["totals"]["greens"] += 1
             STATE["streak_green"] += 1
@@ -494,7 +606,6 @@ async def maybe_close_from_source(msg:dict):
             rolling_append(chosen, "R")
             start_cooldown()
 
-        # opcional: preservar cor do fonte para histórico
         if not osig.get("fonte_side"):
             osig["fonte_side"] = final_loss_side
 
@@ -503,7 +614,7 @@ async def maybe_close_from_source(msg:dict):
         save_state()
         return
 
-    # só fecha se houver confirmação clara do fluxo
+    # precisa confirmação do fluxo para fechar
     has_flow_confirm = bool(SOURCE_G0_GREEN_RE.search(low) or SOURCE_WENT_GALE_RE.search(low))
     if not has_flow_confirm:
         if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC and _can_extend_ttl(raw_text):
@@ -528,8 +639,17 @@ async def maybe_close_from_source(msg:dict):
             save_state()
         return
 
-    # aplicar no placar
-    if our_res == "G":
+    # ===== validação externa antes de fechar =====
+    final_res = await _apply_result_with_external_check(our_res, osig.get("chosen_side"))
+
+    if final_res is None:
+        # não fecha ainda; estende TTL
+        if EXTEND_TTL_ON_ACTIVITY and _open_age_secs() < MAX_OPEN_WINDOW_SEC:
+            osig["expires_at"] = (now_local()+timedelta(seconds=RESULT_GRACE_EXTEND_SEC)).isoformat()
+            save_state()
+        return
+
+    if final_res == "G":
         STATE["totals"]["greens"] += 1
         STATE["streak_green"] += 1
         rolling_append(osig.get("chosen_side"), "G")
@@ -539,7 +659,7 @@ async def maybe_close_from_source(msg:dict):
         rolling_append(osig.get("chosen_side"), "R")
         start_cooldown()
 
-    await announce_outcome(our_res, osig.get("chosen_side"))
+    await announce_outcome(final_res, osig.get("chosen_side"))
     STATE["open_signal"] = None
     save_state()
 
@@ -580,7 +700,7 @@ async def safe_errors(request, call_next):
 
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "G0 serial, fechamento rápido pelo fonte, especialistas na abertura"}
+    return {"ok": True, "service": "G0 serial + fechamento validado (TipMiner + fallback)"}
 
 @app.post("/webhook")
 @app.post("/webhook/{secret}")
