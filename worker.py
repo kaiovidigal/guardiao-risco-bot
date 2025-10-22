@@ -19,15 +19,15 @@ KW_PASS = "SUA_SENHA_AQUI"
 LOGIN_URL = "https://kwbet.com/pt"
 CRAPS_URL = "https://kwbet.com/pt/games/live-craps" # URL do Craps
 
-# XPATHs genéricos da Kwbet 
+# XPATHs REVISADOS: Focados em 'ENTRAR' em maiúsculas e XPATHs genéricos.
 SELECTORS = {
-    # Tenta encontrar o botão "Entrar" na página inicial para abrir o modal (COMENTADO NO FLUXO DE LOGIN)
-    "login_open_button": "//button[contains(text(), 'Entrar')]", 
-    # Tenta encontrar o primeiro campo de entrada de texto ou email
+    # NOVO XPATH: Tenta encontrar o botão "ENTRAR" (em maiúsculas, como visto na imagem) que pode ser um <button> ou <a>
+    "login_open_button": "//button[text()='ENTRAR'] | //a[text()='ENTRAR']", 
+    # Tenta encontrar o primeiro campo de entrada de texto ou email (dentro do modal)
     "username_field": "(//input[@type='email' or @type='text'])[1]",                  
-    # Campo de senha
+    # Campo de senha (dentro do modal)
     "password_field": "//input[@type='password']",                  
-    # Botão de envio (submit) dentro do modal/formulário
+    # Botão de envio (submit) final no modal
     "login_submit_button": "//button[@type='submit' or contains(text(), 'Entrar')]" 
 }
 
@@ -63,7 +63,7 @@ def initialize_driver():
         raise 
 
 def login_to_site(driver, username, password):
-    """Tenta realizar o login na Kwbet, indo direto para os campos de usuário/senha."""
+    """Tenta realizar o login na Kwbet, clicando no botão 'ENTRAR' e preenchendo os campos."""
     driver.get(LOGIN_URL)
     print(f"Tentando acessar a página de login: {LOGIN_URL}")
     
@@ -71,14 +71,14 @@ def login_to_site(driver, username, password):
     wait = WebDriverWait(driver, 25)
 
     try:
-        # 1. CLIQUE NO BOTÃO DE ABERTURA - ETAPA COMENTADA PORQUE FALHOU ANTERIORMENTE
-        # Se os campos já estiverem visíveis, este bloco será ignorado.
-        # Caso queira reativar:
-        # login_open_button = wait.until(EC.element_to_be_clickable((By.XPATH, SELECTORS["login_open_button"])))
-        # login_open_button.click()
-        
-        print("AVISO: Pulando o clique no botão 'Entrar' e indo direto para os campos.")
-        time.sleep(2) 
+        # 1. CLICA NO BOTÃO 'ENTRAR' NA PÁGINA INICIAL (Abre o modal)
+        print("Tentando abrir o modal de Login (clicando no botão 'ENTRAR')...")
+        login_open_button = wait.until(
+            EC.element_to_be_clickable((By.XPATH, SELECTORS["login_open_button"]))
+        )
+        login_open_button.click()
+        print("✅ Botão 'ENTRAR' clicado. Aguardando modal...")
+        time.sleep(3) # Pausa um pouco maior para garantir que o modal carregue
         
         # 2. ENCONTRA E PREENCHE O CAMPO DE USUÁRIO
         print("Preenchendo Usuário...")
@@ -102,7 +102,7 @@ def login_to_site(driver, username, password):
             EC.element_to_be_clickable((By.XPATH, SELECTORS["login_submit_button"]))
         )
         login_submit_button.click()
-        print("✅ Botão Entrar clicado. Aguardando redirecionamento...")
+        print("✅ Botão Entrar final clicado. Aguardando redirecionamento...")
         
         # 5. VERIFICA O SUCESSO DO LOGIN
         time.sleep(10) # Pausa aumentada para estabilizar o redirecionamento
@@ -113,14 +113,14 @@ def login_to_site(driver, username, password):
             return True
         else:
             print("❌ FALHA NO LOGIN: Permaneceu na página ou URL de login.")
-            print("Isso pode ser devido a: XPATH errado ou CAPTCHA/verificação de segurança após o clique.")
+            print("Isso pode ser devido a: XPATH do campo final ou CAPTCHA/verificação de segurança.")
             return False
 
     except (TimeoutException, NoSuchElementException) as e:
         # CAPTURA O ERRO ESPECÍFICO DO SELENIUM
         print("\n=======================================================")
         print("❌ ERRO NO XPATH/TIMEOUT: O bot não conseguiu encontrar um elemento na tela.")
-        print("POSSÍVEL CAUSA: XPATH do USUÁRIO, SENHA ou SUBMIT está incorreto.")
+        print("POSSÍVEL CAUSA: O XPATH que falhou está entre 'Tentando abrir o modal' e '✅ Usuário preenchido.'.")
         print(f"DETALHES DO ERRO: {e}") 
         print("=======================================================\n")
         return False
