@@ -19,15 +19,17 @@ KW_PASS = "SUA_SENHA_AQUI"
 LOGIN_URL = "https://kwbet.com/pt"
 CRAPS_URL = "https://kwbet.com/pt/games/live-craps" # URL do Craps
 
-# XPATHs REVISADOS: Focados em 'ENTRAR' em maiúsculas e XPATHs genéricos.
+# XPATHs REVISADOS: Focados no XPATH mais abrangente para o botão 'ENTRAR'.
 SELECTORS = {
-    # NOVO XPATH: Tenta encontrar o botão "ENTRAR" (em maiúsculas, como visto na imagem) que pode ser um <button> ou <a>
-    "login_open_button": "//button[text()='ENTRAR'] | //a[text()='ENTRAR']", 
-    # Tenta encontrar o primeiro campo de entrada de texto ou email (dentro do modal)
-    "username_field": "(//input[@type='email' or @type='text'])[1]",                  
-    # Campo de senha (dentro do modal)
+    # MUDANÇA CRÍTICA: XPATH mais flexível para o botão 'ENTRAR'
+    # Procura 'ENTRAR' ou 'Entrar' (maiúsculas/minúsculas) em tags <button> ou <a>.
+    "login_open_button": "//button[contains(text(), 'ENTRAR')] | //button[contains(text(), 'Entrar')] | //a[contains(text(), 'ENTRAR')] | //a[contains(text(), 'Entrar')]", 
+    
+    # Tentativa de XPATH genérico final para o campo de Usuário/Email (dentro do modal)
+    "username_field": "//input[@name='username' or @name='email' or @id='username' or @id='email' or @type='text' or @type='email']",                  
+    
+    # Mantém a senha e o botão final
     "password_field": "//input[@type='password']",                  
-    # Botão de envio (submit) final no modal
     "login_submit_button": "//button[@type='submit' or contains(text(), 'Entrar')]" 
 }
 
@@ -120,7 +122,7 @@ def login_to_site(driver, username, password):
         # CAPTURA O ERRO ESPECÍFICO DO SELENIUM
         print("\n=======================================================")
         print("❌ ERRO NO XPATH/TIMEOUT: O bot não conseguiu encontrar um elemento na tela.")
-        print("POSSÍVEL CAUSA: O XPATH que falhou está entre 'Tentando abrir o modal' e '✅ Usuário preenchido.'.")
+        print("POSSÍVEL CAUSA: O XPATH que falhou está entre as mensagens acima.")
         print(f"DETALHES DO ERRO: {e}") 
         print("=======================================================\n")
         return False
