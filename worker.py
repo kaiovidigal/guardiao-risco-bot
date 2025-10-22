@@ -19,11 +19,11 @@ KW_PASS = "SUA_SENHA_AQUI"
 LOGIN_URL = "https://kwbet.com/pt"
 CRAPS_URL = "https://kwbet.com/pt/games/live-craps" # URL do Craps
 
-# XPATHs REVISADOS: Focados no XPATH mais abrangente para o botão 'ENTRAR'.
+# XPATHs REVISADOS: Focados no XPATH mais abrangente para o botão 'ENTRAR'
 SELECTORS = {
-    # MUDANÇA CRÍTICA: XPATH mais flexível para o botão 'ENTRAR'
-    # Procura 'ENTRAR' ou 'Entrar' (maiúsculas/minúsculas) em tags <button> ou <a>.
-    "login_open_button": "//button[contains(text(), 'ENTRAR')] | //button[contains(text(), 'Entrar')] | //a[contains(text(), 'ENTRAR')] | //a[contains(text(), 'Entrar')]", 
+    # XPATH MAIS ABRANGENTE: Procura 'ENTRAR' ou 'Entrar' (maiúsculas/minúsculas) em tags <button> ou <a>, 
+    # e tenta excluir o botão 'REGISTRE-SE' da busca.
+    "login_open_button": "//button[text()='ENTRAR'] | //a[text()='ENTRAR'] | //*[contains(text(), 'ENTRAR') and not(contains(text(), 'REGISTRE'))]", 
     
     # Tentativa de XPATH genérico final para o campo de Usuário/Email (dentro do modal)
     "username_field": "//input[@name='username' or @name='email' or @id='username' or @id='email' or @type='text' or @type='email']",                  
@@ -115,14 +115,14 @@ def login_to_site(driver, username, password):
             return True
         else:
             print("❌ FALHA NO LOGIN: Permaneceu na página ou URL de login.")
-            print("Isso pode ser devido a: XPATH do campo final ou CAPTCHA/verificação de segurança.")
+            print("Isso pode ser devido a: XPATH do botão final, CAPTCHA ou verificação de segurança.")
             return False
 
     except (TimeoutException, NoSuchElementException) as e:
         # CAPTURA O ERRO ESPECÍFICO DO SELENIUM
         print("\n=======================================================")
         print("❌ ERRO NO XPATH/TIMEOUT: O bot não conseguiu encontrar um elemento na tela.")
-        print("POSSÍVEL CAUSA: O XPATH que falhou está entre as mensagens acima.")
+        print("PONTO CRÍTICO: O XPATH que falhou está entre as mensagens acima. O provável é o botão 'ENTRAR' ou o campo de Usuário.")
         print(f"DETALHES DO ERRO: {e}") 
         print("=======================================================\n")
         return False
