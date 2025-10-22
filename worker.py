@@ -72,6 +72,7 @@ def initialize_driver():
         # Força a resolução de desktop para evitar redirecionamento
         options.add_argument("--window-size=1920,1080") 
         
+        # Inicia o driver usando UC
         driver = uc.Chrome(options=options)
         return driver
     except Exception as e:
@@ -80,7 +81,7 @@ def initialize_driver():
         return None
 
 def login_to_site(driver, login_url, user, password, selectors):
-    """Realiza o login com tolerância máxima de tempo e disfarce humano."""
+    """Realiza o login, garantindo o clique no botão inicial para abrir o modal."""
     try:
         driver.get(login_url)
         print(f"Tentando acessar a página do Kwbet: {login_url}...")
@@ -88,38 +89,39 @@ def login_to_site(driver, login_url, user, password, selectors):
         # Espera de 15s para a página carregar completamente
         time.sleep(15) 
         
-        # --- PASSO: Clicar no botão de LOGIN/ENTRAR na página inicial (para abrir o modal) ---
+        # 1. FORÇA O CLIQUE NO BOTÃO SUPERIOR "LOGIN" OU "ENTRAR" (Se necessário)
         try:
-            # Tenta encontrar o botão que abre o modal de login na página inicial
-            login_open_button = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'LOGIN') or contains(., 'ENTRAR')]"))
+            print("Tentando clicar no botão LOGIN/ENTRAR na página inicial para abrir o modal...")
+            # XPATH busca o botão de login/entrar (pode ser um <a> ou <button>)
+            login_open_button = WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.XPATH, "//a[contains(., 'LOGIN')] | //a[contains(., 'ENTRAR')] | //button[contains(., 'LOGIN')] | //button[contains(., 'ENTRAR')]"))
             )
             login_open_button.click()
             time.sleep(5) # Espera o modal de login abrir
-        except Exception:
-            print("Aviso: Botão de login inicial não encontrado ou não é necessário.")
+        except Exception as e:
+            print(f"Aviso: Não foi necessário clicar no botão inicial de LOGIN/ENTRAR. O formulário pode estar visível. {e}")
+            pass
 
-        # Espera que o campo de usuário esteja INTERAGÍVEL (agora dentro do modal)
+        # 2. ESPERA E PREENCHE O CAMPO DE USUÁRIO (Dentro do modal)
         user_field = WebDriverWait(driver, 40).until(
             EC.element_to_be_clickable((By.XPATH, selectors["username_field"]))
         )
         print("Preenchendo credenciais...")
         user_field.send_keys(user)
 
-        # Espera que o campo de senha esteja INTERAGÍVEL
+        # 3. PREENCHE O CAMPO DE SENHA
         pass_field = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, selectors["password_field"]))
         )
         pass_field.send_keys(password)
 
-        # --- AÇÃO HUMANIZADA ---
-        time.sleep(2) # Pequeno atraso antes de clicar em ENTRAR
-
-        # Clicar no botão de login do MODAL
+        # 4. CLICA NO BOTÃO DE SUBMISSÃO (O botão de dentro do modal)
+        time.sleep(2) # AÇÃO HUMANIZADA
+        
         driver.find_element(By.XPATH, selectors["login_button"]).click()
         time.sleep(5) 
 
-        # --- NAVEGAÇÃO PARA O JOGO ---
+        # 5. NAVEGAÇÃO PARA O JOGO
         driver.get(CRAPS_URL)
         print("Login realizado. Navegando para a página do Craps...")
         
@@ -141,7 +143,7 @@ def login_to_site(driver, login_url, user, password, selectors):
         
     except Exception as e:
         print(f"ERRO DE LOGIN: {e}")
-        send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Falha de Autenticação (Kwbet). Verifique as credenciais. 🚨")
+        send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Falha de Autenticação (Kwbet). Verifique as credenciais e o processo de login. 🚨")
         return False
 
 def scrape_data(driver, selectors_list):
