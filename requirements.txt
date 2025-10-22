@@ -3,4 +3,5 @@ urllib3
 chromedriver-autoinstaller
 requests
 python-telegram-bot
+undetected-chromedriver
 webdriver-manager # Opcional, mas útil para o desenvolvimento local
