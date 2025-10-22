@@ -72,7 +72,7 @@ def initialize_driver():
         return None
 
 def login_to_site(driver, login_url, user, password, selectors):
-    """Realiza o login com tolerância máxima de tempo."""
+    """Realiza o login com tolerância máxima de tempo e tenta mudar para Iframe."""
     try:
         driver.get(login_url)
         print(f"Tentando acessar a página de login: {login_url}...")
@@ -96,14 +96,32 @@ def login_to_site(driver, login_url, user, password, selectors):
         driver.find_element(By.XPATH, selectors["login_button"]).click()
         time.sleep(5) 
 
+        # --- NAVEGAÇÃO PARA O JOGO ---
         driver.get(CRAPS_URL)
         print("Login realizado. Navegando para a página do Craps...")
-        # AUMENTO MÁXIMO: 30s para o jogo da Evolution carregar no Render Starter
+        
+        # Espera 30s para o jogo carregar (mesmo no Standard)
         time.sleep(30) 
+        
+        # === TENTATIVA DE MUDAR PARA O IFRAME DO JOGO ===
+        try:
+            # Tenta encontrar o iframe pelo nome da provedora (Evolution) ou pela tag
+            iframe = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "iframe"))
+            )
+            driver.switch_to.frame(iframe)
+            print("Sucesso: Foco alterado para o Iframe do jogo.")
+        except Exception:
+            # Se não conseguir, assume que não há iframe ou que o elemento do resultado está no host
+            print("Aviso: Iframe do jogo não encontrado. Tentando raspar do host.")
+            pass # Continua no host
+            
         return True
+        
     except Exception as e:
+        # Se o login falhar (EVS incorreta), cairá neste erro
         print(f"ERRO DE LOGIN: {e}")
-        send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Elemento não interativo, Timeout ou Credenciais inválidas. 🚨")
+        send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Credenciais, Timeout, ou Falha na Navegação para o Jogo. 🚨")
         return False
 
 def scrape_data(driver, selectors_list):
@@ -112,11 +130,12 @@ def scrape_data(driver, selectors_list):
         by_type = selectors_list[i]
         selector_value = selectors_list[i+1]
         try:
-            # AUMENTO MÁXIMO: 20s para o resultado aparecer (Timeout)
+            # Tempo de espera de 20s para o resultado aparecer (Timeout)
             result_element = WebDriverWait(driver, 20).until( 
                 EC.presence_of_element_located((by_type, selector_value))
             )
             result_text = result_element.text.strip()
+            # Tenta converter para inteiro, se for número
             if result_text.isdigit():
                 return int(result_text)
             else:
@@ -124,6 +143,12 @@ def scrape_data(driver, selectors_list):
         except Exception:
             continue
             
+    # Tenta retornar ao contexto principal se não encontrar nada (caso o erro não tenha sido o iframe)
+    try:
+        driver.switch_to.default_content()
+    except:
+        pass
+        
     return None
 
 # ==============================================================================
@@ -179,7 +204,6 @@ def main_worker_loop():
             time.sleep(5) 
 
         except Exception as e:
-            # Este erro CRÍTICO ocorrerá se o driver travar por muito tempo (e forçar a reinicialização)
             print(f"ERRO CRÍTICO NO LOOP: {e}")
             send_telegram_message(f"🚨 ERRO INESPERADO no Craps. Reiniciando Worker. Detalhe: {e} 🚨")
             driver.quit()
