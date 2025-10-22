@@ -1,8 +1,8 @@
 import os
 import time
 import requests 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+# Importa o undetected_chromedriver
+import undetected_chromedriver as uc 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -17,7 +17,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LOGIN_USER = os.getenv("LOGIN_USER")
 LOGIN_PASS = os.getenv("LOGIN_PASS")
 
-# --- URLs DESKTOP/NORMAL (www.) ---
+# URLs DESKTOP/NORMAL (www.)
 LOGIN_URL = "https://www.luck.bet.br/signin?path=login" 
 CRAPS_URL = "https://www.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
 
@@ -58,32 +58,24 @@ def send_telegram_message(message):
             print(f"ERRO CRÍTICO ao enviar mensagem ao Telegram via Requests: {e}")
 
 def initialize_driver():
-    """Configura o driver com argumentos para disfarçar o modo headless (Anti-Detecção) e força a resolução de desktop."""
+    """Configura o driver usando undetected_chromedriver para evitar a detecção do bot."""
     try:
-        print("Configurando o Chrome Driver (Docker/Headless) com resolução de Desktop...")
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
+        print("Configurando o Driver UC (Anti-Detecção e Resolução Desktop)...")
         
-        # --- NOVO ARGUMENTO CRÍTICO: FORÇAR RESOLUÇÃO DE TELA DE DESKTOP ---
-        chrome_options.add_argument("--window-size=1920,1080")
+        options = uc.ChromeOptions()
+        # O UC lida com o modo headless e anti-detecção de forma mais eficaz
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        # Força a resolução de desktop para evitar redirecionamento para o mobile
+        options.add_argument("--window-size=1920,1080") 
         
-        # --- ARGUMENTOS DE DISFARCE (Anti-Detecção) ---
-        # 1. Mudar o User-Agent para um Chrome de Desktop comum
-        chrome_options.add_argument(
-            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
-        )
-        # 2. Excluir a flag 'enable-automation'
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        # 3. Desabilitar a flag 'password-manager-saving-service'
-        chrome_options.add_experimental_option('prefs', {'credentials_enable_service': False, 'profile.password_manager_enabled': False})
+        # O UC aplica o User-Agent e a exclusão de flags automaticamente
         
-        driver = webdriver.Chrome(options=chrome_options)
+        driver = uc.Chrome(options=options)
         return driver
     except Exception as e:
-        print(f"ERRO CRÍTICO ao inicializar o Selenium Driver: {e}")
-        send_telegram_message("🚨 ERRO CRÍTICO: Falha ao iniciar o Selenium. 🚨")
+        print(f"ERRO CRÍTICO ao inicializar o Driver UC: {e}")
+        send_telegram_message("🚨 ERRO CRÍTICO: Falha ao iniciar o Driver UC. Verifique a instalação da biblioteca. 🚨")
         return None
 
 def login_to_site(driver, login_url, user, password, selectors):
@@ -136,7 +128,7 @@ def login_to_site(driver, login_url, user, password, selectors):
         
     except Exception as e:
         print(f"ERRO DE LOGIN: {e}")
-        send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Credenciais, Timeout, ou Falha na Navegação para o Jogo. 🚨")
+        send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Falha de Autenticação (Possívelmente Credenciais ou Bloqueio de Segurança). 🚨")
         return False
 
 def scrape_data(driver, selectors_list):
@@ -216,7 +208,7 @@ def main_worker_loop():
     if driver is None:
         return
 
-    # Atenção: Se isso falhar, o problema é 100% as credenciais EVS incorretas.
+    # Se isso falhar, o problema é o bloqueio do site.
     if not login_to_site(driver, LOGIN_USER, LOGIN_PASS, SELECTORS):
         driver.quit()
         return
