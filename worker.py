@@ -5,160 +5,212 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-
 from telegram import Bot
+from datetime import datetime
 
-# --- VARIÁVEIS DE AMBIENTE (SUBSTITUA PELAS SUAS!) ---
-# É melhor configurar isso como Environment Variables (Variáveis de Ambiente) no Render
-CASINO_URL = os.environ.get("CASINO_URL", "https://site-do-seu-casino.com/craps")
-LOGIN_USER = os.environ.get("LOGIN_USER", "SEU_LOGIN_AQUI")
-LOGIN_PASS = os.environ.get("LOGIN_PASS", "SUA_SENHA_AQUI")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "SEU_TOKEN_DE_BOT")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-123456789") # ID do seu canal/grupo
+# ==============================================================================
+# 1. CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
+# ==============================================================================
 
-# --- CONFIGURAÇÕES DE SCRAPING ---
-# SELETORES DO SITE (MUITO IMPORTANTES - VOCÊ DEVE ENCONTRAR NO SITE REAL)
+# Variáveis de Ambiente (Configuradas no Render)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+LOGIN_USER = os.getenv("LOGIN_USER")
+LOGIN_PASS = os.getenv("LOGIN_PASS")
+
+# URLs e Seletor do Site (ADAPTE AO SEU SITE DE CRAPS!)
+LOGIN_URL = "https://SEU_SITE_AQUI/login" # SUBSTITUA PELO SEU LINK
+CRAPS_URL = "https://SEU_SITE_AQUI/game/craps" # SUBSTITUA PELO SEU LINK
+
+# SELETORES (MUITO IMPORTANTES - VERIFIQUE NO SITE!)
+# Use o Inspect Element para obter o ID, NAME ou XPATH correto.
 SELECTORS = {
-    "campo_usuario": "id_do_campo_usuario",  # Ex: 'username'
-    "campo_senha": "id_do_campo_senha",      # Ex: 'password'
-    "botao_login": "xpath_do_botao_login",   # Ex: '//button[text()="Login"]'
-    "historico_dados": "classe_ou_id_do_historico_dados", # Ex: '.dice-history-item:first-child'
-    "botao_iniciar_jogo": "id_do_botao_iniciar_jogo", # Ex: para entrar na sala
+    "username_field": "input#username",  # Exemplo: input com ID 'username'
+    "password_field": "input#password",  # Exemplo: input com ID 'password'
+    "login_button": "button#login-btn",  # Exemplo: botão com ID 'login-btn'
+    "dice_result": "div.craps-dice-result", # Exemplo: div com a classe 'craps-dice-result'
 }
 
-# --- LÓGICA DO ROBÔ ---
+# Histórico e Lógica
+results_history = []
+MAX_HISTORY = 10
+last_scraped_result = None
+
+# ==============================================================================
+# 2. FUNÇÕES DE AUTOMAÇÃO (SELENIUM)
+# ==============================================================================
+
+def send_telegram_message(message):
+    """Envia uma mensagem ao Telegram."""
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            bot = Bot(token=TELEGRAM_TOKEN)
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML')
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram: Mensagem enviada.")
+        except Exception as e:
+            print(f"ERRO ao enviar mensagem ao Telegram: {e}")
 
 def initialize_driver():
-    """Configura e retorna o driver do Chrome."""
-    print("Configurando o Chrome Driver...")
-    chrome_options = Options()
-    
-    # Rodar em modo 'headless' (sem interface gráfica), essencial para servidores
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--window-size=1920,1080")
-    
-    # Adiciona um User-Agent para parecer menos como um bot
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36")
-    
-    # O Selenium Manager tenta encontrar o driver automaticamente, mas no Docker,
-    # ele usará o Chrome que instalamos no Dockerfile
-    return webdriver.Chrome(options=chrome_options)
-
-def perform_login(driver):
-    """Realiza o login no cassino."""
-    print(f"Tentando acessar: {CASINO_URL}")
-    driver.get(CASINO_URL)
-    
-    # Espera até que o campo de usuário esteja visível
-    wait = WebDriverWait(driver, 20)
-    
+    """Configura o driver do Chrome para rodar no Docker (headless)."""
     try:
-        # 1. Inserir Login
-        user_field = wait.until(EC.presence_of_element_located((By.ID, SELECTORS["campo_usuario"])))
-        user_field.send_keys(LOGIN_USER)
-        
-        # 2. Inserir Senha
-        pass_field = driver.find_element(By.ID, SELECTORS["campo_senha"])
-        pass_field.send_keys(LOGIN_PASS)
-        
-        # 3. Clicar em Login
-        login_button = driver.find_element(By.XPATH, SELECTORS["botao_login"])
-        login_button.click()
-        
-        print("Login realizado. Aguardando a página carregar...")
-        
-        # Opcional: Esperar por um elemento que só aparece após o login
-        time.sleep(5)
-        
+        print("Configurando o Chrome Driver (Docker/Headless)...")
+        chrome_options = Options()
+        # Opções essenciais para rodar no ambiente Docker do Render:
+        chrome_options.add_argument("--headless")       # Roda sem interface gráfica
+        chrome_options.add_argument("--no-sandbox")     # Essencial para Linux no Docker
+        chrome_options.add_argument("--disable-dev-shm-usage") # Otimiza uso de memória
+
+        # Como estamos usando a imagem 'selenium/standalone-chrome', o driver já está no PATH
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
     except Exception as e:
-        print(f"Erro no Login: {e}")
-        driver.quit()
-        raise
+        print(f"ERRO CRÍTICO ao inicializar o Selenium Driver: {e}")
+        send_telegram_message(f"🚨 ERRO CRÍTICO no Worker Craps: Falha ao iniciar o Selenium. Verifique o Dockerfile ou a versão da imagem. 🚨")
+        return None
 
-def scrape_craps_result(driver):
-    """Extrai o resultado mais recente do dado."""
+def login_to_site(driver, login_url, user, password, selectors):
+    """Realiza o login no site."""
     try:
-        # Espera até que o elemento do resultado do dado esteja presente
-        wait = WebDriverWait(driver, 10)
-        result_element = wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, SELECTORS["historico_dados"]))
+        driver.get(login_url)
+        print("Tentando acessar a página de login...")
+        
+        # AUMENTO DE TEMPO DE ESPERA PARA DAR TEMPO À PÁGINA DE CARREGAR
+        time.sleep(8) 
+        
+        # Espera EXPLICITAMENTE pelo campo de usuário
+        user_field = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, selectors["username_field"]))
         )
         
-        # Tenta extrair o texto/valor do dado. (Pode precisar de mais lógica dependendo do site)
-        latest_result = result_element.text.strip()
-        return latest_result
+        # Encontra e preenche os campos
+        print("Preenchendo credenciais...")
+        user_field.send_keys(user)
+        driver.find_element(By.CSS_SELECTOR, selectors["password_field"]).send_keys(password)
+
+        # Clica no botão de login
+        driver.find_element(By.CSS_SELECTOR, selectors["login_button"]).click()
         
+        # Espera o login ser concluído (Pode demorar, aumente o tempo se necessário)
+        time.sleep(5)
+        
+        # Verifica se o login foi bem-sucedido navegando para a página do jogo
+        driver.get(CRAPS_URL)
+        print("Login realizado. Navegando para a página do Craps...")
+        time.sleep(5) # Espera a página do jogo carregar
+        
+        return True
     except Exception as e:
-        print(f"Erro ao raspar o resultado do Craps: {e}")
+        # Erro comum aqui é NoSuchElementException ou TimeoutException
+        print(f"ERRO DE LOGIN (Seletor ou Timeout): {e}")
+        send_telegram_message(f"🚨 ERRO DE LOGIN no Craps: Seletor/URL/Credenciais incorretas. Verifique seu worker.py e variáveis. Reiniciando... 🚨")
+        return False
+
+def scrape_data(driver, selector):
+    """Raspa o último resultado do dado."""
+    try:
+        # Espera pelo elemento do resultado do dado (tempo de 10s)
+        result_element = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+        )
+        
+        result_text = result_element.text.strip()
+        
+        # Tenta converter para inteiro, se for um número
+        try:
+            return int(result_text)
+        except ValueError:
+            return result_text
+            
+    except Exception as e:
+        # É comum dar erro se o dado estiver rolando ou o elemento sumir brevemente.
+        # Não é um erro fatal para o loop, apenas um 'pass' para tentar de novo.
+        # print(f"Erro ao raspar dado: {e}")
         return None
+
+# ==============================================================================
+# 3. LÓGICA DO BOT
+# ==============================================================================
+
+def analyze_craps_strategy(history):
+    """
+    Função de Lógica:
+    Analisa o histórico e decide se deve enviar um sinal.
+    (Exemplo Simples)
+    """
+    if len(history) < 5:
+        return None # Precisa de pelo menos 5 resultados
+
+    # Exemplo: Se os últimos 5 resultados somaram mais de 30, aposte no Don't Pass
+    last_five_sum = sum(history[-5:])
+    
+    if last_five_sum > 30:
+        return f"🚨 NOVO SINAL (Soma: {last_five_sum}) 🚨\n🎯 Entrar: Don't Pass Line\n🎲 Próxima Rodada"
+
+    return None
+
+# ==============================================================================
+# 4. LOOP PRINCIPAL (WORKER 24/7)
+# ==============================================================================
 
 def main_worker_loop():
     """Loop principal do Worker."""
-    bot = Bot(token=TELEGRAM_TOKEN)
+    global last_scraped_result
+    
     driver = initialize_driver()
-    
-    try:
-        perform_login(driver)
-        
-        last_result = "" # Armazena o último dado raspado
-        
-        while True:
-            # 1. Raspar o resultado mais recente
-            current_result = scrape_craps_result(driver)
-            
-            if current_result and current_result != last_result:
-                print(f"Novo Resultado: {current_result}")
-                
-                # 2. Lógica do SINAL
-                signal = analyze_craps_strategy(current_result)
-                
-                # 3. Enviar para o Telegram
-                if signal:
-                    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=signal)
-                
-                last_result = current_result
-            
-            # Aguarda um período para não sobrecarregar o site (ex: 5 segundos)
-            time.sleep(5) 
-            
-    except Exception as e:
-        print(f"Erro Crítico no Worker: {e}. Reiniciando em 60 segundos...")
-        time.sleep(60)
-        # O Render pode tentar reiniciar o Worker automaticamente,
-        # mas adicionamos um delay aqui.
-        
-    finally:
-        driver.quit()
-        print("Driver encerrado.")
+    if driver is None:
+        return # Encerrar se o driver falhar
 
-def analyze_craps_strategy(result):
-    """
-    Função de Lógica do Craps.
-    Você precisa desenvolver sua estratégia aqui.
-    """
-    try:
-        # Converte o resultado raspado para um número (SE for um número)
-        result_sum = int(result) 
-    except:
-        # Se não for um número (ex: 'Point On'), retorna sem sinal
-        return None 
+    # Tenta fazer login
+    if not login_to_site(driver, LOGIN_URL, LOGIN_USER, LOGIN_PASS, SELECTORS):
+        driver.quit()
+        return # Encerrar se o login falhar
+
+    print("Worker de Craps pronto. Iniciando loop de raspagem...")
     
-    # --- EXEMPLO DE ESTRATÉGIA SIMPLES (SUBSTITUA PELA SUA!) ---
-    # Se o resultado for 2, 3 ou 12 (Craps) no Come Out Roll, é Win para Don't Pass Line
-    if result_sum in [2, 3, 12]:
-        return f"🚨 NOVO SINAL (Resultado: {result_sum}) 🚨 \n🎯 Entrar: Don't Pass Line"
-    # Se o resultado for 7 ou 11 (Natural) no Come Out Roll, é Win para Pass Line
-    elif result_sum in [7, 11]:
-        return f"🟢 SINAL (Resultado: {result_sum}) 🟢 \n🎯 Entrar: Pass Line"
-    else:
-        # Se for 4, 5, 6, 8, 9 ou 10, o Ponto é estabelecido, 
-        # e a análise deve ser mais complexa (baseada no histórico)
-        return None # Nenhuma entrada neste ponto do exemplo
+    # Loop de monitoramento principal (roda enquanto o container estiver ativo)
+    while True:
+        try:
+            current_result = scrape_data(driver, SELECTORS["dice_result"])
+            
+            if current_result is not None and current_result != last_scraped_result:
+                # É um novo resultado e é diferente do último
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Novo Resultado: {current_result}")
+                
+                # Atualiza histórico e último resultado
+                if isinstance(current_result, int):
+                    results_history.append(current_result)
+                    if len(results_history) > MAX_HISTORY:
+                        results_history.pop(0)
+                        
+                    # Verifica a lógica
+                    signal = analyze_craps_strategy(results_history)
+                    if signal:
+                        send_telegram_message(signal)
+                        
+                last_scraped_result = current_result
+            
+            # Espera 5 segundos para a próxima raspagem (ou o tempo que o jogo exige)
+            time.sleep(5) 
+
+        except Exception as e:
+            # Qualquer erro inesperado (ex: o elemento sumiu ou a sessão expirou)
+            print(f"ERRO CRÍTICO NO LOOP: {e}. Reiniciando sessão...")
+            send_telegram_message(f"🚨 ERRO INESPERADO no Craps. Reiniciando Worker. Detalhe: {e} 🚨")
+            driver.quit()
+            return # Sai da função, forçando o loop de reinicialização de 60s do Render
+
+# ==============================================================================
+# 5. INÍCIO DO PROGRAMA
+# ==============================================================================
 
 if __name__ == "__main__":
-    # O Worker deve rodar o loop principal
     print("Iniciando Worker de Craps no Render...")
-    main_worker_loop()
-
+    while True:
+        try:
+            main_worker_loop()
+        except Exception as e:
+            print(f"ERRO CRÍTICO PRINCIPAL: {e}")
+        
+        # Espera 60 segundos antes de tentar reiniciar o worker
+        print("Driver encerrado. Reiniciando em 60 segundos...")
+        time.sleep(60)
