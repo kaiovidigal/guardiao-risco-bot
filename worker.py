@@ -2,7 +2,7 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-# IMPORTAÇÃO CHAVE para capturar erros específicos de elemento/timeout
+# Importação chave para capturar erros específicos de elemento/timeout
 from selenium.common.exceptions import TimeoutException, NoSuchElementException 
 import time
 
@@ -19,15 +19,15 @@ KW_PASS = "SUA_SENHA_AQUI"
 LOGIN_URL = "https://kwbet.com/pt"
 CRAPS_URL = "https://kwbet.com/pt/games/live-craps" # URL do Craps
 
-# XPATHs genéricos da Kwbet (Tentativa para login)
+# XPATHs genéricos da Kwbet 
 SELECTORS = {
-    # Tenta encontrar o botão "Entrar" na página inicial para abrir o modal
+    # Tenta encontrar o botão "Entrar" na página inicial para abrir o modal (COMENTADO NO FLUXO DE LOGIN)
     "login_open_button": "//button[contains(text(), 'Entrar')]", 
     # Tenta encontrar o primeiro campo de entrada de texto ou email
     "username_field": "(//input[@type='email' or @type='text'])[1]",                  
     # Campo de senha
     "password_field": "//input[@type='password']",                  
-    # Botão de envio (submit) dentro do modal
+    # Botão de envio (submit) dentro do modal/formulário
     "login_submit_button": "//button[@type='submit' or contains(text(), 'Entrar')]" 
 }
 
@@ -63,7 +63,7 @@ def initialize_driver():
         raise 
 
 def login_to_site(driver, username, password):
-    """Tenta realizar o login na Kwbet com os XPATHs definidos, capturando erros específicos."""
+    """Tenta realizar o login na Kwbet, indo direto para os campos de usuário/senha."""
     driver.get(LOGIN_URL)
     print(f"Tentando acessar a página de login: {LOGIN_URL}")
     
@@ -71,13 +71,13 @@ def login_to_site(driver, username, password):
     wait = WebDriverWait(driver, 25)
 
     try:
-        # 1. CLICA NO BOTÃO 'ENTRAR' NA PÁGINA INICIAL (abre o modal)
-        print("Tentando abrir o modal de Login (clicando no botão 'Entrar')...")
-        login_open_button = wait.until(
-            EC.element_to_be_clickable((By.XPATH, SELECTORS["login_open_button"]))
-        )
-        login_open_button.click()
-        print("✅ Modal de Login aberto (botão clicado).")
+        # 1. CLIQUE NO BOTÃO DE ABERTURA - ETAPA COMENTADA PORQUE FALHOU ANTERIORMENTE
+        # Se os campos já estiverem visíveis, este bloco será ignorado.
+        # Caso queira reativar:
+        # login_open_button = wait.until(EC.element_to_be_clickable((By.XPATH, SELECTORS["login_open_button"])))
+        # login_open_button.click()
+        
+        print("AVISO: Pulando o clique no botão 'Entrar' e indo direto para os campos.")
         time.sleep(2) 
         
         # 2. ENCONTRA E PREENCHE O CAMPO DE USUÁRIO
@@ -113,14 +113,14 @@ def login_to_site(driver, username, password):
             return True
         else:
             print("❌ FALHA NO LOGIN: Permaneceu na página ou URL de login.")
-            print("Isso pode ser devido a: XPATH errado, CAPTCHA ou verificação de segurança.")
+            print("Isso pode ser devido a: XPATH errado ou CAPTCHA/verificação de segurança após o clique.")
             return False
 
     except (TimeoutException, NoSuchElementException) as e:
         # CAPTURA O ERRO ESPECÍFICO DO SELENIUM
         print("\n=======================================================")
         print("❌ ERRO NO XPATH/TIMEOUT: O bot não conseguiu encontrar um elemento na tela.")
-        print("POSSÍVEL CAUSA: Os XPATHs genéricos estão incorretos para a Kwbet.")
+        print("POSSÍVEL CAUSA: XPATH do USUÁRIO, SENHA ou SUBMIT está incorreto.")
         print(f"DETALHES DO ERRO: {e}") 
         print("=======================================================\n")
         return False
@@ -182,4 +182,3 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
-
