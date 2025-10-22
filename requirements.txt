@@ -1,3 +1,6 @@
 selenium
+urllib3
+chromedriver-autoinstaller
+requests
 python-telegram-bot
 webdriver-manager # Opcional, mas útil para o desenvolvimento local
