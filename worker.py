@@ -24,11 +24,11 @@ LOGIN_PASS = os.getenv("LOGIN_PASS")
 LOGIN_URL = "https://m.luck.bet.br" 
 CRAPS_URL = "https://m.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
 
-# SELETORES (Corrigidos com base em inspeção comum de formulários)
+# SELETORES (TENTATIVA FINAL: Usando o atributo placeholder exato)
 SELECTORS = {
-    # TENTATIVA 2: USANDO ATRIBUTO 'type' ou 'name' (mais comum)
-    "username_field": "//input[@type='text' or @name='login' or @name='email']", 
-    "password_field": "//input[@type='password' or @name='password']", 
+    # XPATH focado no PLACEHOLDER exato da página de login da Luck.Bet
+    "username_field": "//input[@placeholder='Telefone, e-mail ou login *']",
+    "password_field": "//input[@placeholder='Senha *']",
     
     # XPATH: Encontra o botão que contém o texto "ENTRAR"
     "login_button": "//button[contains(., 'ENTRAR')]",  
@@ -61,21 +61,17 @@ def send_telegram_message(message):
             response.raise_for_status() # Lança exceção para códigos de status ruins
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram: Mensagem enviada com sucesso.")
         except Exception as e:
-            # Não use o send_telegram_message aqui para evitar loop infinito
+            # Erro de Telegram não deve ser tratado aqui para evitar loop infinito
             print(f"ERRO CRÍTICO ao enviar mensagem ao Telegram via Requests: {e}") 
 
-# O restante das funções (initialize_driver, login_to_site, scrape_data) continua
-# com as alterações de XPATH e waits (WebDriverWait) aplicadas no código anterior.
-
-# ... (Mantenha initialize_driver sem alterações) ...
 def initialize_driver():
     """Configura o driver do Chrome para rodar no Docker (headless)."""
     try:
         print("Configurando o Chrome Driver (Docker/Headless)...")
         chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--headless")       
+        chrome_options.add_argument("--no-sandbox")     
+        chrome_options.add_argument("--disable-dev-shm-usage") 
 
         driver = webdriver.Chrome(options=chrome_options)
         return driver
@@ -90,10 +86,10 @@ def login_to_site(driver, login_url, user, password, selectors):
         driver.get(login_url)
         print(f"Tentando acessar a página de login: {login_url}...")
         
+        # Aumentamos o tempo de espera (8s) para que a página mobile carregue
         time.sleep(8) 
         
-        # Espera EXPLICITAMENTE pelo campo de usuário usando XPATH
-        # Usamos 40 segundos para garantir que o Render não falhe por Timeout.
+        # Espera EXPLICITAMENTE pelo campo de usuário usando o novo XPATH
         user_field = WebDriverWait(driver, 40).until(
             EC.presence_of_element_located((By.XPATH, selectors["username_field"]))
         )
@@ -112,16 +108,15 @@ def login_to_site(driver, login_url, user, password, selectors):
         # Navega diretamente para a página do jogo após o login
         driver.get(CRAPS_URL)
         print("Login realizado. Navegando para a página do Craps...")
-        time.sleep(10) # Aumentei o tempo de espera aqui
+        time.sleep(10) # Espera a página do jogo carregar
         
         return True
     except Exception as e:
         # Erro comum aqui é NoSuchElementException ou TimeoutException
         print(f"ERRO DE LOGIN (Seletor, Timeout ou Credenciais): {e}")
-        send_telegram_message(f"🚨 ERRO DE LOGIN no Craps: Seletor XPATH incorreto ou credenciais inválidas. Reiniciando... 🚨")
+        send_telegram_message(f"🚨 ERRO DE LOGIN no Craps: Seletor XPATH incorreto. Reiniciando... 🚨")
         return False
-        
-# ... (Mantenha scrape_data sem alterações) ...
+
 def scrape_data(driver, selector):
     """Raspa o último resultado do dado."""
     try:
@@ -140,13 +135,15 @@ def scrape_data(driver, selector):
             
     except Exception as e:
         return None
-        
-# ... (Mantenha analyze_craps_strategy sem alterações) ...
+
+# ==============================================================================
+# 3. LÓGICA DO BOT
+# ==============================================================================
+
 def analyze_craps_strategy(history):
     """
     Função de Lógica:
     Analisa o histórico e decide se deve enviar um sinal.
-    (Exemplo Simples)
     """
     if len(history) < 5:
         return None 
@@ -157,8 +154,11 @@ def analyze_craps_strategy(history):
         return f"🚨 NOVO SINAL (Soma: {last_five_sum}) 🚨\n🎯 Entrar: Don't Pass Line\n🎲 Próxima Rodada"
 
     return None
-    
-# ... (Mantenha main_worker_loop sem alterações, pois o erro está nas funções internas) ...
+
+# ==============================================================================
+# 4. LOOP PRINCIPAL (WORKER 24/7)
+# ==============================================================================
+
 def main_worker_loop():
     """Loop principal do Worker."""
     global last_scraped_result
@@ -168,7 +168,7 @@ def main_worker_loop():
         return 
 
     # Tenta fazer login
-    if not login_to_site(driver, LOGIN_URL, LOGIN_USER, LOGIN_PASS, SELECTORS):
+    if not login_to_site(driver, LOGIN_USER, LOGIN_PASS, SELECTORS):
         driver.quit()
         return 
 
@@ -200,7 +200,10 @@ def main_worker_loop():
             driver.quit()
             return 
 
-# ... (Mantenha o bloco if __name__ == "__main__": sem alterações) ...
+# ==============================================================================
+# 5. INÍCIO DO PROGRAMA
+# ==============================================================================
+
 if __name__ == "__main__":
     print("Iniciando Worker de Craps no Render...")
     while True:
