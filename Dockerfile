@@ -1,34 +1,45 @@
-# Usa uma imagem base Python com os pacotes apt necessários
+# Usa uma imagem base Python que já tem dependências Linux essenciais
 FROM python:3.11-slim
 
-# Instala o Chrome e suas dependências (necessário para o Selenium rodar em ambiente sem interface)
+# Variáveis de ambiente para o Chrome e ChromeDriver
+ENV CHROME_DRIVER_VERSION=114.0.5735.90
+ENV CHROME_VERSION=114.0.5735.90
+
+# Passo 1: Instalar dependências necessárias para o Chrome
 RUN apt-get update && apt-get install -y \
     wget \
+    gnupg \
     unzip \
     libnss3 \
     libxss1 \
-    libappindicator1 \
+    libappindicator3 \
     libindicator7 \
     fonts-liberation \
     libasound2 \
     libnspr4 \
     libxcomposite1 \
-    libgbm-dev 
+    libgbm-dev \
+    --no-install-recommends
 
-# Baixa e instala o Google Chrome
-RUN wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-RUN dpkg -i google-chrome-stable_current_amd64.deb; apt-get -fy install
-RUN rm google-chrome-stable_current_amd64.deb
+# Passo 2: Baixar e instalar o Google Chrome
+RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && echo "deb http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
+    && apt-get update && apt-get install -y google-chrome-stable
+
+# O Render geralmente já tem o Chrome/Driver no PATH
+# Mas instalaremos o driver mais atualizado via 'pip'
 
 # Define o diretório de trabalho
 WORKDIR /usr/src/app
 
-# Copia os arquivos de requisitos e instala as bibliotecas Python
+# Passo 3: Copia os arquivos de requisitos e instala as bibliotecas Python
 COPY requirements.txt ./
+# O Selenium 4 não precisa mais do ChromeDriver separado se você usar Service.
+# Certifique-se de que no seu requirements.txt você tenha: selenium==4.12.0 ou superior
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia o restante do código
 COPY . .
 
-# Comando de início (o Render Worker irá rodar este arquivo)
+# Comando de início do Worker
 CMD [ "python", "worker.py" ]
