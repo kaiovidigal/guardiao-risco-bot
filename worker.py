@@ -17,8 +17,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LOGIN_USER = os.getenv("LOGIN_USER")
 LOGIN_PASS = os.getenv("LOGIN_PASS")
 
-LOGIN_URL = "https://m.luck.bet.br/signin?path=login" 
-CRAPS_URL = "https://m.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
+# --- MUDANÇA PARA URLS DESKTOP/NORMAL (www.) ---
+LOGIN_URL = "https://www.luck.bet.br/signin?path=login" 
+CRAPS_URL = "https://www.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
 
 # XPATHs de LOGIN (Genéricos por Posição)
 SELECTORS = {
@@ -212,7 +213,7 @@ def main_worker_loop():
     if driver is None:
         return
 
-    if not login_to_site(driver, LOGIN_URL, LOGIN_USER, LOGIN_PASS, SELECTORS):
+    if not login_to_site(driver, LOGIN_USER, LOGIN_PASS, SELECTORS):
         driver.quit()
         return
 
