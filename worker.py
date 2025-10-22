@@ -20,7 +20,7 @@ LOGIN_PASS = os.getenv("LOGIN_PASS")
 LOGIN_URL = "https://m.luck.bet.br/signin?path=login" 
 CRAPS_URL = "https://m.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
 
-# XPATHs de LOGIN (Genéricos por Posição, que funcionaram no log)
+# XPATHs de LOGIN (Genéricos por Posição)
 SELECTORS = {
     "username_field": "(//input)[1]", 
     "password_field": "(//input)[2]",
@@ -57,13 +57,24 @@ def send_telegram_message(message):
             print(f"ERRO CRÍTICO ao enviar mensagem ao Telegram via Requests: {e}")
 
 def initialize_driver():
-    """Configura o driver para ambiente Docker/Headless."""
+    """Configura o driver com argumentos para disfarçar o modo headless (Anti-Detecção)."""
     try:
-        print("Configurando o Chrome Driver (Docker/Headless)...")
+        print("Configurando o Chrome Driver (Docker/Headless) com disfarce...")
         chrome_options = Options()
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
+        
+        # --- ARGUMENTOS DE DISFARCE (Anti-Detecção) ---
+        # 1. Mudar o User-Agent para um Chrome de Desktop comum
+        chrome_options.add_argument(
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
+        )
+        # 2. Excluir a flag 'enable-automation'
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        # 3. Desabilitar a flag 'password-manager-saving-service'
+        chrome_options.add_experimental_option('prefs', {'credentials_enable_service': False, 'profile.password_manager_enabled': False})
+        
         driver = webdriver.Chrome(options=chrome_options)
         return driver
     except Exception as e:
@@ -72,7 +83,7 @@ def initialize_driver():
         return None
 
 def login_to_site(driver, login_url, user, password, selectors):
-    """Realiza o login com tolerância máxima de tempo e tenta mudar para Iframe."""
+    """Realiza o login com tolerância máxima de tempo e disfarce humano."""
     try:
         driver.get(login_url)
         print(f"Tentando acessar a página de login: {login_url}...")
@@ -80,7 +91,7 @@ def login_to_site(driver, login_url, user, password, selectors):
         # Espera de 15s para a página carregar completamente
         time.sleep(15) 
 
-        # Espera que o campo de usuário esteja INTERAGÍVEL para evitar "not interactable"
+        # Espera que o campo de usuário esteja INTERAGÍVEL
         user_field = WebDriverWait(driver, 40).until(
             EC.element_to_be_clickable((By.XPATH, selectors["username_field"]))
         )
@@ -93,6 +104,9 @@ def login_to_site(driver, login_url, user, password, selectors):
         )
         pass_field.send_keys(password)
 
+        # --- AÇÃO HUMANIZADA ---
+        time.sleep(2) # Pequeno atraso antes de clicar em ENTRAR
+
         driver.find_element(By.XPATH, selectors["login_button"]).click()
         time.sleep(5) 
 
@@ -100,55 +114,76 @@ def login_to_site(driver, login_url, user, password, selectors):
         driver.get(CRAPS_URL)
         print("Login realizado. Navegando para a página do Craps...")
         
-        # Espera 30s para o jogo carregar (mesmo no Standard)
+        # Espera 30s para o jogo carregar
         time.sleep(30) 
         
-        # === TENTATIVA DE MUDAR PARA O IFRAME DO JOGO ===
+        # === TENTATIVA DE MUDAR PARA O IFRAME DO JOGO (Primeira Tentativa) ===
         try:
-            # Tenta encontrar o iframe pelo nome da provedora (Evolution) ou pela tag
             iframe = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.TAG_NAME, "iframe"))
             )
             driver.switch_to.frame(iframe)
             print("Sucesso: Foco alterado para o Iframe do jogo.")
         except Exception:
-            # Se não conseguir, assume que não há iframe ou que o elemento do resultado está no host
             print("Aviso: Iframe do jogo não encontrado. Tentando raspar do host.")
-            pass # Continua no host
+            pass
             
         return True
         
     except Exception as e:
-        # Se o login falhar (EVS incorreta), cairá neste erro
         print(f"ERRO DE LOGIN: {e}")
         send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Credenciais, Timeout, ou Falha na Navegação para o Jogo. 🚨")
         return False
 
 def scrape_data(driver, selectors_list):
-    """Raspa o último resultado, tentando múltiplos seletores com espera de 20s."""
+    """Raspa o último resultado, tentando host e depois iframe, com 20s de espera total."""
+    
+    current_result = None
+    
+    # 1. Garante que o driver está no CONTEXTO PRINCIPAL antes de começar
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+        
+    # === A) Tenta raspar no HOST (página principal) ===
     for i in range(0, len(selectors_list), 2):
         by_type = selectors_list[i]
         selector_value = selectors_list[i+1]
         try:
-            # Tempo de espera de 20s para o resultado aparecer (Timeout)
-            result_element = WebDriverWait(driver, 20).until( 
+            result_element = WebDriverWait(driver, 10).until( 
                 EC.presence_of_element_located((by_type, selector_value))
             )
             result_text = result_element.text.strip()
-            # Tenta converter para inteiro, se for número
             if result_text.isdigit():
                 return int(result_text)
-            else:
-                return result_text
+            return result_text
         except Exception:
             continue
-            
-    # Tenta retornar ao contexto principal se não encontrar nada (caso o erro não tenha sido o iframe)
+    
+    # 2. Se falhou no Host, tenta mudar para o Iframe e raspar lá
     try:
-        driver.switch_to.default_content()
-    except:
-        pass
+        iframe = driver.find_element(By.TAG_NAME, "iframe")
+        driver.switch_to.frame(iframe)
         
+        # === B) Tenta raspar DENTRO do iframe ===
+        for i in range(0, len(selectors_list), 2):
+            by_type = selectors_list[i]
+            selector_value = selectors_list[i+1]
+            try:
+                result_element = WebDriverWait(driver, 10).until( 
+                    EC.presence_of_element_located((by_type, selector_value))
+                )
+                result_text = result_element.text.strip()
+                if result_text.isdigit():
+                    return int(result_text)
+                return result_text
+            except Exception:
+                continue
+                
+    except Exception:
+        pass
+
     return None
 
 # ==============================================================================
@@ -207,7 +242,7 @@ def main_worker_loop():
             print(f"ERRO CRÍTICO NO LOOP: {e}")
             send_telegram_message(f"🚨 ERRO INESPERADO no Craps. Reiniciando Worker. Detalhe: {e} 🚨")
             driver.quit()
-            return 
+            return
 
 # ==============================================================================
 # 5. EXECUÇÃO
