@@ -24,11 +24,12 @@ LOGIN_PASS = os.getenv("LOGIN_PASS")
 LOGIN_URL = "https://m.luck.bet.br" 
 CRAPS_URL = "https://m.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
 
-# SELETORES (TENTATIVA FINAL: Usando o atributo placeholder exato)
+# SELETORES (ÚLTIMA TENTATIVA: XPATH por Posição)
 SELECTORS = {
-    # XPATH focado no PLACEHOLDER exato da página de login da Luck.Bet
-    "username_field": "//input[@placeholder='Telefone, e-mail ou login *']",
-    "password_field": "//input[@placeholder='Senha *']",
+    # Pega o primeiro campo de input na página, que deve ser o de usuário/email.
+    "username_field": "(//input)[1]", 
+    # Pega o segundo campo de input na página, que deve ser o de senha.
+    "password_field": "(//input)[2]",
     
     # XPATH: Encontra o botão que contém o texto "ENTRAR"
     "login_button": "//button[contains(., 'ENTRAR')]",  
@@ -61,7 +62,6 @@ def send_telegram_message(message):
             response.raise_for_status() # Lança exceção para códigos de status ruins
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram: Mensagem enviada com sucesso.")
         except Exception as e:
-            # Erro de Telegram não deve ser tratado aqui para evitar loop infinito
             print(f"ERRO CRÍTICO ao enviar mensagem ao Telegram via Requests: {e}") 
 
 def initialize_driver():
@@ -81,7 +81,7 @@ def initialize_driver():
         return None
 
 def login_to_site(driver, login_url, user, password, selectors):
-    """Realiza o login no site com novos XPATHs e waits."""
+    """Realiza o login no site com XPATHs por posição e waits."""
     try:
         driver.get(login_url)
         print(f"Tentando acessar a página de login: {login_url}...")
@@ -89,7 +89,7 @@ def login_to_site(driver, login_url, user, password, selectors):
         # Aumentamos o tempo de espera (8s) para que a página mobile carregue
         time.sleep(8) 
         
-        # Espera EXPLICITAMENTE pelo campo de usuário usando o novo XPATH
+        # Espera EXPLICITAMENTE pelo campo de usuário usando XPATH por posição
         user_field = WebDriverWait(driver, 40).until(
             EC.presence_of_element_located((By.XPATH, selectors["username_field"]))
         )
