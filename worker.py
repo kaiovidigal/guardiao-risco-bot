@@ -17,7 +17,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 LOGIN_USER = os.getenv("LOGIN_USER")
 LOGIN_PASS = os.getenv("LOGIN_PASS")
 
-# --- MUDANÇA PARA URLS DESKTOP/NORMAL (www.) ---
+# --- URLs DESKTOP/NORMAL (www.) ---
 LOGIN_URL = "https://www.luck.bet.br/signin?path=login" 
 CRAPS_URL = "https://www.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
 
@@ -58,13 +58,16 @@ def send_telegram_message(message):
             print(f"ERRO CRÍTICO ao enviar mensagem ao Telegram via Requests: {e}")
 
 def initialize_driver():
-    """Configura o driver com argumentos para disfarçar o modo headless (Anti-Detecção)."""
+    """Configura o driver com argumentos para disfarçar o modo headless (Anti-Detecção) e força a resolução de desktop."""
     try:
-        print("Configurando o Chrome Driver (Docker/Headless) com disfarce...")
+        print("Configurando o Chrome Driver (Docker/Headless) com resolução de Desktop...")
         chrome_options = Options()
         chrome_options.add_argument("--headless")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-dev-shm-usage")
+        
+        # --- NOVO ARGUMENTO CRÍTICO: FORÇAR RESOLUÇÃO DE TELA DE DESKTOP ---
+        chrome_options.add_argument("--window-size=1920,1080")
         
         # --- ARGUMENTOS DE DISFARCE (Anti-Detecção) ---
         # 1. Mudar o User-Agent para um Chrome de Desktop comum
@@ -213,6 +216,7 @@ def main_worker_loop():
     if driver is None:
         return
 
+    # Atenção: Se isso falhar, o problema é 100% as credenciais EVS incorretas.
     if not login_to_site(driver, LOGIN_USER, LOGIN_PASS, SELECTORS):
         driver.quit()
         return
