@@ -14,21 +14,22 @@ from datetime import datetime
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-# Lembre-se de atualizar LOGIN_USER e LOGIN_PASS no Render para as credenciais do kwbet.net!
 LOGIN_USER = os.getenv("LOGIN_USER")
 LOGIN_PASS = os.getenv("LOGIN_PASS")
 
-# --- NOVAS URLS DO KW BET ---
+# --- URLS DO KWBET ---
 LOGIN_URL = "https://kwbet.net/?ref=Autoroleta" 
 CRAPS_URL = "https://kwbet.net/live-casino/evolution/evo-oss-xs-craps" 
 
-# XPATHs de LOGIN (Genéricos por Posição) - Podem precisar de ajuste se o layout for diferente
-# O Kwbet usa um pop-up de login, então esses XPATHs genéricos devem funcionar.
+# XPATHs de LOGIN (OTIMIZADOS para maior robustez no Kwbet)
 SELECTORS = {
-    "username_field": "(//input)[1]", 
-    "password_field": "(//input)[2]",
-    # O botão de login pode ter o texto 'ENTRAR' ou 'LOGIN'. Manteremos 'ENTRAR' por enquanto.
-    "login_button": "//button[contains(., 'ENTRAR') or contains(., 'LOGIN')]", 
+    # Procura por inputs de texto ou e-mail, pegando o primeiro (geralmente username)
+    "username_field": "(//input[@type='text'] | //input[@type='email'])[1]", 
+    # Procura pelo input de senha
+    "password_field": "(//input[@type='password'])[1]",
+    
+    # Tenta XPATH por type='submit' OU pelo texto 'LOGIN' OU pelo texto 'ENTRAR'
+    "login_button": "//button[@type='submit'] | //button[contains(., 'LOGIN')] | //button[contains(., 'ENTRAR')]",
 }
 
 # SELETORES DO RESULTADO (Múltiplas Tentativas)
@@ -66,13 +67,11 @@ def initialize_driver():
         print("Configurando o Driver UC (Anti-Detecção e Resolução Desktop)...")
         
         options = uc.ChromeOptions()
-        # O UC lida com o modo headless e anti-detecção de forma mais eficaz
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
-        # Força a resolução de desktop para evitar redirecionamento para o mobile
+        # Força a resolução de desktop para evitar redirecionamento
         options.add_argument("--window-size=1920,1080") 
         
-        # Inicia o driver usando UC
         driver = uc.Chrome(options=options)
         return driver
     except Exception as e:
@@ -89,8 +88,7 @@ def login_to_site(driver, login_url, user, password, selectors):
         # Espera de 15s para a página carregar completamente
         time.sleep(15) 
         
-        # --- NOVO PASSO: Clicar no botão de LOGIN/ENTRAR na página inicial ---
-        # A kwbet tem um botão de login/entrar que abre o modal.
+        # --- PASSO: Clicar no botão de LOGIN/ENTRAR na página inicial (para abrir o modal) ---
         try:
             # Tenta encontrar o botão que abre o modal de login na página inicial
             login_open_button = WebDriverWait(driver, 10).until(
@@ -143,7 +141,7 @@ def login_to_site(driver, login_url, user, password, selectors):
         
     except Exception as e:
         print(f"ERRO DE LOGIN: {e}")
-        send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Falha de Autenticação (Kwbet). Verifique as credenciais do Kwbet! 🚨")
+        send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Falha de Autenticação (Kwbet). Verifique as credenciais. 🚨")
         return False
 
 def scrape_data(driver, selectors_list):
