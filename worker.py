@@ -1,271 +1,154 @@
-import os
-import time
-import requests 
-# Importa o undetected_chromedriver
-import undetected_chromedriver as uc 
+import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from datetime import datetime
+import time
 
-# ==============================================================================
-# 1. CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
-# ==============================================================================
+# =================================================================
+# 🔑 CREDENCIAIS E CONFIGURAÇÕES
+# =================================================================
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-LOGIN_USER = os.getenv("LOGIN_USER")
-LOGIN_PASS = os.getenv("LOGIN_PASS")
+# --- ALTERE AQUI COM SUAS CREDENCIAIS ---
+KW_USER = "marechal.consultor@gmail.com" 
+KW_PASS = "Serval@134234"
+# ----------------------------------------
 
-# --- URLS DO KWBET ---
-LOGIN_URL = "https://kwbet.net/?ref=Autoroleta" 
-CRAPS_URL = "https://kwbet.net/live-casino/evolution/evo-oss-xs-craps" 
+# URLs da Kwbet
+LOGIN_URL = "https://kwbet.com/pt"
+CRAPS_URL = "https://kwbet.com/pt/games/live-craps"
 
-# XPATHs de LOGIN (OTIMIZADOS para maior robustez no Kwbet)
+# XPATHs genéricos da Kwbet (Melhores palpites)
 SELECTORS = {
-    # Procura por inputs de texto ou e-mail, pegando o primeiro (geralmente username)
-    "username_field": "(//input[@type='text'] | //input[@type='email'])[1]", 
-    # Procura pelo input de senha
-    "password_field": "(//input[@type='password'])[1]",
-    
-    # Tenta XPATH por type='submit' OU pelo texto 'LOGIN' OU pelo texto 'ENTRAR'
-    "login_button": "//button[@type='submit'] | //button[contains(., 'LOGIN')] | //button[contains(., 'ENTRAR')]",
+    "login_open_button": "//button[contains(text(), 'Entrar')]", # Botão na home para abrir o modal de login
+    "username_field": "(//input[@type='email' or @type='text'])[1]", # Campo de usuário/email
+    "password_field": "//input[@type='password']",                  # Campo de senha
+    "login_submit_button": "//button[@type='submit' or contains(text(), 'Entrar')]" # Botão de envio no modal
 }
 
-# SELETORES DO RESULTADO (Múltiplas Tentativas)
-RESULT_SELECTORS = [
-    By.CSS_SELECTOR, "div.current-score", 
-    By.XPATH, "//div[contains(@class, 'score')]",
-    By.XPATH, "//div[contains(@class, 'dice') and contains(@class, 'score')]",
-    By.CSS_SELECTOR, "div[class*='number-roll']",
-    By.XPATH, "//span[contains(@class, 'score') and text()]", 
-]
-
-results_history = []
-MAX_HISTORY = 10 
-last_scraped_result = None
-
-# ==============================================================================
-# 2. FUNÇÕES DE TELEGRAM E SELENIUM
-# ==============================================================================
-
-def send_telegram_message(message):
-    """Envia mensagem usando requests (síncrono)."""
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": 'HTML'}
-            response = requests.post(url, data=payload)
-            response.raise_for_status()
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram: Mensagem enviada com sucesso.")
-        except Exception as e:
-            print(f"ERRO CRÍTICO ao enviar mensagem ao Telegram via Requests: {e}")
+# =================================================================
+# ⚙️ FUNÇÕES
+# =================================================================
 
 def initialize_driver():
-    """Configura o driver usando undetected_chromedriver para evitar a detecção do bot."""
+    """Inicializa o undetected_chromedriver em modo headless (invisível no VPS)."""
+    options = uc.ChromeOptions()
+    
+    # Configurações essenciais para rodar no VPS/Servidor
+    options.add_argument('--headless')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+
+    print("Inicializando Chrome Driver...")
+    # Tenta resolver o problema de path do driver no VPS
+    driver = uc.Chrome(options=options) 
+    print("Driver inicializado com sucesso.")
+    return driver
+
+def login_to_site(driver, username, password):
+    """Tenta realizar o login na Kwbet."""
+    driver.get(LOGIN_URL)
+    print(f"Navegando para: {LOGIN_URL}")
+    
+    wait = WebDriverWait(driver, 15)
+
     try:
-        print("Configurando o Driver UC (Anti-Detecção e Resolução Desktop)...")
-        
-        options = uc.ChromeOptions()
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        # Força a resolução de desktop para evitar redirecionamento
-        options.add_argument("--window-size=1920,1080") 
-        
-        # Inicia o driver usando UC
-        driver = uc.Chrome(options=options)
-        return driver
-    except Exception as e:
-        print(f"ERRO CRÍTICO ao inicializar o Driver UC: {e}")
-        send_telegram_message("🚨 ERRO CRÍTICO: Falha ao iniciar o Driver UC. Verifique a instalação da biblioteca. 🚨")
-        return None
-
-def login_to_site(driver, login_url, user, password, selectors):
-    """Realiza o login, garantindo o clique no botão inicial para abrir o modal."""
-    try:
-        driver.get(login_url)
-        print(f"Tentando acessar a página do Kwbet: {login_url}...")
-        
-        # Espera de 15s para a página carregar completamente
-        time.sleep(15) 
-        
-        # 1. FORÇA O CLIQUE NO BOTÃO SUPERIOR "LOGIN" OU "ENTRAR" (Se necessário)
-        try:
-            print("Tentando clicar no botão LOGIN/ENTRAR na página inicial para abrir o modal...")
-            # XPATH busca o botão de login/entrar (pode ser um <a> ou <button>)
-            login_open_button = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.XPATH, "//a[contains(., 'LOGIN')] | //a[contains(., 'ENTRAR')] | //button[contains(., 'LOGIN')] | //button[contains(., 'ENTRAR')]"))
-            )
-            login_open_button.click()
-            time.sleep(5) # Espera o modal de login abrir
-        except Exception as e:
-            print(f"Aviso: Não foi necessário clicar no botão inicial de LOGIN/ENTRAR. O formulário pode estar visível. {e}")
-            pass
-
-        # 2. ESPERA E PREENCHE O CAMPO DE USUÁRIO (Dentro do modal)
-        user_field = WebDriverWait(driver, 40).until(
-            EC.element_to_be_clickable((By.XPATH, selectors["username_field"]))
+        # 1. CLICA NO BOTÃO 'ENTRAR' NA PÁGINA INICIAL (abre o modal)
+        print("Tentando abrir o modal de Login...")
+        login_open_button = wait.until(
+            EC.element_to_be_clickable((By.XPATH, SELECTORS["login_open_button"]))
         )
-        print("Preenchendo credenciais...")
-        user_field.send_keys(user)
-
-        # 3. PREENCHE O CAMPO DE SENHA
-        pass_field = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, selectors["password_field"]))
+        login_open_button.click()
+        time.sleep(2) # Pequena pausa para o modal carregar
+        
+        # 2. ENCONTRA E PREENCHE O CAMPO DE USUÁRIO
+        print("Preenchendo Usuário...")
+        username_field = wait.until(
+            EC.presence_of_element_located((By.XPATH, SELECTORS["username_field"]))
         )
-        pass_field.send_keys(password)
+        username_field.send_keys(username)
 
-        # 4. CLICA NO BOTÃO DE SUBMISSÃO (O botão de dentro do modal)
-        time.sleep(2) # AÇÃO HUMANIZADA
-        
-        driver.find_element(By.XPATH, selectors["login_button"]).click()
-        time.sleep(5) 
+        # 3. ENCONTRA E PREENCHE O CAMPO DE SENHA
+        print("Preenchendo Senha...")
+        password_field = wait.until(
+            EC.presence_of_element_located((By.XPATH, SELECTORS["password_field"]))
+        )
+        password_field.send_keys(password)
 
-        # 5. NAVEGAÇÃO PARA O JOGO
-        driver.get(CRAPS_URL)
-        print("Login realizado. Navegando para a página do Craps...")
+        # 4. CLICA NO BOTÃO FINAL DE SUBMISSÃO
+        print("Clicando em Entrar...")
+        login_submit_button = wait.until(
+            EC.element_to_be_clickable((By.XPATH, SELECTORS["login_submit_button"]))
+        )
+        login_submit_button.click()
         
-        # Espera 30s para o jogo carregar
-        time.sleep(30) 
+        # 5. VERIFICA O SUCESSO DO LOGIN (espera por um elemento após o login, como um botão de perfil)
+        time.sleep(5) # Pausa maior para o redirecionamento e carregamento
+        print("Login tentado. Verificando...")
         
-        # === TENTATIVA DE MUDAR PARA O IFRAME DO JOGO ===
-        try:
-            iframe = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.TAG_NAME, "iframe"))
-            )
-            driver.switch_to.frame(iframe)
-            print("Sucesso: Foco alterado para o Iframe do jogo.")
-        except Exception:
-            print("Aviso: Iframe do jogo não encontrado. Tentando raspar do host.")
-            pass
-            
-        return True
-        
+        # Se a URL não for mais a de login e não houver erro, considera-se sucesso
+        if driver.current_url != LOGIN_URL:
+            print("✅ LOGIN BEM-SUCEDIDO!")
+            return True
+        else:
+            print("❌ FALHA NO LOGIN: Permaneceu na página de login. (Pode ser CAPTCHA ou XPATH errado)")
+            return False
+
     except Exception as e:
-        print(f"ERRO DE LOGIN: {e}")
-        send_telegram_message("🚨 ERRO CRÍTICO DE LOGIN: Falha de Autenticação (Kwbet). Verifique as credenciais e o processo de login. 🚨")
+        print(f"❌ ERRO GRAVE DURANTE O LOGIN: {e}")
+        # Tira um print para debug (útil se estiver rodando localmente/com tela)
+        # driver.save_screenshot("login_error.png") 
         return False
 
-def scrape_data(driver, selectors_list):
-    """Raspa o último resultado, tentando host e depois iframe, com 20s de espera total."""
-    
-    current_result = None
-    
-    # 1. Garante que o driver está no CONTEXTO PRINCIPAL antes de começar
+def navigate_to_craps(driver):
+    """Navega diretamente para a página do Craps."""
+    print(f"Navegando para o Craps: {CRAPS_URL}")
+    driver.get(CRAPS_URL)
+    WebDriverWait(driver, 20).until(
+        EC.url_to_be(CRAPS_URL)
+    )
+    print("✅ Chegou à página do Craps.")
+
+# =================================================================
+# 🚀 FUNÇÃO PRINCIPAL
+# =================================================================
+
+def run_bot():
+    """Fluxo principal do bot: Inicialização, Login e Navegação."""
+    driver = None
     try:
-        driver.switch_to.default_content()
-    except Exception:
-        pass
+        # 1. Inicializa o Driver
+        driver = initialize_driver()
         
-    # === A) Tenta raspar no HOST (página principal) ===
-    for i in range(0, len(selectors_list), 2):
-        by_type = selectors_list[i]
-        selector_value = selectors_list[i+1]
-        try:
-            result_element = WebDriverWait(driver, 10).until( 
-                EC.presence_of_element_located((by_type, selector_value))
-            )
-            result_text = result_element.text.strip()
-            if result_text.isdigit():
-                return int(result_text)
-            return result_text
-        except Exception:
-            continue
-    
-    # 2. Se falhou no Host, tenta mudar para o Iframe e raspar lá
-    try:
-        iframe = driver.find_element(By.TAG_NAME, "iframe")
-        driver.switch_to.frame(iframe)
+        # 2. Realiza o Login
+        login_success = login_to_site(driver, KW_USER, KW_PASS)
         
-        # === B) Tenta raspar DENTRO do iframe ===
-        for i in range(0, len(selectors_list), 2):
-            by_type = selectors_list[i]
-            selector_value = selectors_list[i+1]
-            try:
-                result_element = WebDriverWait(driver, 10).until( 
-                    EC.presence_of_element_located((by_type, selector_value))
-                )
-                result_text = result_element.text.strip()
-                if result_text.isdigit():
-                    return int(result_text)
-                return result_text
-            except Exception:
-                continue
-                
-    except Exception:
-        pass
-
-    return None
-
-# ==============================================================================
-# 3. LÓGICA DO BOT
-# ==============================================================================
-
-def analyze_craps_strategy(history):
-    """Analisa o histórico e decide se deve enviar um sinal."""
-    if len(history) < 5:
-        return None
-    last_five_sum = sum(history[-5:])
-    
-    if last_five_sum > 30:
-        return f"🚨 NOVO SINAL (Soma: {last_five_sum}) 🚨\n🎯 Entrar: Don't Pass Line\n🎲 Próxima Rodada"
-    return None
-
-# ==============================================================================
-# 4. LOOP PRINCIPAL
-# ==============================================================================
-
-def main_worker_loop():
-    """Loop principal do Worker."""
-    global last_scraped_result
-    
-    driver = initialize_driver()
-    if driver is None:
-        return
-
-    if not login_to_site(driver, LOGIN_USER, LOGIN_PASS, SELECTORS):
-        driver.quit()
-        return
-
-    print("Worker de Craps pronto. Iniciando loop de raspagem...")
-
-    while True:
-        try:
-            current_result = scrape_data(driver, RESULT_SELECTORS) 
+        if login_success:
+            # 3. Navega para o Craps e inicia a leitura/aposta
+            navigate_to_craps(driver)
             
-            if current_result is not None and current_result != last_scraped_result:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Novo Resultado: {current_result}")
-                
-                if isinstance(current_result, int):
-                    results_history.append(current_result)
-                    if len(results_history) > MAX_HISTORY:
-                        results_history.pop(0)
-                        
-                    signal = analyze_craps_strategy(results_history)
-                    if signal:
-                        send_telegram_message(signal)
-                        
-                last_scraped_result = current_result
+            # --- LOOP PRINCIPAL DO BOT AQUI ---
+            print("\n=======================================================")
+            print("🚀 PONTO DE INÍCIO DA LEITURA DE DADOS DO CRAPS (IFrame da Evolution)")
+            print("Se essa mensagem aparecer, o login e a navegação deram certo!")
+            print("=======================================================\n")
             
-            time.sleep(5) 
+            # TODO: ADICIONAR LÓGICA DE LEITURA E APOSTA
+            while True:
+                # Aqui você irá ler o iFrame, aplicar a lógica do Craps e clicar nos botões.
+                time.sleep(10) # Pausa para simular o loop de leitura
+            
+        else:
+            print("NÃO FOI POSSÍVEL CONTINUAR: O login falhou.")
 
-        except Exception as e:
-            print(f"ERRO CRÍTICO NO LOOP: {e}")
-            send_telegram_message(f"🚨 ERRO INESPERADO no Craps (Kwbet). Reiniciando Worker. Detalhe: {e} 🚨")
+    except Exception as e:
+        print(f"ERRO CRÍTICO NO FLUXO PRINCIPAL: {e}")
+    finally:
+        if driver:
+            # Garante que o navegador feche no final ou em caso de erro
+            print("Fechando Driver.")
             driver.quit()
-            return
-
-# ==============================================================================
-# 5. EXECUÇÃO
-# ==============================================================================
 
 if __name__ == "__main__":
-    print("Iniciando Worker de Craps no Render...")
-    while True:
-        try:
-            main_worker_loop()
-        except Exception as e:
-            print(f"ERRO CRÍTICO PRINCIPAL: {e}")
-        
-        print("Driver encerrado. Reiniciando em 60 segundos...")
-        time.sleep(60)
+    run_bot()
+
