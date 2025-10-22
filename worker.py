@@ -20,24 +20,24 @@ LOGIN_PASS = os.getenv("LOGIN_PASS")
 LOGIN_URL = "https://m.luck.bet.br/signin?path=login" 
 CRAPS_URL = "https://m.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
 
-# XPATHs finais para LOGIN (Genéricos por Posição, que funcionaram!)
+# XPATHs de LOGIN (Genéricos por Posição, que superaram a falha de XPATH)
 SELECTORS = {
     "username_field": "(//input)[1]", 
     "password_field": "(//input)[2]",
     "login_button": "//button[contains(., 'ENTRAR')]",
 }
 
-# NOVOS SELETORES DO RESULTADO (Tentativas para Evolution Gaming)
+# SELETORES DO RESULTADO (Múltiplas Tentativas para Evolution Gaming)
 RESULT_SELECTORS = [
-    By.CSS_SELECTOR, "div.current-score",
-    By.CSS_SELECTOR, "div[class*='craps-score']",
-    By.CSS_SELECTOR, "div[class*='score-value']",
-    By.CSS_SELECTOR, "div.number-roll",
-    By.XPATH, "//div[contains(@class, 'current-score')]",
+    By.CSS_SELECTOR, "div.current-score", 
+    By.XPATH, "//div[contains(@class, 'score')]",
+    By.XPATH, "//div[contains(@class, 'dice') and contains(@class, 'score')]",
+    By.CSS_SELECTOR, "div[class*='number-roll']",
+    By.XPATH, "//span[contains(@class, 'score') and text()]", 
 ]
 
 results_history = []
-# CORREÇÃO DE SINTAXE AQUI!
+# CORREÇÃO DE SINTAXE (Valor 10 estava faltando)
 MAX_HISTORY = 10 
 last_scraped_result = None
 
@@ -73,12 +73,13 @@ def initialize_driver():
         return None
 
 def login_to_site(driver, login_url, user, password, selectors):
-    """Realiza o login com XPATHs genéricos que provaram funcionar."""
+    """Realiza o login."""
     try:
         driver.get(login_url)
         print(f"Tentando acessar a página de login: {login_url}...")
         time.sleep(8) 
 
+        # Espera pelo campo de usuário
         user_field = WebDriverWait(driver, 40).until(
             EC.presence_of_element_located((By.XPATH, selectors["username_field"]))
         )
@@ -101,15 +102,17 @@ def login_to_site(driver, login_url, user, password, selectors):
         return False
 
 def scrape_data(driver, selectors_list):
-    """Raspa o último resultado, tentando múltiplos seletores."""
+    """Raspa o último resultado, tentando múltiplos seletores com espera de 10s."""
     for i in range(0, len(selectors_list), 2):
         by_type = selectors_list[i]
         selector_value = selectors_list[i+1]
         try:
-            result_element = WebDriverWait(driver, 5).until(
+            # Tempo de espera de 10s para cada seletor
+            result_element = WebDriverWait(driver, 10).until( 
                 EC.presence_of_element_located((by_type, selector_value))
             )
             result_text = result_element.text.strip()
+            # Se o seletor funcionar, tenta converter para inteiro
             try:
                 return int(result_text)
             except ValueError:
@@ -117,6 +120,7 @@ def scrape_data(driver, selectors_list):
         except Exception:
             continue
             
+    # Se todos falharem após o loop, retorna None
     return None
 
 # ==============================================================================
@@ -153,6 +157,7 @@ def main_worker_loop():
 
     while True:
         try:
+            # Tenta múltiplos seletores com espera maior
             current_result = scrape_data(driver, RESULT_SELECTORS) 
             
             if current_result is not None and current_result != last_scraped_result:
@@ -172,6 +177,7 @@ def main_worker_loop():
             time.sleep(5) 
 
         except Exception as e:
+            # Este erro CRÍTICO ocorrerá se o driver travar por muito tempo
             print(f"ERRO CRÍTICO NO LOOP: {e}")
             send_telegram_message(f"🚨 ERRO INESPERADO no Craps. Reiniciando Worker. Detalhe: {e} 🚨")
             driver.quit()
