@@ -34,7 +34,10 @@ SELECTORS = {
 # =================================================================
 
 def initialize_driver():
-    """Inicializa o undetected_chromedriver em modo headless (invisível no VPS)."""
+    """
+    Inicializa o undetected_chromedriver com correções de compatibilidade.
+    Força a versão 119 para corrigir o erro de 'session not created' no Render.
+    """
     options = uc.ChromeOptions()
     
     # Configurações essenciais para rodar no VPS/Servidor
@@ -44,16 +47,27 @@ def initialize_driver():
     options.add_argument('--disable-dev-shm-usage')
 
     print("Configurando o Driver UC (Anti-Detecção e Resolução Desktop)...")
-    driver = uc.Chrome(options=options) 
-    print("Driver inicializado com sucesso.")
-    return driver
+    
+    try:
+        # CORREÇÃO CRÍTICA: Força a versão 119 do Chrome (baseado no log de erro)
+        driver = uc.Chrome(
+            options=options,
+            version_main=119
+        ) 
+        print("Driver inicializado com sucesso.")
+        return driver
+    except Exception as e:
+        print(f"❌ ERRO AO INICIALIZAR O DRIVER UC. Tentativa com forçar a versão 119 falhou: {e}")
+        # Levanta o erro para o fluxo principal (run_bot) pegar e reiniciar
+        raise 
 
 def login_to_site(driver, username, password):
     """Tenta realizar o login na Kwbet com os XPATHs definidos."""
     driver.get(LOGIN_URL)
     print(f"Tentando acessar a página de login: {LOGIN_URL}")
     
-    wait = WebDriverWait(driver, 15)
+    # Aumentando o tempo de espera para 25 segundos para estabilidade no VPS/Render
+    wait = WebDriverWait(driver, 25)
 
     try:
         # 1. CLICA NO BOTÃO 'ENTRAR' NA PÁGINA INICIAL (abre o modal)
@@ -63,7 +77,7 @@ def login_to_site(driver, username, password):
         )
         login_open_button.click()
         print("✅ Modal de Login aberto (botão clicado).")
-        time.sleep(2) # Pequena pausa para o modal carregar
+        time.sleep(2) 
         
         # 2. ENCONTRA E PREENCHE O CAMPO DE USUÁRIO
         print("Preenchendo Usuário...")
@@ -90,7 +104,7 @@ def login_to_site(driver, username, password):
         print("✅ Botão Entrar clicado. Aguardando redirecionamento...")
         
         # 5. VERIFICA O SUCESSO DO LOGIN
-        time.sleep(5) # Pausa maior para o redirecionamento e carregamento
+        time.sleep(10) # Pausa aumentada para estabilizar o redirecionamento
         
         # Verifica se a URL mudou e se não existe um elemento de erro de login
         if driver.current_url != LOGIN_URL and "login" not in driver.current_url.lower():
