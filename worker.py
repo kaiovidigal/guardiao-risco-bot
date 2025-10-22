@@ -20,14 +20,14 @@ LOGIN_PASS = os.getenv("LOGIN_PASS")
 LOGIN_URL = "https://m.luck.bet.br/signin?path=login" 
 CRAPS_URL = "https://m.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
 
-# XPATHs de LOGIN (Genéricos por Posição)
+# XPATHs de LOGIN (Genéricos por Posição, que funcionaram no log)
 SELECTORS = {
     "username_field": "(//input)[1]", 
     "password_field": "(//input)[2]",
     "login_button": "//button[contains(., 'ENTRAR')]",
 }
 
-# SELETORES DO RESULTADO (Múltiplas Tentativas para Evolution Gaming)
+# SELETORES DO RESULTADO (Múltiplas Tentativas)
 RESULT_SELECTORS = [
     By.CSS_SELECTOR, "div.current-score", 
     By.XPATH, "//div[contains(@class, 'score')]",
@@ -45,7 +45,7 @@ last_scraped_result = None
 # ==============================================================================
 
 def send_telegram_message(message):
-    """Envia mensagem usando requests para garantir a sincronia."""
+    """Envia mensagem usando requests (síncrono)."""
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -57,7 +57,7 @@ def send_telegram_message(message):
             print(f"ERRO CRÍTICO ao enviar mensagem ao Telegram via Requests: {e}")
 
 def initialize_driver():
-    """Configura o driver para ambiente Docker."""
+    """Configura o driver para ambiente Docker/Headless."""
     try:
         print("Configurando o Chrome Driver (Docker/Headless)...")
         chrome_options = Options()
@@ -72,22 +72,22 @@ def initialize_driver():
         return None
 
 def login_to_site(driver, login_url, user, password, selectors):
-    """Realiza o login, aguardando que os elementos se tornem clicáveis."""
+    """Realiza o login com tolerância máxima de tempo."""
     try:
         driver.get(login_url)
         print(f"Tentando acessar a página de login: {login_url}...")
         
-        # Aumentamos a espera inicial para garantir que o overlay/animação saia
-        time.sleep(12) 
+        # Espera de 15s para a página carregar completamente
+        time.sleep(15) 
 
-        # Espera EXPLICITAMENTE que o campo de usuário esteja INTERAGÍVEL
+        # Espera que o campo de usuário esteja INTERAGÍVEL para evitar "not interactable"
         user_field = WebDriverWait(driver, 40).until(
             EC.element_to_be_clickable((By.XPATH, selectors["username_field"]))
         )
         print("Preenchendo credenciais...")
         user_field.send_keys(user)
 
-        # Espera EXPLICITAMENTE que o campo de senha esteja INTERAGÍVEL
+        # Espera que o campo de senha esteja INTERAGÍVEL
         pass_field = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, selectors["password_field"]))
         )
@@ -98,7 +98,8 @@ def login_to_site(driver, login_url, user, password, selectors):
 
         driver.get(CRAPS_URL)
         print("Login realizado. Navegando para a página do Craps...")
-        time.sleep(10)
+        # AUMENTO MÁXIMO: 30s para o jogo da Evolution carregar no Render Starter
+        time.sleep(30) 
         return True
     except Exception as e:
         print(f"ERRO DE LOGIN: {e}")
@@ -106,20 +107,19 @@ def login_to_site(driver, login_url, user, password, selectors):
         return False
 
 def scrape_data(driver, selectors_list):
-    """Raspa o último resultado, tentando múltiplos seletores com espera de 10s."""
+    """Raspa o último resultado, tentando múltiplos seletores com espera de 20s."""
     for i in range(0, len(selectors_list), 2):
         by_type = selectors_list[i]
         selector_value = selectors_list[i+1]
         try:
-            # Tempo de espera de 10s para cada seletor
-            result_element = WebDriverWait(driver, 10).until( 
+            # AUMENTO MÁXIMO: 20s para o resultado aparecer (Timeout)
+            result_element = WebDriverWait(driver, 20).until( 
                 EC.presence_of_element_located((by_type, selector_value))
             )
             result_text = result_element.text.strip()
-            # Se o seletor funcionar, tenta converter para inteiro
-            try:
+            if result_text.isdigit():
                 return int(result_text)
-            except ValueError:
+            else:
                 return result_text
         except Exception:
             continue
@@ -179,6 +179,7 @@ def main_worker_loop():
             time.sleep(5) 
 
         except Exception as e:
+            # Este erro CRÍTICO ocorrerá se o driver travar por muito tempo (e forçar a reinicialização)
             print(f"ERRO CRÍTICO NO LOOP: {e}")
             send_telegram_message(f"🚨 ERRO INESPERADO no Craps. Reiniciando Worker. Detalhe: {e} 🚨")
             driver.quit()
