@@ -1,6 +1,9 @@
-# Usa uma imagem oficial do Selenium com Python e Chrome já configurados
-# A tag "4.12.0-20230919" é um exemplo de uma versão estável
-FROM selenium/standalone-chrome:4.12.0-20230919
+# Substitua a tag específica por uma versão mais estável e genérica.
+# "4.15.0" é uma versão recente e estável do Selenium.
+# Você pode sempre verificar a última versão no Docker Hub do Selenium.
+
+# NOVO DOCKERFILE (APENAS A PRIMEIRA LINHA MUDOU)
+FROM selenium/standalone-chrome:4.15.0 
 
 # O Render precisa que o Python seja o usuário principal para rodar scripts
 USER root 
@@ -9,7 +12,6 @@ USER root
 WORKDIR /usr/src/app
 
 # Passo 1: Instalar dependências Python
-# Instala o Python (se já não estiver na imagem base) e o pip
 RUN apt-get update && apt-get install -y python3 python3-pip
 
 # Copia os arquivos de requisitos e instala as bibliotecas
@@ -20,5 +22,4 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Comando de início do Worker
-# NOTE: O driver (Chrome) já está no PATH
 CMD [ "python3", "worker.py" ]
