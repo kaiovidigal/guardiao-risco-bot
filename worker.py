@@ -21,10 +21,11 @@ LOGIN_USER = os.getenv("LOGIN_USER")
 LOGIN_PASS = os.getenv("LOGIN_PASS")
 
 # URLs e Seletor do Site (LUCK.BET.BR)
-LOGIN_URL = "https://m.luck.bet.br" 
+# URL de login explícita para evitar redirecionamentos
+LOGIN_URL = "https://m.luck.bet.br/signin?path=login" 
 CRAPS_URL = "https://m.luck.bet.br/live-casino/game/1679419?provider=Evolution&from=%2Flive-casino%3Fname%3DCrap" 
 
-# SELETORES (ÚLTIMA TENTATIVA: XPATH por Posição)
+# SELETORES (ÚLTIMA TENTATIVA: XPATH por Posição - Mais confiável em mobile/headless)
 SELECTORS = {
     # Pega o primeiro campo de input na página, que deve ser o de usuário/email.
     "username_field": "(//input)[1]", 
@@ -83,10 +84,10 @@ def initialize_driver():
 def login_to_site(driver, login_url, user, password, selectors):
     """Realiza o login no site com XPATHs por posição e waits."""
     try:
-        driver.get(login_url)
+        driver.get(login_url) # Navega para a URL explícita de login
         print(f"Tentando acessar a página de login: {login_url}...")
         
-        # Aumentamos o tempo de espera (8s) para que a página mobile carregue
+        # Aumentamos o tempo de espera para que a página mobile carregue
         time.sleep(8) 
         
         # Espera EXPLICITAMENTE pelo campo de usuário usando XPATH por posição
@@ -168,7 +169,8 @@ def main_worker_loop():
         return 
 
     # Tenta fazer login
-    if not login_to_site(driver, LOGIN_USER, LOGIN_PASS, SELECTORS):
+    # As credenciais são lidas das variáveis de ambiente do Render
+    if not login_to_site(driver, LOGIN_URL, LOGIN_USER, LOGIN_PASS, SELECTORS):
         driver.quit()
         return 
 
