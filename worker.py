@@ -2,6 +2,8 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+# IMPORTAÇÃO CHAVE para capturar erros específicos de elemento/timeout
+from selenium.common.exceptions import TimeoutException, NoSuchElementException 
 import time
 
 # =================================================================
@@ -49,7 +51,7 @@ def initialize_driver():
     print("Configurando o Driver UC (Anti-Detecção e Resolução Desktop)...")
     
     try:
-        # CORREÇÃO CRÍTICA: Força a versão 119 do Chrome (baseado no log de erro)
+        # CORREÇÃO CRÍTICA: Força a versão 119 do Chrome (baseado no log de erro anterior)
         driver = uc.Chrome(
             options=options,
             version_main=119
@@ -57,12 +59,11 @@ def initialize_driver():
         print("Driver inicializado com sucesso.")
         return driver
     except Exception as e:
-        print(f"❌ ERRO AO INICIALIZAR O DRIVER UC. Tentativa com forçar a versão 119 falhou: {e}")
-        # Levanta o erro para o fluxo principal (run_bot) pegar e reiniciar
+        print(f"❌ ERRO AO INICIALIZAR O DRIVER UC. A falha de compatibilidade persiste: {e}")
         raise 
 
 def login_to_site(driver, username, password):
-    """Tenta realizar o login na Kwbet com os XPATHs definidos."""
+    """Tenta realizar o login na Kwbet com os XPATHs definidos, capturando erros específicos."""
     driver.get(LOGIN_URL)
     print(f"Tentando acessar a página de login: {LOGIN_URL}")
     
@@ -112,11 +113,20 @@ def login_to_site(driver, username, password):
             return True
         else:
             print("❌ FALHA NO LOGIN: Permaneceu na página ou URL de login.")
-            print("Isso pode ser devido a: XPATH errado ou CAPTCHA/segurança.")
+            print("Isso pode ser devido a: XPATH errado, CAPTCHA ou verificação de segurança.")
             return False
 
+    except (TimeoutException, NoSuchElementException) as e:
+        # CAPTURA O ERRO ESPECÍFICO DO SELENIUM
+        print("\n=======================================================")
+        print("❌ ERRO NO XPATH/TIMEOUT: O bot não conseguiu encontrar um elemento na tela.")
+        print("POSSÍVEL CAUSA: Os XPATHs genéricos estão incorretos para a Kwbet.")
+        print(f"DETALHES DO ERRO: {e}") 
+        print("=======================================================\n")
+        return False
     except Exception as e:
-        print(f"❌ ERRO CRÍTICO DURANTE O LOGIN (XPATH ou Timeout): {e}")
+        # Captura qualquer outro erro inesperado (rede, etc.)
+        print(f"❌ ERRO CRÍTICO INESPERADO DURANTE O LOGIN: {e}")
         return False
 
 def navigate_to_craps(driver):
@@ -160,7 +170,7 @@ def run_bot():
                 time.sleep(15) 
             
         else:
-            print("NÃO FOI POSSÍVEL CONTINUAR: O login falhou. Reinicie o processo para tentar novamente.")
+            print("NÃO FOI POSSÍVEL CONTINUAR: O login falhou. Verifique o log acima para a causa.")
 
     except Exception as e:
         print(f"ERRO CRÍTICO NO FLUXO PRINCIPAL: {e}")
@@ -172,3 +182,4 @@ def run_bot():
 
 if __name__ == "__main__":
     run_bot()
+
