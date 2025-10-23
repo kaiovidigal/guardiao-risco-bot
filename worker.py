@@ -13,22 +13,27 @@ import time
 KW_USER = "SEU_EMAIL_OU_USUARIO_AQUI" 
 KW_PASS = "SUA_SENHA_AQUI"
 
-# --- 🍪 CONFIGURAÇÃO DE COOKIES (NECESSÁRIO AGORA!) 🍪 ---
-# ⚠️ PREENCHA ESTAS DUAS VARIÁVEIS COM O NOME E O VALOR DO COOKIE DE SESSÃO DA KWBET.
-# SE ESTIVEREM VAZIAS, O BOT TENTARÁ O LOGIN POR FORMULÁRIO E IRÁ FALHAR!
-KW_COOKIE_NAME = "NOME_DO_COOKIE_DE_SESSAO_AQUI" # Ex: "session_id" ou "auth_token"
-KW_COOKIE_VALUE = "VALOR_DO_COOKIE_DE_SESSAO_AQUI" # O valor longo da sua sessão ativa
+# --- 🍪 CONFIGURAÇÃO DE COOKIES (PREENCHA APENAS SE O LOGIN ABAIXO FALHAR) 🍪 ---
+KW_COOKIE_NAME = "" 
+KW_COOKIE_VALUE = "" 
 # ----------------------------------------
 
 # URLs da Kwbet
 LOGIN_URL = "https://kwbet.com/pt"
 CRAPS_URL = "https://kwbet.com/pt/games/live-craps"
 
-# XPATHs REVISADOS (Uso apenas se o método de Cookie falhar ou não for configurado)
+# XPATHs FINAIS E EXATOS (Baseados nas suas imagens)
 SELECTORS = {
-    "login_open_button": "//button[text()='ENTRAR'] | //a[text()='ENTRAR'] | //*[contains(text(), 'ENTRAR') and not(contains(text(), 'REGISTRE'))]", 
-    "username_field": "//input[@name='username' or @name='email' or @id='username' or @id='email' or @type='text' or @type='email']",                  
-    "password_field": "//input[@type='password']",                  
+    # XPATH ESPECÍFICO 1: Botão 'ENTRAR' (usa a classe 'botao-entrar')
+    "login_open_button": "//a[contains(@class, 'botao-entrar')]", 
+    
+    # XPATH ESPECÍFICO 2: Campo de Usuário (usa o id='username')
+    "username_field": "//input[@id='username']",                  
+    
+    # XPATH ESPECÍFICO 3: Campo de Senha (usa o id='password')
+    "password_field": "//input[@id='password']",                  
+    
+    # XPATH Genérico para o botão de SUBMIT (dentro do modal)
     "login_submit_button": "//button[@type='submit' or contains(text(), 'Entrar')]" 
 }
 
@@ -39,6 +44,8 @@ SELECTORS = {
 def initialize_driver():
     """Inicializa o undetected_chromedriver com correções de compatibilidade (versão 119)."""
     options = uc.ChromeOptions()
+    
+    # Configurações essenciais para rodar no VPS/Servidor
     options.add_argument('--headless')
     options.add_argument('--disable-gpu')
     options.add_argument('--no-sandbox')
@@ -50,7 +57,7 @@ def initialize_driver():
         # Correção crítica de compatibilidade
         driver = uc.Chrome(
             options=options,
-            version_main=119
+            version_main=119 
         ) 
         print("Driver inicializado com sucesso.")
         return driver
@@ -60,16 +67,13 @@ def initialize_driver():
 
 def login_via_cookie(driver, cookie_name, cookie_value):
     """Tenta injetar um cookie de sessão para evitar o login pelo formulário."""
-    if cookie_name == "NOME_DO_COOKIE_DE_SESSAO_AQUI" or not cookie_value:
-        print("AVISO: Cookies de sessão não configurados. Tentando login via formulário (e provavelmente falhará)...")
+    if not cookie_name or not cookie_value:
         return False
 
     driver.get(LOGIN_URL)
     
     try:
         print(f"Tentando injetar cookie de sessão: {cookie_name}...")
-        
-        # Adicionar o cookie
         driver.add_cookie({
             'name': cookie_name,
             'value': cookie_value,
@@ -78,12 +82,10 @@ def login_via_cookie(driver, cookie_name, cookie_value):
             'secure': True,
             'httpOnly': True
         })
-        
-        # Recarregar a página para aplicar o cookie e verificar o login
         driver.get(LOGIN_URL)
         time.sleep(5)
         
-        # Tenta encontrar um elemento que só aparece após o login para confirmar o sucesso
+        # Elemento de confirmação de login
         logged_in_element = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.XPATH, "//button[contains(text(), 'Depósito') or contains(text(), 'Conta')]"))
         )
@@ -91,23 +93,20 @@ def login_via_cookie(driver, cookie_name, cookie_value):
         print("✅ LOGIN VIA COOKIE BEM-SUCEDIDO! Sessão injetada com sucesso.")
         return True
         
-    except (TimeoutException, NoSuchElementException) as e:
-        print("❌ FALHA NO LOGIN VIA COOKIE: O site não reconheceu a sessão ou o cookie expirou.")
-        return False
-    except WebDriverException as e:
-        print(f"❌ ERRO CRÍTICO AO INJETAR COOKIE: {e}")
+    except (TimeoutException, NoSuchElementException, WebDriverException) as e:
+        print("❌ FALHA NO LOGIN VIA COOKIE: O cookie pode estar expirado ou incorreto.")
         return False
 
 
 def login_to_form(driver, username, password):
-    """Tenta realizar o login na Kwbet preenchendo o formulário."""
+    """Realiza o login na Kwbet preenchendo o formulário com XPATHs específicos."""
     driver.get(LOGIN_URL)
-    print("Tentando login via formulário (Botão 'ENTRAR')...")
+    print("Tentando login via formulário com XPATHs exatos...")
     wait = WebDriverWait(driver, 25)
 
     try:
-        # 1. CLICA NO BOTão 'ENTRAR'
-        print("Tentando abrir o modal de Login...")
+        # 1. CLICA NO BOTÃO 'ENTRAR'
+        print("Tentando abrir o modal de Login (XPATH EXATO)...")
         login_open_button = wait.until(
             EC.element_to_be_clickable((By.XPATH, SELECTORS["login_open_button"]))
         )
@@ -115,16 +114,16 @@ def login_to_form(driver, username, password):
         print("✅ Botão 'ENTRAR' clicado. Aguardando modal...")
         time.sleep(3) 
         
-        # 2. ENCONTRA E PREENCHE O CAMPO DE USUÁRIO
-        print("Preenchendo Usuário...")
+        # 2. ENCONTRA E PREENCHE O CAMPO DE USUÁRIO (XPATH EXATO)
+        print("Preenchendo Usuário (XPATH EXATO)...")
         username_field = wait.until(
             EC.presence_of_element_located((By.XPATH, SELECTORS["username_field"]))
         )
         username_field.send_keys(username)
         print("✅ Usuário preenchido.")
 
-        # 3. ENCONTRA E PREENCHE O CAMPO DE SENHA
-        print("Preenchendo Senha...")
+        # 3. ENCONTRA E PREENCHE O CAMPO DE SENHA (XPATH EXATO)
+        print("Preenchendo Senha (XPATH EXATO)...")
         password_field = wait.until(
             EC.presence_of_element_located((By.XPATH, SELECTORS["password_field"]))
         )
@@ -145,17 +144,19 @@ def login_to_form(driver, username, password):
         if driver.current_url != LOGIN_URL and "login" not in driver.current_url.lower():
             return True
         else:
+            print("AVISO: Falha após o SUBMIT. Pode ser senha errada ou CAPTCHA/segurança.")
             return False
 
     except (TimeoutException, NoSuchElementException) as e:
+        # Se falhar aqui, a página pode não ter carregado o modal ou o site tem proteção ativa.
         print("\n=======================================================")
-        print("❌ ERRO NO XPATH/TIMEOUT: O bot não conseguiu encontrar um elemento na tela.")
-        print("CAUSA: XPATHs genéricos não são aceitos pela Kwbet. Use o método de COOKIES.")
+        print("❌ ERRO CRÍTICO NO LOGIN DE FORMULÁRIO.")
+        print("CAUSA: O site está bloqueando a automação. Use o método de COOKIES.")
         print(f"DETALHES DO ERRO: {e}") 
         print("=======================================================\n")
         return False
     except Exception as e:
-        print(f"❌ ERRO CRÍTICO INESPERADO DURANTE O LOGIN DE FORMULÁRIO: {e}")
+        print(f"❌ ERRO CRÍTICO INESPERADO: {e}")
         return False
 
 def navigate_to_craps(driver):
@@ -180,9 +181,10 @@ def run_bot():
         driver = initialize_driver()
         
         # 2. Tenta Login por Cookie (PRIORIDADE MÁXIMA)
-        login_success = login_via_cookie(driver, KW_COOKIE_NAME, KW_COOKIE_VALUE)
+        if KW_COOKIE_NAME and KW_COOKIE_VALUE:
+            login_success = login_via_cookie(driver, KW_COOKIE_NAME, KW_COOKIE_VALUE)
         
-        # 3. Se o Cookie falhar (ou não estiver configurado), tenta o Formulário
+        # 3. Se o Cookie falhar (ou não estiver configurado), tenta o Formulário (XPATHS EXATOS)
         if not login_success:
             login_success = login_to_form(driver, KW_USER, KW_PASS)
         
