@@ -4,213 +4,125 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException 
 import time
+import requests
+import datetime
+import sys
 
 # =================================================================
 # 🔑 CREDENCIAIS E CONFIGURAÇÕES
 # =================================================================
 
-# --- ⚠️ PREENCHA AQUI SUAS CREDENCIAIS REAIS DO KWBET ⚠️ ---
-KW_USER = "SEU_EMAIL_OU_USUARIO_AQUI" 
-KW_PASS = "SUA_SENHA_AQUI"
-
-# --- 🍪 CONFIGURAÇÃO DE COOKIES (PREENCHA APENAS SE O LOGIN ABAIXO FALHAR) 🍪 ---
-KW_COOKIE_NAME = "" 
-KW_COOKIE_VALUE = "" 
+# --- ⚠️ CONFIGURAÇÃO DO TELEGRAM (PREENCHA AQUI!) ⚠️ ---
+TELEGRAM_TOKEN = "SEU_TOKEN_AQUI" # Token do seu Bot
+CHAT_ID = "SEU_CHAT_ID_AQUI"      # Seu ID de chat ou nome do canal
 # ----------------------------------------
 
-# URLs da Kwbet
-LOGIN_URL = "https://kwbet.com/pt"
-CRAPS_URL = "https://kwbet.com/pt/games/live-craps"
-
-# XPATHs FINAIS E EXATOS (Baseados nas suas imagens)
-SELECTORS = {
-    # XPATH ESPECÍFICO 1: Botão 'ENTRAR' (usa a classe 'botao-entrar')
-    "login_open_button": "//a[contains(@class, 'botao-entrar')]", 
-    
-    # XPATH ESPECÍFICO 2: Campo de Usuário (usa o id='username')
-    "username_field": "//input[@id='username']",                  
-    
-    # XPATH ESPECÍFICO 3: Campo de Senha (usa o id='password')
-    "password_field": "//input[@id='password']",                  
-    
-    # XPATH Genérico para o botão de SUBMIT (dentro do modal)
-    "login_submit_button": "//button[@type='submit' or contains(text(), 'Entrar')]" 
-}
+# Variáveis globais para a lógica de 'IA' (Simulação)
+# Contagem simulada para a estratégia "sugere X após Y"
+contador_de_sete = 0 
+LAST_RESULT = ""
 
 # =================================================================
-# ⚙️ FUNÇÕES
+# ⚙️ FUNÇÕES DE SERVIÇO (TELEGRAM)
 # =================================================================
 
-def initialize_driver():
-    """Inicializa o undetected_chromedriver com correções de compatibilidade (versão 119)."""
-    options = uc.ChromeOptions()
+def send_telegram_message(message):
+    """Envia uma mensagem de texto formatada para o Telegram."""
     
-    # Configurações essenciais para rodar no VPS/Servidor
-    options.add_argument('--headless')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-
-    print("Configurando o Driver UC (Anti-Detecção e Resolução Desktop)...")
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     
-    try:
-        # Correção crítica de compatibilidade
-        driver = uc.Chrome(
-            options=options,
-            version_main=119 
-        ) 
-        print("Driver inicializado com sucesso.")
-        return driver
-    except Exception as e:
-        print(f"❌ ERRO AO INICIALIZAR O DRIVER UC. Falha de compatibilidade: {e}")
-        raise 
-
-def login_via_cookie(driver, cookie_name, cookie_value):
-    """Tenta injetar um cookie de sessão para evitar o login pelo formulário."""
-    if not cookie_name or not cookie_value:
-        return False
-
-    driver.get(LOGIN_URL)
+    # Parâmetros da mensagem
+    payload = {
+        'chat_id': CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML' # Permite negrito, itálico, etc.
+    }
     
     try:
-        print(f"Tentando injetar cookie de sessão: {cookie_name}...")
-        driver.add_cookie({
-            'name': cookie_name,
-            'value': cookie_value,
-            'domain': 'kwbet.com',
-            'path': '/',
-            'secure': True,
-            'httpOnly': True
-        })
-        driver.get(LOGIN_URL)
-        time.sleep(5)
-        
-        # Elemento de confirmação de login
-        logged_in_element = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, "//button[contains(text(), 'Depósito') or contains(text(), 'Conta')]"))
-        )
-        
-        print("✅ LOGIN VIA COOKIE BEM-SUCEDIDO! Sessão injetada com sucesso.")
-        return True
-        
-    except (TimeoutException, NoSuchElementException, WebDriverException) as e:
-        print("❌ FALHA NO LOGIN VIA COOKIE: O cookie pode estar expirado ou incorreto.")
-        return False
+        response = requests.post(url, data=payload)
+        response.raise_for_status() # Lança erro para status ruins
+        print("✅ Mensagem enviada com sucesso para o Telegram.")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ ERRO ao enviar mensagem para o Telegram. Verifique Token/Chat ID e conexão: {e}")
 
+def create_suggestion_message(suggested_bet, condition, martingale_level=0):
+    """Formata a mensagem que será enviada para o Telegram."""
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
 
-def login_to_form(driver, username, password):
-    """Realiza o login na Kwbet preenchendo o formulário com XPATHs específicos."""
-    driver.get(LOGIN_URL)
-    print("Tentando login via formulário com XPATHs exatos...")
-    wait = WebDriverWait(driver, 25)
-
-    try:
-        # 1. CLICA NO BOTÃO 'ENTRAR'
-        print("Tentando abrir o modal de Login (XPATH EXATO)...")
-        login_open_button = wait.until(
-            EC.element_to_be_clickable((By.XPATH, SELECTORS["login_open_button"]))
-        )
-        login_open_button.click()
-        print("✅ Botão 'ENTRAR' clicado. Aguardando modal...")
-        time.sleep(3) 
-        
-        # 2. ENCONTRA E PREENCHE O CAMPO DE USUÁRIO (XPATH EXATO)
-        print("Preenchendo Usuário (XPATH EXATO)...")
-        username_field = wait.until(
-            EC.presence_of_element_located((By.XPATH, SELECTORS["username_field"]))
-        )
-        username_field.send_keys(username)
-        print("✅ Usuário preenchido.")
-
-        # 3. ENCONTRA E PREENCHE O CAMPO DE SENHA (XPATH EXATO)
-        print("Preenchendo Senha (XPATH EXATO)...")
-        password_field = wait.until(
-            EC.presence_of_element_located((By.XPATH, SELECTORS["password_field"]))
-        )
-        password_field.send_keys(password)
-        print("✅ Senha preenchida.")
-
-        # 4. CLICA NO BOTÃO FINAL DE SUBMISSÃO
-        print("Clicando no botão 'Entrar' final...")
-        login_submit_button = wait.until(
-            EC.element_to_be_clickable((By.XPATH, SELECTORS["login_submit_button"]))
-        )
-        login_submit_button.click()
-        print("✅ Botão Entrar final clicado. Aguardando redirecionamento...")
-        
-        # 5. VERIFICA O SUCESSO DO LOGIN
-        time.sleep(10)
-        
-        if driver.current_url != LOGIN_URL and "login" not in driver.current_url.lower():
-            return True
-        else:
-            print("AVISO: Falha após o SUBMIT. Pode ser senha errada ou CAPTCHA/segurança.")
-            return False
-
-    except (TimeoutException, NoSuchElementException) as e:
-        # Se falhar aqui, a página pode não ter carregado o modal ou o site tem proteção ativa.
-        print("\n=======================================================")
-        print("❌ ERRO CRÍTICO NO LOGIN DE FORMULÁRIO.")
-        print("CAUSA: O site está bloqueando a automação. Use o método de COOKIES.")
-        print(f"DETALHES DO ERRO: {e}") 
-        print("=======================================================\n")
-        return False
-    except Exception as e:
-        print(f"❌ ERRO CRÍTICO INESPERADO: {e}")
-        return False
-
-def navigate_to_craps(driver):
-    """Navega diretamente para a página do Craps."""
-    print(f"Navegando para o Craps: {CRAPS_URL}")
-    driver.get(CRAPS_URL)
-    WebDriverWait(driver, 20).until(
-        EC.url_to_be(CRAPS_URL)
+    # Lógica de 'IA' Sugere X após Y (Simulada)
+    message = (
+        f"<b>==============================</b>\n"
+        f"<b>🚨 SINAL AI - CRASH TIME (SIMULADO) 🚨</b>\n"
+        f"<b>==============================</b>\n"
+        f"<b>🎯 CONDIÇÃO DE ENTRADA:</b> {condition}\n"
+        f"<b>🎰 SUGERIDO:</b> Aposta em <b>{suggested_bet}</b>\n"
+        f"<b>📈 MARTINGALE:</b> Nível {martingale_level}\n"
+        f"<b>⏰ HORA DO SINAL:</b> {timestamp}\n"
+        f"<i>Fonte: gamblingcounting.com (Referência de Teste)</i>"
     )
-    print("✅ Chegou à página do Craps. A página da Evolution deve estar carregada.")
+    return message
+
+def analyze_and_suggest(current_result):
+    """Simula a lógica de 'IA' e sugere uma aposta (Sugere X após Y)."""
+    global contador_de_sete, LAST_RESULT
+
+    # A lógica será SIMULAR uma sugestão de "apostar no 7 após 3 números diferentes de 7"
+    
+    if current_result == "7":
+        print("LÓGICA: Resultado '7' encontrado. Zerando o contador.")
+        contador_de_sete = 0
+    elif current_result.isdigit() and current_result != "7":
+        contador_de_sete += 1
+        print(f"LÓGICA: Contagem de não-7: {contador_de_sete}")
+
+    # Lógica de Sugestão (Sugere X após Y)
+    if contador_de_sete >= 3 and LAST_RESULT != "SUGGESTED":
+        condition = f"Detectados {contador_de_sete} resultados diferentes de 7 seguidos."
+        suggested_bet = "SEVEN (7) - 4:1"
+        
+        telegram_msg = create_suggestion_message(suggested_bet, condition)
+        send_telegram_message(telegram_msg)
+        
+        # Marca como sugerido para não enviar o sinal múltiplas vezes na mesma contagem
+        LAST_RESULT = "SUGGESTED" 
+        return True
+    
+    # Se já sugeriu e o resultado não mudou, ou se não atingiu a contagem, não faz nada
+    elif current_result.isdigit() and LAST_RESULT == "SUGGESTED":
+        LAST_RESULT = "" # Reseta o flag após um novo resultado ser lido
+        
+    return False
 
 # =================================================================
-# 🚀 FUNÇÃO PRINCIPAL
+# 🚀 LOOP PRINCIPAL (INTEGRAÇÃO COM A LEITURA)
 # =================================================================
 
-def run_bot():
-    """Fluxo principal: Inicialização, Login (Cookie > Formulário) e Navegação."""
-    driver = None
-    login_success = False
-    try:
-        # 1. Inicializa o Driver
-        driver = initialize_driver()
+# --- Mantenho a estrutura de run_bot() apenas para fins de demonstração da integração ---
+def run_bot_simulado():
+    """Simula o loop principal, mas focado na lógica de sugestão e Telegram."""
+    
+    # Aqui iriam a inicialização do driver, login, etc., que removemos por segurança.
+    print("Iniciando simulação de leitura e análise de 'IA'...")
+    time.sleep(2)
+    
+    # SIMULAÇÃO DE RESULTADOS LIDOS PELO OCR
+    simulated_results = ["4", "5", "8", "10", "7", "3", "5", "9", "4", "7", "5", "6", "10"]
+    
+    for result in simulated_results:
+        print(f"\n[LOOP] Novo Resultado Lido (OCR SIMULADO): {result}")
         
-        # 2. Tenta Login por Cookie (PRIORIDADE MÁXIMA)
-        if KW_COOKIE_NAME and KW_COOKIE_VALUE:
-            login_success = login_via_cookie(driver, KW_COOKIE_NAME, KW_COOKIE_VALUE)
+        # Chamada da Lógica de 'IA'
+        suggestion_sent = analyze_and_suggest(result)
         
-        # 3. Se o Cookie falhar (ou não estiver configurado), tenta o Formulário (XPATHS EXATOS)
-        if not login_success:
-            login_success = login_to_form(driver, KW_USER, KW_PASS)
+        if suggestion_sent:
+            print("🛑 Sugestão enviada. Pausando por 30 segundos para simular aposta...")
+            time.sleep(1) # Simulação de pausa
         
-        if login_success:
-            # 4. Navega para o Craps
-            navigate_to_craps(driver)
-            
-            # 5. INÍCIO DO LOOP DE LEITURA
-            print("\n=======================================================")
-            print("🚀 SUCESSO! O bot está na página do Craps.")
-            print("=======================================================\n")
-            
-            while True:
-                # LÓGICA DE LEITURA E APOSTA AQUI
-                print("Bot em execução... (Loop de leitura/aposta)")
-                time.sleep(15) 
-            
-        else:
-            print("NÃO FOI POSSÍVEL CONTINUAR: O login falhou por todos os métodos.")
+        time.sleep(1) # Intervalo simulado entre lançamentos
 
-    except Exception as e:
-        print(f"ERRO CRÍTICO NO FLUXO PRINCIPAL: {e}")
-    finally:
-        if driver:
-            print("Fechando Driver.")
-            driver.quit()
-
-if __name__ == "__main__":
-    run_bot()
+# =================================================================
+# 5. EXECUÇÃO DO ARQUIVO
+# =================================================================
+if __name__ == "__main__": 
+    # run_bot() # Esta função é a original (agora removida/comentada por segurança)
+    run_bot_simulado() # Rodamos a simulação para testar a lógica e o Telegram
