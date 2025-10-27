@@ -1,6 +1,6 @@
-# worker.py (Playwright NATIVO)
+# worker.py
+# Código Python FINAL para monitoramento de sinais do Crazy Time usando Playwright NATIVO.
 
-# Substitua os imports do Selenium/UC por este:
 from playwright.sync_api import sync_playwright
 import time
 import logging
@@ -10,9 +10,11 @@ import logging
 # ====================================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-URL = "https://gamblingcounting.com/VAVADA" # URL do jogo
-# SELETOR CSS: Ajuste o seletor para pegar a área do histórico
-RESULT_SELECTOR = ".history-container .result-row" 
+URL = "https://gamblingcounting.com/VAVADA" 
+
+# SELETOR CSS: ESTE É UM PLACEHOLDER. AJUSTE ESTE SELETOR
+# Use um seletor simples que você pode obter inspecionando o site.
+RESULT_SELECTOR = ".history-container" 
 
 # ====================================================================
 # FUNÇÕES DO BOT
@@ -22,22 +24,29 @@ def fetch_signals(page):
     """Navega até o site e extrai os últimos sinais usando Playwright."""
     try:
         logging.info(f"Navegando para: {URL}")
-        # Usa o método nativo do Playwright para navegar
+        
+        # Navega para a URL e espera até que a rede esteja inativa (carregamento completo)
         page.goto(URL, wait_until="networkidle") 
         
-        # Espera que o elemento de histórico apareça
+        # Espera que o elemento de histórico apareça (Timeout de 20 segundos)
         page.wait_for_selector(RESULT_SELECTOR, timeout=20000)
         
-        # Extrai os elementos
-        results = page.locator(RESULT_SELECTOR).all_text_contents()
+        # Extrai os elementos do histórico.
+        # Playwright é mais eficiente em extrair conteúdo.
+        # Vamos pegar todo o texto da área do histórico e processar (Você precisará refinar a extração!)
+        history_text = page.locator(RESULT_SELECTOR).inner_text()
         
-        if not results:
-            logging.warning("Não encontrou resultados. Verifique o seletor CSS.")
+        # Neste ponto, você precisa de uma lógica para analisar 'history_text'
+        # e transformar em uma lista de sinais (ex: ['2', '5', '10', 'x2', ...])
+        
+        # EXIBINDO O TEXTO BRUTO PARA DEBUGAÇÃO
+        signals_raw = history_text.split() # Exemplo simples de divisão por espaço
+        signals = [s for s in signals_raw if s]
+        
+        if not signals:
+            logging.warning("Não conseguiu extrair sinais válidos. Verifique o seletor ou a lógica de extração.")
             return []
 
-        # A extração de texto bruto é mais simples no Playwright
-        signals = [text.strip() for text in results if text.strip()]
-                
         logging.info(f"Total de sinais capturados: {len(signals)}. Últimos: {signals[:5]}")
         return signals
 
@@ -46,33 +55,37 @@ def fetch_signals(page):
         return []
 
 def filter_and_alert(signals):
-    """Sua lógica de filtragem e alerta (esta lógica é a mesma)."""
+    """Sua lógica de filtragem e alerta (a lógica é a mesma)."""
     if not signals:
         return
 
     logging.info("Iniciando a lógica de filtragem de sinais...")
     
+    # --- EXEMPLO DE LÓGICA DE FILTRAGEM ---
+    # Adapte esta lógica aos seus objetivos
     recent_signals = signals[:5] 
     contagem_do_1 = recent_signals.count('1') 
 
     if contagem_do_1 >= 4:
         logging.warning(f"*** SINAL DETECTADO ***: '1' apareceu {contagem_do_1} vezes em 5 rodadas.")
-        # EX: enviar_alerta_telegram("SINAL DE ENTRADA DETECTADO!")
+        # Integre a função de envio de alerta aqui.
     else:
         logging.info("Nenhum padrão de sinal detectado na última análise.")
+    # --------------------------------------
 
 
 # ====================================================================
 # LÓGICA DE EXECUÇÃO PRINCIPAL DO BOT (Playwright)
 # ====================================================================
 if __name__ == "__main__":
-    logging.info("Iniciando o bot usando Playwright...")
+    logging.info("Iniciando o bot usando Playwright NATIVO...")
     try:
         # Inicia o Playwright, o navegador e uma página de uma vez
         with sync_playwright() as p:
+            # Lança o Chromium no modo headless (necessário para o Render)
             browser = p.chromium.launch(
                 headless=True, 
-                args=['--no-sandbox', '--disable-gpu']
+                args=['--no-sandbox', '--disable-gpu'] # Args de ambiente Docker
             )
             page = browser.new_page()
 
