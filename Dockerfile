@@ -1,33 +1,29 @@
-# 1. IMAGEM BASE COM CHROME E DRIVER PRONTOS (Selenium Standalone)
-# Esta imagem vem com o Chromium, o Driver (ChromeDriver) e uma base Linux pronta.
-# Você só precisa adicionar o Python e suas dependências.
-# A tag '4.8.3-20230301' é um exemplo estável, mas você pode usar 'latest' ou outra de sua preferência.
-FROM selenium/standalone-chrome:latest
+# ======================================================================================
+# DOCKERFILE DEFINITIVO: SOLUÇÃO PARA O ERRO 'EXIT CODE 100' NO RENDER
+# Utiliza a imagem Playwright, que já inclui Python, Chromium e todas as dependências Linux
+# ======================================================================================
 
-# 2. INSTALAÇÃO DO PYTHON (É NECESSÁRIO INSTALAR O PYTHON EM CIMA DESSA IMAGEM)
-# A imagem base 'selenium/standalone-chrome' é baseada em Debian, mas não tem o Python por padrão.
-RUN apt-get update && \
-    apt-get install -y python3 python3-pip && \
-    rm -rf /var/lib/apt/lists/*
+# 1. IMAGEM BASE COMPLETA (SEM NECESSIDADE DE NENHUM 'APT-GET')
+FROM mcr.microsoft.com/playwright/python:latest
 
-# 3. CONFIGURAÇÃO DO DIRETÓRIO DE TRABALHO
+# 2. DEFINIÇÕES GERAIS E DIRETÓRIO DE TRABALHO
+ENV PYTHONUNBUFFERED 1
 WORKDIR /app
 
-# 4. CÓPIA DO CÓDIGO E INSTALAÇÃO DE DEPENDÊNCIAS PYTHON
-# Instala as dependências Python (selenium, undetected-chromedriver, etc.)
+# 3. CÓPIA DO CÓDIGO E INSTALAÇÃO DE DEPENDÊNCIAS PYTHON
+# Instala as dependências do seu projeto (Selenium, undetected-chromedriver, etc.)
 COPY requirements.txt /app/
-# Use python3 e pip3 para garantir que as versões corretas sejam usadas
-RUN pip3 install --no-cache-dir -r requirements.txt
+
+# O Playwright já inclui a maioria das libs. Instalamos apenas as específicas do seu projeto.
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Cópia do restante do código da aplicação
 COPY . /app/
 
-# 5. AJUSTE DO COMANDO DE INICIALIZAÇÃO
-# A porta é definida pelo Render.
-EXPOSE 8080 
+# 4. PORTA E COMANDO DE INICIALIZAÇÃO
+# A porta é um placeholder, o Render usará a variável $PORT
+EXPOSE 10000
 
 # COMANDO DE INICIALIZAÇÃO DO SEU BOT
-# Lembre-se: O Selenium precisa se conectar ao ChromeDriver/Servidor da Selenium. 
-# Se seu bot executa o navegador localmente, você precisa adaptá-lo.
-# Se seu bot usa undetected-chromedriver (que gerencia o driver internamente), ele deve funcionar.
-CMD ["python3", "seu_bot_principal.py"]
+# *** IMPORTANTE: AJUSTE "seu_bot_principal.py" para o nome do SEU arquivo principal ***
+CMD ["python", "seu_bot_principal.py"]
