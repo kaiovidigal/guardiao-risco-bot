@@ -122,4 +122,5 @@ def run_bot_simulado():
 # 5. EXECUÇÃO DO ARQUIVO
 # =================================================================
 if __name__ == "__main__": 
-    run_bot
+    run_bot_simulado()
+
