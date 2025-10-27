@@ -1,9 +1,10 @@
 # ======================================================================================
-# DOCKERFILE DEFINITIVO: SOLUÇÃO PARA O ERRO 'EXIT CODE 100' NO RENDER
-# Utiliza a imagem Playwright, que já inclui Python, Chromium e todas as dependências Linux
+# DOCKERFILE FINAL: PRONTO PARA DEPLOY NO RENDER
+# Imagem Playwright (resolve o erro apt-get)
+# Nome do arquivo de execução CORRIGIDO para worker.py
 # ======================================================================================
 
-# 1. IMAGEM BASE COMPLETA (SEM NECESSIDADE DE NENHUM 'APT-GET')
+# 1. IMAGEM BASE COMPLETA (contém Python, Chromium e todas as libs Linux)
 FROM mcr.microsoft.com/playwright/python:latest
 
 # 2. DEFINIÇÕES GERAIS E DIRETÓRIO DE TRABALHO
@@ -14,16 +15,15 @@ WORKDIR /app
 # Instala as dependências do seu projeto (Selenium, undetected-chromedriver, etc.)
 COPY requirements.txt /app/
 
-# O Playwright já inclui a maioria das libs. Instalamos apenas as específicas do seu projeto.
+# Instala as libs Python do seu arquivo
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Cópia do restante do código da aplicação
 COPY . /app/
 
 # 4. PORTA E COMANDO DE INICIALIZAÇÃO
-# A porta é um placeholder, o Render usará a variável $PORT
 EXPOSE 10000
 
-# COMANDO DE INICIALIZAÇÃO DO SEU BOT
-# *** IMPORTANTE: AJUSTE "seu_bot_principal.py" para o nome do SEU arquivo principal ***
-CMD ["python", "seu_bot_principal.py"]
+# COMANDO DE INICIALIZAÇÃO CORRIGIDO
+# O nome do arquivo foi corrigido para 'worker.py' (conforme seu repositório)
+CMD ["python", "worker.py"]
