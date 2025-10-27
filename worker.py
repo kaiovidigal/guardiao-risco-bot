@@ -12,13 +12,12 @@ import sys
 # 🔑 CREDENCIAIS E CONFIGURAÇÕES
 # =================================================================
 
-# --- ⚠️ CONFIGURAÇÃO DO TELEGRAM (PREENCHA AQUI!) ⚠️ ---
-TELEGRAM_TOKEN = "SEU_TOKEN_AQUI" # Token do seu Bot
-CHAT_ID = "SEU_CHAT_ID_AQUI"      # Seu ID de chat ou nome do canal
+# --- ✅ CONFIGURAÇÃO DO TELEGRAM (CORRIGIDA COM SEUS DADOS) ✅ ---
+TELEGRAM_TOKEN = "8217345207:AAEf5DjyRgIzxtDlTZVJX5bOjLw-uSg_i5o" 
+CHAT_ID = "-1003156785631"      
 # ----------------------------------------
 
 # Variáveis globais para a lógica de 'IA' (Simulação)
-# Contagem simulada para a estratégia "sugere X após Y"
 contador_de_sete = 0 
 LAST_RESULT = ""
 
@@ -43,13 +42,14 @@ def send_telegram_message(message):
         response.raise_for_status() # Lança erro para status ruins
         print("✅ Mensagem enviada com sucesso para o Telegram.")
     except requests.exceptions.RequestException as e:
+        # Este erro deve SUMIR agora que o Token e o ID estão corretos
         print(f"❌ ERRO ao enviar mensagem para o Telegram. Verifique Token/Chat ID e conexão: {e}")
 
 def create_suggestion_message(suggested_bet, condition, martingale_level=0):
     """Formata a mensagem que será enviada para o Telegram."""
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
 
-    # Lógica de 'IA' Sugere X após Y (Simulada)
+    # Mensagem Sugerida
     message = (
         f"<b>==============================</b>\n"
         f"<b>🚨 SINAL AI - CRASH TIME (SIMULADO) 🚨</b>\n"
@@ -66,7 +66,7 @@ def analyze_and_suggest(current_result):
     """Simula a lógica de 'IA' e sugere uma aposta (Sugere X após Y)."""
     global contador_de_sete, LAST_RESULT
 
-    # A lógica será SIMULAR uma sugestão de "apostar no 7 após 3 números diferentes de 7"
+    # A lógica SIMULA uma sugestão de "apostar no 7 após 3 números diferentes de 7"
     
     if current_result == "7":
         print("LÓGICA: Resultado '7' encontrado. Zerando o contador.")
@@ -94,14 +94,12 @@ def analyze_and_suggest(current_result):
     return False
 
 # =================================================================
-# 🚀 LOOP PRINCIPAL (INTEGRAÇÃO COM A LEITURA)
+# 🚀 LOOP PRINCIPAL (SIMULAÇÃO)
 # =================================================================
 
-# --- Mantenho a estrutura de run_bot() apenas para fins de demonstração da integração ---
 def run_bot_simulado():
-    """Simula o loop principal, mas focado na lógica de sugestão e Telegram."""
+    """Simula o loop principal, focado na lógica de sugestão e Telegram."""
     
-    # Aqui iriam a inicialização do driver, login, etc., que removemos por segurança.
     print("Iniciando simulação de leitura e análise de 'IA'...")
     time.sleep(2)
     
@@ -124,5 +122,4 @@ def run_bot_simulado():
 # 5. EXECUÇÃO DO ARQUIVO
 # =================================================================
 if __name__ == "__main__": 
-    # run_bot() # Esta função é a original (agora removida/comentada por segurança)
-    run_bot_simulado() # Rodamos a simulação para testar a lógica e o Telegram
+    run_bot
