@@ -1,42 +1,33 @@
-# 1. IMAGEM BASE ATUALIZADA E COMPLETA
-# Usar uma imagem completa (sem o '-slim') aumenta a chance de sucesso na instalação de dependências Linux.
-# Recomendamos Python 3.11 ou mais recente, que usa uma base Debian moderna (Bullseye/Bookworm).
-FROM python:3.11
+# 1. IMAGEM BASE COM CHROME E DRIVER PRONTOS (Selenium Standalone)
+# Esta imagem vem com o Chromium, o Driver (ChromeDriver) e uma base Linux pronta.
+# Você só precisa adicionar o Python e suas dependências.
+# A tag '4.8.3-20230301' é um exemplo estável, mas você pode usar 'latest' ou outra de sua preferência.
+FROM selenium/standalone-chrome:latest
 
-# 2. DEFINIÇÃO DE VARIÁVEIS DE AMBIENTE
-# Variável para evitar o buffer de saída do Python (boa prática)
-ENV PYTHONUNBUFFERED 1
-# Variável de ambiente para o Chrome/Chromium (útil para alguns drivers)
-ENV CHROME_BIN /usr/bin/chromium
-
-# 3. INSTALAÇÃO DE DEPENDÊNCIAS DO SISTEMA (A CORREÇÃO DO ERRO 100 ESTÁ AQUI)
-# Agrupamos todos os comandos em uma única instrução RUN para eficiência.
+# 2. INSTALAÇÃO DO PYTHON (É NECESSÁRIO INSTALAR O PYTHON EM CIMA DESSA IMAGEM)
+# A imagem base 'selenium/standalone-chrome' é baseada em Debian, mas não tem o Python por padrão.
 RUN apt-get update && \
-    # Instala ferramentas de build e pacotes necessários para Chromium
-    apt-get install -y --allow-unauthenticated --fix-missing \
-        build-essential \
-        chromium \
-        libnss3 \
-        libgconf-2-4 && \
-    # Limpa o cache do apt-get (mantido por boa prática)
+    apt-get install -y python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# 4. CONFIGURAÇÃO DO DIRETÓRIO DE TRABALHO
+# 3. CONFIGURAÇÃO DO DIRETÓRIO DE TRABALHO
 WORKDIR /app
 
-# 5. CÓPIA DO CÓDIGO E INSTALAÇÃO DE DEPENDÊNCIAS PYTHON
-# Instala as dependências Python (ex: selenium, undetected-chromedriver)
+# 4. CÓPIA DO CÓDIGO E INSTALAÇÃO DE DEPENDÊNCIAS PYTHON
+# Instala as dependências Python (selenium, undetected-chromedriver, etc.)
 COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+# Use python3 e pip3 para garantir que as versões corretas sejam usadas
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Cópia do restante do código da aplicação
 COPY . /app/
 
-# 6. PORTA E COMANDO DE INICIALIZAÇÃO
-# A porta é definida pelo Render, mas você pode usar 10000 como placeholder.
-EXPOSE 10000
+# 5. AJUSTE DO COMANDO DE INICIALIZAÇÃO
+# A porta é definida pelo Render.
+EXPOSE 8080 
 
-# 7. COMANDO DE INICIALIZAÇÃO DO SEU BOT
-# Substitua 'seu_bot_principal.py' pelo nome do arquivo Python que contém a lógica do seu bot.
-# Se você usa Flask/Django/Gunicorn, este comando será diferente.
-CMD ["python", "seu_bot_principal.py"]
+# COMANDO DE INICIALIZAÇÃO DO SEU BOT
+# Lembre-se: O Selenium precisa se conectar ao ChromeDriver/Servidor da Selenium. 
+# Se seu bot executa o navegador localmente, você precisa adaptá-lo.
+# Se seu bot usa undetected-chromedriver (que gerencia o driver internamente), ele deve funcionar.
+CMD ["python3", "seu_bot_principal.py"]
