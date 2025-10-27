@@ -3,13 +3,12 @@
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service # NOVO IMPORT ESSENCIAL
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
 import logging
-# Se você usa undetected_chromedriver, troque o import de selenium
-# import undetected_chromedriver as uc 
 
 # ====================================================================
 # CONFIGURAÇÃO
@@ -20,9 +19,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # URL do site (Ajuste se necessário)
 URL = "https://gamblingcounting.com" 
 
-# SELETOR CSS: ESTE É UM PLACEHOLDER. VOCÊ PRECISA AJUSTAR ESTE SELETOR
-# PARA PEGAR A ÁREA DE HISTÓRICO DAS RODADAS NO SEU SITE.
+# SELETOR CSS: ESTE É UM PLACEHOLDER. AJUSTE ESTE SELETOR
+# para a área de histórico das rodadas no seu site.
 RESULT_SELECTOR = ".history-container .result-row" 
+
+# Caminho do Driver (ChromeDriver) e do Binário (Chromium) na imagem Playwright
+CHROME_DRIVER_PATH = "/usr/local/bin/chromedriver" # Caminho comum do driver
+CHROME_BIN_PATH = "/usr/bin/chromium"              # Caminho comum do binário do navegador
 
 # ====================================================================
 # FUNÇÕES DO BOT
@@ -30,8 +33,8 @@ RESULT_SELECTOR = ".history-container .result-row"
 
 def setup_browser():
     """
-    Configura e retorna o driver do Chrome.
-    Contém a CORREÇÃO para o erro "Binary Location must be a String".
+    Configura e retorna o driver do Chrome usando a classe Service para
+    definir os caminhos do driver e do binário.
     """
     logging.info("Iniciando a configuração do navegador...")
     chrome_options = Options()
@@ -43,22 +46,20 @@ def setup_browser():
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     
-    # *** CORREÇÃO CRÍTICA PARA AMBIENTE DOCKER/PLAYWRIGHT ***
-    # Força o driver a encontrar o binário do Chromium no caminho padrão do Playwright/Debian
-    chrome_options.binary_location = "/usr/bin/chromium"
+    # ** CORREÇÃO FINAL: Define o caminho do binário do Chromium **
+    chrome_options.binary_location = CHROME_BIN_PATH
     
+    # ** CORREÇÃO FINAL: Define o caminho do ChromeDriver **
+    service = Service(executable_path=CHROME_DRIVER_PATH)
+
     try:
-        # Se você usa Selenium (mais simples)
-        driver = webdriver.Chrome(options=chrome_options) 
-        
-        # Se você usa undetected_chromedriver (descomente e ajuste):
-        # import undetected_chromedriver as uc
-        # driver = uc.Chrome(options=chrome_options)
+        # Inicializa o Chrome usando o Service e as Options
+        driver = webdriver.Chrome(service=service, options=chrome_options) 
         
         logging.info("Navegador Chrome iniciado com sucesso.")
         return driver
     except Exception as e:
-        logging.error(f"Erro ao iniciar o driver: {e}")
+        logging.error(f"ERRO CRÍTICO AO INICIAR O DRIVER/CHROME: {e}")
         return None
 
 def fetch_signals(driver):
@@ -67,7 +68,7 @@ def fetch_signals(driver):
         logging.info(f"Navegando para: {URL}")
         driver.get(URL)
         
-        # Usa espera explícita para o elemento de histórico carregar (mais robusto que time.sleep)
+        # Usa espera explícita para o elemento de histórico carregar (mais robusto)
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, RESULT_SELECTOR))
         )
@@ -82,7 +83,7 @@ def fetch_signals(driver):
         # Exemplo de extração: extrai o texto ou atributo de valor de cada resultado
         for result in results:
             try:
-                # Adapte a extração para o que for necessário (texto, atributo, etc.)
+                # Adapte a extração conforme necessário
                 value = result.get_attribute("data-value") or result.text.strip()
                 signals.append(value)
             except:
@@ -93,14 +94,11 @@ def fetch_signals(driver):
 
     except Exception as e:
         logging.error(f"Erro ao capturar sinais: {e}")
-        # Tenta fechar o driver em caso de erro (boa prática)
-        driver.quit() 
         return []
 
 def filter_and_alert(signals):
     """
     Sua lógica personalizada de filtragem de sinais e envio de alerta vai aqui.
-    (Exemplo: se 3 resultados forem '1' em sequência).
     """
     if not signals:
         return
@@ -136,6 +134,6 @@ if __name__ == "__main__":
             logging.info("Aguardando 60 segundos para a próxima verificação...")
             time.sleep(60) # Intervalo entre as verificações
             
-        driver.quit() # Fechar o navegador (será alcançado apenas se o loop for quebrado)
+        driver.quit()
     else:
         logging.error("O bot não pode ser executado devido à falha de inicialização do navegador.")
