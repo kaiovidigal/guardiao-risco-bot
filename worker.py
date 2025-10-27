@@ -22,7 +22,7 @@ URL = "https://gamblingcounting.com"
 # para a área de histórico das rodadas no seu site.
 RESULT_SELECTOR = ".history-container .result-row" 
 
-# Caminho do Binário do Chromium na imagem Playwright (essencial para o UC)
+# Caminho do Binário do Chromium na imagem Playwright
 CHROME_BIN_PATH = "/usr/bin/chromium"              
 
 # ====================================================================
@@ -32,7 +32,7 @@ CHROME_BIN_PATH = "/usr/bin/chromium"
 def setup_browser():
     """
     Configura e retorna o driver do Chrome usando undetected_chromedriver (UC).
-    UC é mais eficaz para encontrar e iniciar o navegador no Docker.
+    Força a versão e o caminho para o UC funcionar no Docker.
     """
     logging.info("Iniciando a configuração do navegador com UC...")
     chrome_options = Options()
@@ -45,17 +45,18 @@ def setup_browser():
     chrome_options.add_argument("--window-size=1920,1080")
     
     try:
-        # ** CORREÇÃO FINAL: Inicializa o UC passando o caminho do executável do navegador **
+        # ** CORREÇÃO FINAL: Força a versão principal do Chrome e o caminho do binário **
+        # Isso ajuda o UC a baixar o driver compatível e encontrar o navegador.
         driver = uc.Chrome(
-            options=chrome_options, 
+            options=chrome_options,
+            # Tente esta versão, é comum em imagens Debian/Playwright:
+            version_main=118, 
             browser_executable_path=CHROME_BIN_PATH,
-            # UC cuida da compatibilidade de driver.
         )
         
         logging.info("Navegador uc.Chrome iniciado com sucesso.")
         return driver
     except Exception as e:
-        # A mensagem de erro final será esta, se falhar
         logging.error(f"ERRO CRÍTICO AO INICIAR O DRIVER UC: {e}")
         return None
 
