@@ -1,48 +1,42 @@
-# 1. IMAGEM BASE ATUALIZADA
-# Use uma imagem recente e suportada (Bullseye ou Bookworm).
-# Ajuste a versão do Python se necessário.
-FROM python:3.11-slim-bullseye
+# 1. IMAGEM BASE ATUALIZADA E COMPLETA
+# Usar uma imagem completa (sem o '-slim') aumenta a chance de sucesso na instalação de dependências Linux.
+# Recomendamos Python 3.11 ou mais recente, que usa uma base Debian moderna (Bullseye/Bookworm).
+FROM python:3.11
 
-# 2. DEFINIÇÃO DE VARIÁVEIS DE AMBIENTE (SE NECESSÁRIO)
+# 2. DEFINIÇÃO DE VARIÁVEIS DE AMBIENTE
+# Variável para evitar o buffer de saída do Python (boa prática)
 ENV PYTHONUNBUFFERED 1
-ENV CHROME_DRIVER_VERSION 120.0.6099.109  # Ajuste para a versão que você usa no código (opcional)
+# Variável de ambiente para o Chrome/Chromium (útil para alguns drivers)
+ENV CHROME_BIN /usr/bin/chromium
 
-# 3. INSTALAÇÃO DE DEPENDÊNCIAS DO SISTEMA (APT-GET)
-# Instalamos o build-essential e os pacotes necessários para o Chromium (incluindo o libgconf-2-4 e libnss3)
-# O comando está separado e o --no-install-recommends foi removido para evitar problemas de dependência.
-# O pacote 'chromium' foi substituído por 'chromium-browser' ou mantido, dependendo da imagem base.
-# Se 'chromium' falhar, tente 'chromium-browser' ou 'google-chrome-stable'.
-
-# Atualiza a lista de pacotes
-RUN apt-get update 
-
-# Instala as dependências do Chromium/navegador com --fix-missing
-# Removida a opção "--no-install-recommends" para resolver dependências
-RUN apt-get install -y --fix-missing \
-    build-essential \
-    chromium \
-    libnss3 \
-    libgconf-2-4 
-
-# Tenta a limpeza do cache (mantido por boa prática)
-RUN rm -rf /var/lib/apt/lists/*
+# 3. INSTALAÇÃO DE DEPENDÊNCIAS DO SISTEMA (A CORREÇÃO DO ERRO 100 ESTÁ AQUI)
+# Agrupamos todos os comandos em uma única instrução RUN para eficiência.
+RUN apt-get update && \
+    # Instala ferramentas de build e pacotes necessários para Chromium
+    apt-get install -y --allow-unauthenticated --fix-missing \
+        build-essential \
+        chromium \
+        libnss3 \
+        libgconf-2-4 && \
+    # Limpa o cache do apt-get (mantido por boa prática)
+    rm -rf /var/lib/apt/lists/*
 
 # 4. CONFIGURAÇÃO DO DIRETÓRIO DE TRABALHO
 WORKDIR /app
 
 # 5. CÓPIA DO CÓDIGO E INSTALAÇÃO DE DEPENDÊNCIAS PYTHON
-# Cópia do arquivo de requisitos e instalação
+# Instala as dependências Python (ex: selenium, undetected-chromedriver)
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Cópia do restante do código
+# Cópia do restante do código da aplicação
 COPY . /app/
 
-# 6. PORTA DO SERVIÇO
-# Render injeta a porta, mas é bom documentar
-EXPOSE 10000 
+# 6. PORTA E COMANDO DE INICIALIZAÇÃO
+# A porta é definida pelo Render, mas você pode usar 10000 como placeholder.
+EXPOSE 10000
 
-# 7. COMANDO DE INICIALIZAÇÃO (AJUSTE CONFORME SEU PROJETO)
-# Exemplo para um app Flask ou Django.
-CMD ["python", "app.py"] 
-# OU, se for Gunicorn: CMD ["gunicorn", "seu_app.wsgi:application", "--bind", "0.0.0.0:$PORT"]
+# 7. COMANDO DE INICIALIZAÇÃO DO SEU BOT
+# Substitua 'seu_bot_principal.py' pelo nome do arquivo Python que contém a lógica do seu bot.
+# Se você usa Flask/Django/Gunicorn, este comando será diferente.
+CMD ["python", "seu_bot_principal.py"]
