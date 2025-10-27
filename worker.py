@@ -1,9 +1,8 @@
 # worker.py
 # Código Python para monitoramento de sinais do Crazy Time (Web Scraping)
 
-from selenium import webdriver
+import undetected_chromedriver as uc # Importa o UC
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service # NOVO IMPORT ESSENCIAL
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -23,9 +22,8 @@ URL = "https://gamblingcounting.com"
 # para a área de histórico das rodadas no seu site.
 RESULT_SELECTOR = ".history-container .result-row" 
 
-# Caminho do Driver (ChromeDriver) e do Binário (Chromium) na imagem Playwright
-CHROME_DRIVER_PATH = "/usr/local/bin/chromedriver" # Caminho comum do driver
-CHROME_BIN_PATH = "/usr/bin/chromium"              # Caminho comum do binário do navegador
+# Caminho do Binário do Chromium na imagem Playwright (essencial para o UC)
+CHROME_BIN_PATH = "/usr/bin/chromium"              
 
 # ====================================================================
 # FUNÇÕES DO BOT
@@ -33,10 +31,10 @@ CHROME_BIN_PATH = "/usr/bin/chromium"              # Caminho comum do binário d
 
 def setup_browser():
     """
-    Configura e retorna o driver do Chrome usando a classe Service para
-    definir os caminhos do driver e do binário.
+    Configura e retorna o driver do Chrome usando undetected_chromedriver (UC).
+    UC é mais eficaz para encontrar e iniciar o navegador no Docker.
     """
-    logging.info("Iniciando a configuração do navegador...")
+    logging.info("Iniciando a configuração do navegador com UC...")
     chrome_options = Options()
     
     # Argumentos essenciais para rodar em Docker/Render (headless)
@@ -46,20 +44,19 @@ def setup_browser():
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1920,1080")
     
-    # ** CORREÇÃO FINAL: Define o caminho do binário do Chromium **
-    chrome_options.binary_location = CHROME_BIN_PATH
-    
-    # ** CORREÇÃO FINAL: Define o caminho do ChromeDriver **
-    service = Service(executable_path=CHROME_DRIVER_PATH)
-
     try:
-        # Inicializa o Chrome usando o Service e as Options
-        driver = webdriver.Chrome(service=service, options=chrome_options) 
+        # ** CORREÇÃO FINAL: Inicializa o UC passando o caminho do executável do navegador **
+        driver = uc.Chrome(
+            options=chrome_options, 
+            browser_executable_path=CHROME_BIN_PATH,
+            # UC cuida da compatibilidade de driver.
+        )
         
-        logging.info("Navegador Chrome iniciado com sucesso.")
+        logging.info("Navegador uc.Chrome iniciado com sucesso.")
         return driver
     except Exception as e:
-        logging.error(f"ERRO CRÍTICO AO INICIAR O DRIVER/CHROME: {e}")
+        # A mensagem de erro final será esta, se falhar
+        logging.error(f"ERRO CRÍTICO AO INICIAR O DRIVER UC: {e}")
         return None
 
 def fetch_signals(driver):
@@ -94,6 +91,8 @@ def fetch_signals(driver):
 
     except Exception as e:
         logging.error(f"Erro ao capturar sinais: {e}")
+        # Tenta fechar o driver em caso de erro
+        driver.quit() 
         return []
 
 def filter_and_alert(signals):
@@ -106,7 +105,6 @@ def filter_and_alert(signals):
     logging.info("Iniciando a lógica de filtragem de sinais...")
     
     # --- EXEMPLO DE LÓGICA DE FILTRAGEM ---
-    # Pegue os 5 sinais mais recentes
     recent_signals = signals[:5] 
     contagem_do_1 = recent_signals.count('1') 
 
