@@ -1,25 +1,30 @@
-# Substitua a tag específica por uma versão mais estável e genérica.
-# "4.15.0" é uma versão recente e estável do Selenium.
-# Você pode sempre verificar a última versão no Docker Hub do Selenium.
+# Usa uma imagem base que já é otimizada para Web Scraping/Python.
+# Você pode tentar também 'python:3.10-slim' se quiser começar do zero, 
+# mas essa imagem base já costuma ter dependências comuns de sistema.
+FROM python:3.10
 
-# NOVO DOCKERFILE (APENAS A PRIMEIRA LINHA MUDOU)
-FROM selenium/standalone-chrome:4.15.0 
+# Variáveis de Ambiente para evitar que o Python faça cache de logs (bom para containers)
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
 
-# O Render precisa que o Python seja o usuário principal para rodar scripts
-USER root 
+# Instala as dependências de sistema necessárias para o Chrome/Chromium. 
+# Estas são as bibliotecas que geralmente faltam no Render e causam o erro.
+RUN apt-get update && apt-get install -y \
+    chromium \
+    libnss3 \
+    libgconf-2-4 \
+    --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
 
-# Define o diretório de trabalho
-WORKDIR /usr/src/app
+# Define o diretório de trabalho no container
+WORKDIR /app
 
-# Passo 1: Instalar dependências Python
-RUN apt-get update && apt-get install -y python3 python3-pip
+# Copia os arquivos de dependência do Python e instala
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia os arquivos de requisitos e instala as bibliotecas
-COPY requirements.txt ./
-RUN pip3 install --no-cache-dir -r requirements.txt
+# Copia o restante do seu código
+COPY . /app/
 
-# Copia o restante do código (seu worker.py, etc.)
-COPY . .
-
-# Comando de início do Worker
-CMD [ "python3", "worker.py" ]
+# Comando que será executado quando o container iniciar (substitua 'seu_script.py' pelo nome real do seu arquivo)
+CMD ["python", "seu_script.py"] 
