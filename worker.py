@@ -21,9 +21,9 @@ CHAT_ID = "-1003156785631"
 contador_de_sete = 0 
 LAST_RESULT = ""
 
-# =================================================================
+# -----------------------------------------------------------------
 # ⚙️ FUNÇÕES DE SERVIÇO (TELEGRAM)
-# =================================================================
+# -----------------------------------------------------------------
 
 def send_telegram_message(message):
     """Envia uma mensagem de texto formatada para o Telegram."""
@@ -94,33 +94,108 @@ def analyze_and_suggest(current_result):
     return False
 
 # =================================================================
-# 🚀 LOOP PRINCIPAL (SIMULAÇÃO)
+# 🌐 FUNÇÕES DE WEB SCRAPING COM SELENIUM/UC
+# (Este é o trecho que faltou e provavelmente você chamou de 'EVs')
 # =================================================================
 
-def run_bot_simulado():
-    """Simula o loop principal, focado na lógica de sugestão e Telegram."""
-    
-    print("Iniciando simulação de leitura e análise de 'IA'...")
-    time.sleep(2)
-    
-    # SIMULAÇÃO DE RESULTADOS LIDOS PELO OCR
-    simulated_results = ["4", "5", "8", "10", "7", "3", "5", "9", "4", "7", "5", "6", "10"]
-    
-    for result in simulated_results:
-        print(f"\n[LOOP] Novo Resultado Lido (OCR SIMULADO): {result}")
+def setup_driver():
+    """Inicializa e retorna o driver do Undetected Chromedriver."""
+    try:
+        options = uc.ChromeOptions()
+        # options.headless = True # Descomente se quiser rodar sem interface gráfica
+        options.add_argument("--start-maximized")
         
-        # Chamada da Lógica de 'IA'
-        suggestion_sent = analyze_and_suggest(result)
+        # Configuração do UC
+        driver = uc.Chrome(options=options)
+        driver.get("https://www.google.com") # Coloque a URL do site de apostas aqui
         
-        if suggestion_sent:
-            print("🛑 Sugestão enviada. Pausando por 30 segundos para simular aposta...")
-            time.sleep(1) # Simulação de pausa
+        print("✅ Driver UC inicializado com sucesso.")
+        return driver
+    except WebDriverException as e:
+        print(f"❌ ERRO ao iniciar o Undetected Chromedriver: {e}")
+        sys.exit(1) # Sai do programa se o driver não iniciar
+
+def read_current_result(driver):
+    """
+    Função SIMULADA de leitura de resultado.
+    
+    ATENÇÃO: Você precisa substituir os seletores (By.XPATH)
+    pelos seletores reais da sua plataforma de aposta!
+    """
+    try:
+        # --- ATENÇÃO: SUBSTITUA ESTE XPATH PELO CORRETO DA SUA PLATAFORMA ---
+        XPATH_RESULTADO = "//div[@class='game-result-display']/span" 
         
-        time.sleep(1) # Intervalo simulado entre lançamentos
+        # Espera até que o elemento com o resultado esteja visível
+        result_element = WebDriverWait(driver, 20).until(
+            EC.visibility_of_element_located((By.XPATH, XPATH_RESULTADO))
+        )
+        
+        current_result_text = result_element.text.strip()
+        print(f"✅ Resultado lido via Selenium: {current_result_text}")
+        return current_result_text
+        
+    except TimeoutException:
+        print("⏳ Tempo esgotado! Elemento do resultado não encontrado ou não atualizado.")
+        return None
+    except NoSuchElementException:
+        print("❌ ERRO: XPATH/Seletor do resultado está incorreto.")
+        return None
+    except Exception as e:
+        print(f"❌ Ocorreu um erro durante a leitura do resultado: {e}")
+        return None
+
+# =================================================================
+# 🚀 LOOP PRINCIPAL (COM SELENIUM)
+# =================================================================
+
+def run_bot_scraper():
+    """Loop principal, agora usando Selenium para ler o resultado."""
+    
+    driver = setup_driver()
+    
+    print("\nIniciando leitura e análise de 'IA' (Web Scraping)...")
+    
+    # Variável para rastrear o último resultado lido
+    last_processed_result = "" 
+    
+    try:
+        while True:
+            # 1. Tenta ler o resultado atual da tela
+            current_result = read_current_result(driver)
+            
+            if current_result and current_result != last_processed_result:
+                print(f"\n[LOOP] Novo Resultado Lido: {current_result}")
+                
+                # 2. Chamada da Lógica de 'IA'
+                analyze_and_suggest(current_result)
+                
+                # 3. Atualiza o último resultado processado
+                last_processed_result = current_result
+            
+            elif current_result:
+                print(f"\n[LOOP] Resultado inalterado: {current_result}. Esperando...")
+            
+            # 4. Espera um intervalo de tempo antes de verificar novamente
+            time.sleep(5) # Ajuste este tempo conforme a velocidade do jogo
+
+    except KeyboardInterrupt:
+        print("\n👋 Bot encerrado pelo usuário.")
+    except Exception as e:
+        print(f"\n❌ ERRO FATAL no loop principal: {e}")
+    finally:
+        if 'driver' in locals() and driver:
+            driver.quit()
+            print("Driver do navegador fechado.")
 
 # =================================================================
 # 5. EXECUÇÃO DO ARQUIVO
 # =================================================================
 if __name__ == "__main__": 
-    run_bot_simulado()
-
+    # Para usar o Web Scraping real, comente a linha da simulação e descomente a linha do Scraper
+    
+    # --- Versão Simulação (a que você enviou): ---
+    # run_bot_simulado() 
+    
+    # --- Versão com Web Scraper (o que você estava pedindo): ---
+    run_bot_scraper()
