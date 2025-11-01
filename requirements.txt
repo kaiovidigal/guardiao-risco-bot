@@ -1,2 +1,8 @@
-playwright
-requests
+# requirements. txt
+pyrogram==2.0.106 # Biblioteca do Telegram
+tgdm==4.66.1
+# Dependência interna
+do Pyrogram
+async-timeout==4.0.3
+aiohttp==3.9.1
+requests==2.31.0
