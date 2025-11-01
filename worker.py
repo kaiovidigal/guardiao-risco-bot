@@ -1,95 +1,147 @@
 # worker.py
-# Código Python FINAL para monitoramento de sinais do Crazy Time usando Playwright NATIVO.
-
-from playwright.sync_api import sync_playwright
-import time
-import logging
-
-# ====================================================================
-# CONFIGURAÇÃO
-# ====================================================================
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-URL = "https://gamblingcounting.com/VAVADA" 
-
-# SELETOR CSS: AJUSTE ESTE SELETOR para a área do histórico
-RESULT_SELECTOR = ".history-container" 
+from pyrogram import Client, filters
+import sqlite3
+import re
+import os
+from time import sleep
 
 # ====================================================================
-# FUNÇÕES DO BOT
+# CONFIGURAÇÃO DE SEGURANÇA (Usando Variáveis de Ambiente)
+# ====================================================================
+# Render usa variáveis de ambiente. Defina estas no seu dashboard do Render!
+API_ID = int(os.environ.get("API_ID", 0)) 
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+
+# IDs dos Canais (Defina no Render ou diretamente aqui)
+# Os IDs devem ser definidos como inteiros, usando valores negativos para canais
+CANAL_ORIGEM_ID = -1003156785631 
+CANAL_DESTINO_ID = -1002796105884
+
+# ====================================================================
+# BANCO DE DADOS (DB)
+# ====================================================================
+DB_NAME = 'double_jonbet_data.db'
+
+def setup_db():
+    """Conecta e garante que a tabela de performance exista."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS sinais_performance (
+        sinal_original TEXT PRIMARY KEY,
+        jogadas_analisadas INTEGER DEFAULT 0,
+        acertos_branco INTEGER DEFAULT 0
+    )
+    ''')
+    conn.commit()
+    return conn, cursor
+
+conn, cursor = setup_db()
+
+# ====================================================================
+# MÓDULO DE ANÁLISE E DECISÃO (A 'IA' de Filtragem)
 # ====================================================================
 
-def fetch_signals(page):
-    """Navega até o site e extrai os últimos sinais usando Playwright."""
-    try:
-        logging.info(f"Navegando para: {URL}")
-        
-        # Navega para a URL e espera até que a rede esteja inativa (carregamento completo)
-        page.goto(URL, wait_until="networkidle") 
-        
-        # Espera que o elemento de histórico apareça (Timeout de 20 segundos)
-        page.wait_for_selector(RESULT_SELECTOR, timeout=20000)
-        
-        # Extrai todo o texto da área do histórico
-        history_text = page.locator(RESULT_SELECTOR).inner_text()
-        
-        # Lógica de extração de sinais: Transforma o texto em uma lista de strings
-        signals_raw = history_text.split() 
-        signals = [s for s in signals_raw if s]
-        
-        if not signals:
-            logging.warning("Não conseguiu extrair sinais válidos. Verifique o seletor ou a lógica de extração.")
-            return []
+def get_performance(sinal):
+    """Retorna a performance e a confiança de um sinal."""
+    cursor.execute("SELECT jogadas_analisadas, acertos_branco FROM sinais_performance WHERE sinal_original = ?", (sinal,))
+    data = cursor.fetchone()
+    if data:
+        analisadas, acertos = data
+        if analisadas > 0:
+            confianca = (acertos / analisadas) * 100
+            return analisadas, confianca
+        return analisadas, 0.0
+    # Insere o sinal se for a primeira vez que é visto
+    cursor.execute("INSERT OR IGNORE INTO sinais_performance (sinal_original) VALUES (?)", (sinal,))
+    conn.commit()
+    return 0, 0.0
 
-        logging.info(f"Total de sinais capturados: {len(signals)}. Últimos: {signals[:5]}")
-        return signals
-
-    except Exception as e:
-        logging.error(f"Erro ao capturar sinais: {e}")
-        return []
-
-def filter_and_alert(signals):
-    """Sua lógica de filtragem e alerta (a lógica é a mesma)."""
-    if not signals:
-        return
-
-    logging.info("Iniciando a lógica de filtragem de sinais...")
+def deve_enviar_sinal(sinal):
+    """Lógica da 'IA' para decidir o envio (Aprendizado e Confiança > 79%)."""
+    analisadas, confianca = get_performance(sinal)
     
-    # --- EXEMPLO DE LÓGICA DE FILTRAGEM ---
-    recent_signals = signals[:5] 
-    contagem_do_1 = recent_signals.count('1') 
+    # MODO APRENDIZADO (Libera tudo para coletar dados)
+    if analisadas < 10: 
+        return True, "APRENDIZADO"
 
-    if contagem_do_1 >= 4:
-        logging.warning(f"*** SINAL DETECTADO ***: '1' apareceu {contagem_do_1} vezes em 5 rodadas.")
+    # MODO CONFIANÇA (Só envia se a confiança for alta)
+    if confianca > 79.0:
+        return True, "CONFIANÇA"
+        
+    # MODO BLOQUEIO
+    return False, "BLOQUEIO"
+
+def atualizar_performance(sinal, is_win):
+    """ATENÇÃO: ESTA FUNÇÃO PRECISA SER CHAMADA COM O RESULTADO REAL."""
+    # A implementação completa do bot exige saber o resultado da rodada.
+    # Por enquanto, mantemos a função para futuras chamadas.
+    
+    novo_acerto = 1 if is_win else 0
+    
+    cursor.execute(f"""
+    UPDATE sinais_performance SET 
+        jogadas_analisadas = jogadas_analisadas + 1, 
+        acertos_branco = acertos_branco + ?
+    WHERE sinal_original = ?
+    """, (novo_acerto, sinal))
+    
+    conn.commit()
+    print(f"DB Atualizado: {sinal} - WIN: {is_win}")
+    
+# ====================================================================
+# APLICAÇÃO TELEGRAM (Pyrogram)
+# ====================================================================
+
+# Inicialização do cliente Pyrogram
+app = Client(
+    "double_bot_ia",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
+
+@app.on_message(filters.chat(CANAL_ORIGEM_ID) & filters.text)
+async def processar_sinal(client, message):
+    sinal = message.text.strip()
+    
+    # Limpeza básica do sinal (você pode ajustar este regex)
+    sinal_limpo = re.sub(r'#[0-9]+', '', sinal).strip()
+
+    # Obtém performance e decide
+    deve_enviar, modo = deve_enviar_sinal(sinal_limpo)
+    analisadas, confianca = get_performance(sinal_limpo)
+    
+    if deve_enviar:
+        # Formata a mensagem de saída
+        sinal_convertido = (
+            f"⚠️ **SINAL BRANCO DETECTADO ({modo})** ⚠️\n\n"
+            f"🎯 JOGO: **Double JonBet**\n"
+            f"🔥 FOCO TOTAL NO **BRANCO** 🔥\n\n"
+            f"📊 Confiança: `{confianca:.2f}%` (Base: {analisadas} análises)"
+        )
+        
+        # Envia para o canal de destino
+        await client.send_message(CANAL_DESTINO_ID, sinal_convertido)
+        
+        print(f"Sinal ENVIADO: {sinal_limpo} - Modo: {modo}")
     else:
-        logging.info("Nenhum padrão de sinal detectado na última análise.")
-    # --------------------------------------
-
+        print(f"Sinal IGNORADO: {sinal_limpo} - Confiança baixa: {confianca:.2f}%")
 
 # ====================================================================
-# LÓGICA DE EXECUÇÃO PRINCIPAL DO BOT (Playwright)
+# EXECUÇÃO PRINCIPAL
 # ====================================================================
 if __name__ == "__main__":
-    logging.info("Iniciando o bot usando Playwright NATIVO...")
+    print("Iniciando Bot de Análise...")
+    print(f"API ID: {API_ID}, Token Length: {len(BOT_TOKEN)}")
+    
+    # O Pyrogram rodará em modo bloqueante (executa o bot 24/7)
+    # Coloque o bot em um loop seguro para evitar que o Render o encerre
     try:
-        # Inicia o Playwright, o navegador e uma página de uma vez
-        with sync_playwright() as p:
-            # Lança o Chromium no modo headless (necessário para o Render)
-            browser = p.chromium.launch(
-                headless=True, 
-                args=['--no-sandbox', '--disable-gpu'] # Args de ambiente Docker
-            )
-            page = browser.new_page()
-
-            # Loop principal: verifica, filtra e espera
-            while True:
-                signals = fetch_signals(page)
-                filter_and_alert(signals)
-                
-                logging.info("Aguardando 60 segundos para a próxima verificação...")
-                time.sleep(60)
-            
-            browser.close() # Fecha o navegador se o loop for interrompido
-            
+        app.run()
     except Exception as e:
-        logging.error(f"ERRO CRÍTICO NO LOOP PRINCIPAL DO PLAYWRIGHT: {e}")
+        print(f"Erro Crítico na Execução: {e}")
+    finally:
+        if conn:
+            conn.close()
