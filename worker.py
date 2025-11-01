@@ -1,4 +1,4 @@
-# worker.py - Versão SOMENTE TELEGRAM (Com Persistência de Disco)
+# worker.py - Versão FINAL COM APRENDIZADO e Persistência de Disco
 import os
 import sqlite3
 import re
@@ -36,8 +36,7 @@ LAST_SENT_SIGNAL = {"text": None, "timestamp": 0}
 # ====================================================================
 
 # Caminho para o Disco Persistente no Render.
-# Se você configurou um disco com o Mount Path /var/data no painel do Render,
-# este código garantirá que o DB seja salvo lá.
+# EXIGE que o disco seja configurado no Render com o Mount Path: /var/data
 DB_MOUNT_PATH = os.environ.get("DB_MOUNT_PATH", "/var/data") 
 DB_NAME = os.path.join(DB_MOUNT_PATH, 'double_jonbet_data.db') 
 
@@ -81,12 +80,15 @@ def deve_enviar_sinal(sinal):
     """Lógica da 'IA' para decidir o envio (Aprendizado e Confiança > 79%)."""
     analisadas, confianca = get_performance(sinal)
     
+    # 1. MODO APRENDIZADO: Envia sempre se não tiver amostras suficientes
     if analisadas < MIN_JOGADAS_APRENDIZADO: 
         return True, "APRENDIZADO"
 
+    # 2. MODO CONFIANÇA: Envia somente se a confiança for atingida
     if confianca > PERCENTUAL_MINIMO_CONFIANCA:
         return True, "CONFIANÇA"
         
+    # 3. MODO BLOQUEIO
     return False, "BLOQUEIO"
 
 def atualizar_performance(sinal, is_win):
@@ -163,7 +165,7 @@ async def processar_feedback(client, message):
         logging.warning("Feedback recebido, mas nenhum sinal recente foi enviado.")
         return
 
-    # Lógica para detectar WIN ou LOSS
+    # Lógica para detectar WIN ou LOSS (o que for 'WIN'/'GREEN' é contado como acerto)
     is_win = "WIN" in feedback_text or "GREEN" in feedback_text
     is_loss = "LOSS" in feedback_text or "RED" in feedback_text or "NO WIN" in feedback_text
     
@@ -192,7 +194,7 @@ async def processar_feedback(client, message):
 # EXECUÇÃO PRINCIPAL
 # ====================================================================
 if __name__ == "__main__":
-    logging.info("Iniciando Bot de Análise (Modo SOMENTE TELEGRAM e DB Persistente)...")
+    logging.info("Iniciando Bot de Análise (Modo COM APRENDIZADO)...")
     
     if not API_ID or not API_HASH or not BOT_TOKEN:
         logging.critical("ERRO: Configure as Variáveis de Ambiente (API_ID, API_HASH, BOT_TOKEN).")
@@ -203,6 +205,7 @@ if __name__ == "__main__":
     except Exception as e:
         logging.critical(f"ERRO CRÍTICO NA EXECUÇÃO PRINCIPAL: {e}")
     finally:
+        # Garante que a conexão com o DB seja fechada antes de o processo terminar
         if conn:
             conn.close()
             logging.info("Conexão com o Banco de Dados fechada.")
