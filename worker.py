@@ -1,12 +1,10 @@
-# worker.py
+# worker.py - Versão SOMENTE TELEGRAM (Removido Playwright/Scraping)
 import os
 import sqlite3
 import re
-import asyncio
 from pyrogram import Client, filters
-from playwright.async_api import async_playwright
-import time
 import logging
+from time import sleep
 
 # ====================================================================
 # CONFIGURAÇÃO GERAL E LOGGING
@@ -18,33 +16,27 @@ API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# URLs e IDs dos Canais (IDs de grupos/canais são negativos)
-# ADICIONE A URL DO SEU JOGO DOUBLE AQUI!
-JOGO_URL = os.environ.get("JOGO_URL", "URL_DO_JOGO_DOUBLE_JONBET_AQUI")
-
-# LISTA DE IDs dos Canais de ORIGEM (Onde os sinais chegam)
-CANAL_ORIGEM_IDS = [-1003156785631, -1009998887776] # Adicione todos os IDs dos canais de sinal aqui
-
-# ID do Canal de DESTINO (Onde o sinal filtrado será enviado)
-CANAL_DESTINO_ID = -1002796105884
+# IDs dos Canais (IDs de grupos/canais são negativos)
+CANAL_ORIGEM_IDS = [-1003156785631, -1009998887776] # Adicione todos os IDs de origem
+CANAL_DESTINO_ID = -1002796105884 # Canal onde o sinal filtrado será enviado
+CANAL_FEEDBACK_ID = -1009990001112 # << NOVO: Canal/Grupo onde o resultado será postado.
 
 # ====================================================================
 # CONFIGURAÇÃO DE APRENDIZADO E FILTRAGEM
 # ====================================================================
 DB_NAME = 'double_jonbet_data.db'
-MIN_JOGADAS_APRENDIZADO = 10  # Mínimo de amostras para sair do modo APRENDIZADO
-PERCENTUAL_MINIMO_CONFIANCA = 79.0 # Percentual mínimo para ENVIAR o sinal (após aprendizado)
-TEMPO_ESPERA_RESULTADO = 40 # Segundos que o bot espera para buscar o resultado após o sinal
+MIN_JOGADAS_APRENDIZADO = 10
+PERCENTUAL_MINIMO_CONFIANCA = 79.0 
 
-# SELETOR CSS: Ajuste este para o seletor do último resultado do DOUBLE (ex: o número ou cor)
-RESULT_SELECTOR = ".last-roll-result" 
+# Variável de estado para armazenar o ÚLTIMO SINAL ENVIADO
+# Usado para ligar o feedback (WIN/LOSS) ao sinal correspondente
+LAST_SENT_SIGNAL = {"text": None, "timestamp": 0} 
 
 # ====================================================================
-# BANCO DE DADOS (SQLite)
+# BANCO DE DADOS (SQLite) - Funções Inalteradas
 # ====================================================================
 
 def setup_db():
-    """Conecta e garante que a tabela de performance exista."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
@@ -60,7 +52,6 @@ def setup_db():
 conn, cursor = setup_db()
 
 def get_performance(sinal):
-    """Retorna a performance e a confiança de um sinal."""
     cursor.execute("SELECT jogadas_analisadas, acertos_branco FROM sinais_performance WHERE sinal_original = ?", (sinal,))
     data = cursor.fetchone()
     if data:
@@ -69,28 +60,22 @@ def get_performance(sinal):
             confianca = (acertos / analisadas) * 100
             return analisadas, confianca
         return analisadas, 0.0
-    # Insere o sinal se for a primeira vez que é visto
     cursor.execute("INSERT OR IGNORE INTO sinais_performance (sinal_original) VALUES (?)", (sinal,))
     conn.commit()
     return 0, 0.0
 
 def deve_enviar_sinal(sinal):
-    """Lógica da 'IA' para decidir o envio (Aprendizado e Confiança > 79%)."""
     analisadas, confianca = get_performance(sinal)
     
-    # 1. MODO APRENDIZADO
     if analisadas < MIN_JOGADAS_APRENDIZADO: 
         return True, "APRENDIZADO"
 
-    # 2. MODO CONFIANÇA
     if confianca > PERCENTUAL_MINIMO_CONFIANCA:
         return True, "CONFIANÇA"
         
-    # 3. MODO BLOQUEIO
     return False, "BLOQUEIO"
 
 def atualizar_performance(sinal, is_win):
-    """Atualiza o DB com o resultado da rodada."""
     novo_acerto = 1 if is_win else 0
     
     cursor.execute(f"""
@@ -104,40 +89,6 @@ def atualizar_performance(sinal, is_win):
     logging.info(f"DB Atualizado: {sinal} - WIN BRANCO: {is_win}")
 
 # ====================================================================
-# MÓDULO DE SCRAPING DE RESULTADOS (Playwright Assíncrono)
-# ====================================================================
-
-async def fetch_real_result():
-    """Busca o resultado mais recente (Branco/Não Branco) via Playwright."""
-    logging.info(f"Iniciando busca de resultado em: {JOGO_URL}")
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                # Argumentos cruciais para rodar no Render (Docker)
-                args=['--no-sandbox', '--disable-gpu'] 
-            )
-            page = await browser.new_page()
-            
-            await page.goto(JOGO_URL, wait_until="networkidle") 
-            await page.wait_for_selector(RESULT_SELECTOR, timeout=20000)
-            
-            result_element = await page.locator(RESULT_SELECTOR).first
-            result_text = await result_element.inner_text()
-            
-            await browser.close()
-
-            # LÓGICA DE DETECÇÃO DO BRANCO: ADAPTE PARA O TEXTO/VALOR REAL DO SEU JOGO
-            is_branco = "BRANCO" in result_text.upper() or "WHITE" in result_text.upper() 
-            
-            logging.info(f"Resultado do Double capturado: '{result_text}'. É Branco? {is_branco}")
-            return is_branco, result_text
-            
-    except Exception as e:
-        logging.error(f"Erro Crítico no Playwright ao buscar resultado: {e}")
-        return False, "ERRO_DE_SCRAPING"
-
-# ====================================================================
 # APLICAÇÃO TELEGRAM (Pyrogram)
 # ====================================================================
 
@@ -148,23 +99,24 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+# ----------------------------------------
+# 1. MANIPULADOR DE SINAIS (ORIGEM)
+# ----------------------------------------
 @app.on_message(filters.chat(CANAL_ORIGEM_IDS) & filters.text)
 async def processar_sinal(client, message):
+    global LAST_SENT_SIGNAL
     sinal = message.text.strip()
-    
-    # Limpeza básica do sinal (você pode ajustar este regex para remover números de rodada, etc.)
     sinal_limpo = re.sub(r'#[0-9]+', '', sinal).strip()
 
-    # Obtém performance e decide
     deve_enviar, modo = deve_enviar_sinal(sinal_limpo)
     analisadas, confianca = get_performance(sinal_limpo)
     
     logging.info(f"Sinal Recebido: '{sinal_limpo}'. Decisão: {modo} ({confianca:.2f}% de {analisadas}).")
     
     if deve_enviar:
-        # Formata a mensagem de saída
+        # Formata a mensagem para o BRANCO
         sinal_convertido = (
-            f"⚠️ **SINAL BRANCO DETECTADO ({modo})** ⚠️\n\n"
+            f"⚠️ **SINAL EXCLUSIVO BRANCO ({modo})** ⚠️\n\n"
             f"🎯 JOGO: **Double JonBet**\n"
             f"🔥 FOCO TOTAL NO **BRANCO** 🔥\n\n"
             f"📊 Confiança: `{confianca:.2f}%` (Base: {analisadas} análises)\n"
@@ -174,36 +126,58 @@ async def processar_sinal(client, message):
         # Envia para o canal de destino
         await client.send_message(CANAL_DESTINO_ID, sinal_convertido)
         
-        # --- ROTINA DE APRENDIZADO APÓS O ENVIO DO SINAL ---
+        # Registra o último sinal enviado para que o feedback saiba qual atualizar
+        LAST_SENT_SIGNAL["text"] = sinal_limpo
+        LAST_SENT_SIGNAL["timestamp"] = time.time()
+        logging.warning(f"Sinal ENVIADO: '{sinal_limpo}'. Esperando feedback em {CANAL_FEEDBACK_ID}.")
         
-        # 1. Espera o tempo da rodada
-        logging.info(f"Aguardando {TEMPO_ESPERA_RESULTADO} segundos pelo resultado da rodada...")
-        await asyncio.sleep(TEMPO_ESPERA_RESULTADO)
+    else:
+        logging.info(f"Sinal IGNORADO: '{sinal_limpo}'. Confiança: {confianca:.2f}%")
 
-        # 2. Busca do Resultado (Web Scraping)
-        is_win, resultado_lido = await fetch_real_result()
-        
-        # 3. Atualização do Aprendizado (a 'IA')
-        atualizar_performance(sinal_limpo, is_win)
-        
-        # 4. Envia o resultado do acompanhamento para o canal de destino
-        if is_win:
-            resultado_msg = f"✅ **WIN BRANCO!** Resultado lido: `{resultado_lido}`"
-        else:
-            resultado_msg = f"❌ **LOSS.** Resultado lido: `{resultado_lido}`"
-            
-        await client.send_message(CANAL_DESTINO_ID, resultado_msg)
+
+# ----------------------------------------
+# 2. MANIPULADOR DE FEEDBACK (APRENDIZADO)
+# ----------------------------------------
+@app.on_message(filters.chat(CANAL_FEEDBACK_ID) & filters.text)
+async def processar_feedback(client, message):
+    global LAST_SENT_SIGNAL
+    feedback_text = message.text.strip().upper()
     
+    if LAST_SENT_SIGNAL["text"] is None:
+        logging.warning("Feedback recebido, mas nenhum sinal recente foi enviado.")
+        return
+
+    # Lógica para detectar WIN ou LOSS (Adapte conforme o texto que você usará)
+    is_win = "WIN" in feedback_text or "GREEN" in feedback_text
+    is_loss = "LOSS" in feedback_text or "RED" in feedback_text
+    
+    if is_win or is_loss:
+        # Encontramos o resultado para o último sinal enviado
+        sinal_para_atualizar = LAST_SENT_SIGNAL["text"]
+        
+        # 1. Atualiza o DB
+        atualizar_performance(sinal_para_atualizar, is_win)
+        
+        # 2. Envia a confirmação para o canal de destino
+        resultado_msg = f"✅ **{feedback_text} NO BRANCO!**\nSinal: `{sinal_para_atualizar}`"
+        await client.send_message(CANAL_DESTINO_ID, resultado_msg)
+        
+        # 3. Limpa o estado
+        LAST_SENT_SIGNAL["text"] = None 
+        logging.info("Estado de feedback limpo. Pronto para o próximo sinal.")
+    else:
+        logging.info("Feedback recebido, mas não é um WIN/LOSS reconhecido. Ignorando.")
+
+
 # ====================================================================
 # EXECUÇÃO PRINCIPAL
 # ====================================================================
 if __name__ == "__main__":
-    logging.info("Iniciando Bot de Análise...")
+    logging.info("Iniciando Bot de Análise (Modo SOMENTE TELEGRAM)...")
     
-    # Verifica se as chaves críticas estão presentes
-    if not API_ID or not API_HASH or not BOT_TOKEN or "URL_DO_JOGO" in JOGO_URL:
-        logging.critical("ERRO: Configure as Variáveis de Ambiente (API_ID, API_HASH, BOT_TOKEN) e a JOGO_URL no Render ou no código.")
-        # Se estiver no Render, ele pode falhar aqui, o que é o correto.
+    # Verifica chaves críticas
+    if not API_ID or not API_HASH or not BOT_TOKEN:
+        logging.critical("ERRO: Configure as Variáveis de Ambiente (API_ID, API_HASH, BOT_TOKEN).")
         exit(1)
         
     try:
@@ -214,3 +188,4 @@ if __name__ == "__main__":
         if conn:
             conn.close()
             logging.info("Conexão com o Banco de Dados fechada.")
+
