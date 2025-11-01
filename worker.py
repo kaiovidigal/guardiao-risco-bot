@@ -1,10 +1,10 @@
-# worker.py - Versão SOMENTE TELEGRAM (Removido Playwright/Scraping)
+# worker.py - Versão SOMENTE TELEGRAM (Com Persistência de Disco)
 import os
 import sqlite3
 import re
 from pyrogram import Client, filters
 import logging
-from time import sleep
+import time
 
 # ====================================================================
 # CONFIGURAÇÃO GERAL E LOGGING
@@ -17,26 +17,35 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
 # IDs dos Canais (IDs de grupos/canais são negativos)
+# ATENÇÃO: SUBSTITUA OS PLACEHOLDERS PELOS SEUS IDs REAIS
 CANAL_ORIGEM_IDS = [-1003156785631, -1009998887776] # Adicione todos os IDs de origem
 CANAL_DESTINO_ID = -1002796105884 # Canal onde o sinal filtrado será enviado
-CANAL_FEEDBACK_ID = -1009990001112 # << NOVO: Canal/Grupo onde o resultado será postado.
+CANAL_FEEDBACK_ID = -1009990001112 # Canal/Grupo onde o resultado (WIN/LOSS) será postado.
 
 # ====================================================================
 # CONFIGURAÇÃO DE APRENDIZADO E FILTRAGEM
 # ====================================================================
-DB_NAME = 'double_jonbet_data.db'
 MIN_JOGADAS_APRENDIZADO = 10
 PERCENTUAL_MINIMO_CONFIANCA = 79.0 
 
 # Variável de estado para armazenar o ÚLTIMO SINAL ENVIADO
-# Usado para ligar o feedback (WIN/LOSS) ao sinal correspondente
 LAST_SENT_SIGNAL = {"text": None, "timestamp": 0} 
 
 # ====================================================================
-# BANCO DE DADOS (SQLite) - Funções Inalteradas
+# BANCO DE DADOS (SQLite) E PERSISTÊNCIA DE DISCO NO RENDER
 # ====================================================================
 
+# Caminho para o Disco Persistente no Render.
+# Se você configurou um disco com o Mount Path /var/data no painel do Render,
+# este código garantirá que o DB seja salvo lá.
+DB_MOUNT_PATH = os.environ.get("DB_MOUNT_PATH", "/var/data") 
+DB_NAME = os.path.join(DB_MOUNT_PATH, 'double_jonbet_data.db') 
+
 def setup_db():
+    """Conecta e garante que a tabela de performance exista."""
+    # Garante que o diretório exista antes de criar o arquivo DB
+    os.makedirs(DB_MOUNT_PATH, exist_ok=True)
+    
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute('''
@@ -47,11 +56,13 @@ def setup_db():
     )
     ''')
     conn.commit()
+    logging.info(f"DB configurado em: {DB_NAME}")
     return conn, cursor
 
 conn, cursor = setup_db()
 
 def get_performance(sinal):
+    """Retorna a performance e a confiança de um sinal."""
     cursor.execute("SELECT jogadas_analisadas, acertos_branco FROM sinais_performance WHERE sinal_original = ?", (sinal,))
     data = cursor.fetchone()
     if data:
@@ -60,11 +71,14 @@ def get_performance(sinal):
             confianca = (acertos / analisadas) * 100
             return analisadas, confianca
         return analisadas, 0.0
+    
+    # Insere o sinal se for a primeira vez que é visto
     cursor.execute("INSERT OR IGNORE INTO sinais_performance (sinal_original) VALUES (?)", (sinal,))
     conn.commit()
     return 0, 0.0
 
 def deve_enviar_sinal(sinal):
+    """Lógica da 'IA' para decidir o envio (Aprendizado e Confiança > 79%)."""
     analisadas, confianca = get_performance(sinal)
     
     if analisadas < MIN_JOGADAS_APRENDIZADO: 
@@ -76,6 +90,7 @@ def deve_enviar_sinal(sinal):
     return False, "BLOQUEIO"
 
 def atualizar_performance(sinal, is_win):
+    """Atualiza o DB com o resultado da rodada."""
     novo_acerto = 1 if is_win else 0
     
     cursor.execute(f"""
@@ -106,8 +121,8 @@ app = Client(
 async def processar_sinal(client, message):
     global LAST_SENT_SIGNAL
     sinal = message.text.strip()
-    sinal_limpo = re.sub(r'#[0-9]+', '', sinal).strip()
-
+    sinal_limpo = re.sub(r'#[0-9]+', '', sinal).strip() # Limpa o sinal
+    
     deve_enviar, modo = deve_enviar_sinal(sinal_limpo)
     analisadas, confianca = get_performance(sinal_limpo)
     
@@ -126,7 +141,7 @@ async def processar_sinal(client, message):
         # Envia para o canal de destino
         await client.send_message(CANAL_DESTINO_ID, sinal_convertido)
         
-        # Registra o último sinal enviado para que o feedback saiba qual atualizar
+        # Registra o último sinal enviado para o sistema de feedback
         LAST_SENT_SIGNAL["text"] = sinal_limpo
         LAST_SENT_SIGNAL["timestamp"] = time.time()
         logging.warning(f"Sinal ENVIADO: '{sinal_limpo}'. Esperando feedback em {CANAL_FEEDBACK_ID}.")
@@ -143,23 +158,27 @@ async def processar_feedback(client, message):
     global LAST_SENT_SIGNAL
     feedback_text = message.text.strip().upper()
     
+    # Verifica se há um sinal pendente para atualização
     if LAST_SENT_SIGNAL["text"] is None:
         logging.warning("Feedback recebido, mas nenhum sinal recente foi enviado.")
         return
 
-    # Lógica para detectar WIN ou LOSS (Adapte conforme o texto que você usará)
+    # Lógica para detectar WIN ou LOSS
     is_win = "WIN" in feedback_text or "GREEN" in feedback_text
-    is_loss = "LOSS" in feedback_text or "RED" in feedback_text
+    is_loss = "LOSS" in feedback_text or "RED" in feedback_text or "NO WIN" in feedback_text
     
     if is_win or is_loss:
-        # Encontramos o resultado para o último sinal enviado
         sinal_para_atualizar = LAST_SENT_SIGNAL["text"]
         
         # 1. Atualiza o DB
         atualizar_performance(sinal_para_atualizar, is_win)
         
         # 2. Envia a confirmação para o canal de destino
-        resultado_msg = f"✅ **{feedback_text} NO BRANCO!**\nSinal: `{sinal_para_atualizar}`"
+        if is_win:
+            resultado_msg = f"✅ **WIN BRANCO!** Feedback: `{feedback_text}`"
+        else:
+            resultado_msg = f"❌ **LOSS BRANCO.** Feedback: `{feedback_text}`"
+            
         await client.send_message(CANAL_DESTINO_ID, resultado_msg)
         
         # 3. Limpa o estado
@@ -173,9 +192,8 @@ async def processar_feedback(client, message):
 # EXECUÇÃO PRINCIPAL
 # ====================================================================
 if __name__ == "__main__":
-    logging.info("Iniciando Bot de Análise (Modo SOMENTE TELEGRAM)...")
+    logging.info("Iniciando Bot de Análise (Modo SOMENTE TELEGRAM e DB Persistente)...")
     
-    # Verifica chaves críticas
     if not API_ID or not API_HASH or not BOT_TOKEN:
         logging.critical("ERRO: Configure as Variáveis de Ambiente (API_ID, API_HASH, BOT_TOKEN).")
         exit(1)
@@ -188,4 +206,3 @@ if __name__ == "__main__":
         if conn:
             conn.close()
             logging.info("Conexão com o Banco de Dados fechada.")
-
