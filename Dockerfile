@@ -1,29 +1,20 @@
-# ======================================================================================
-# DOCKERFILE FINAL: PRONTO PARA DEPLOY NO RENDER
-# Imagem Playwright (resolve o erro apt-get)
-# Nome do arquivo de execução CORRIGIDO para worker.py
-# ======================================================================================
+# Dockerfile
 
-# 1. IMAGEM BASE COMPLETA (contém Python, Chromium e todas as libs Linux)
-FROM mcr.microsoft.com/playwright/python:latest
+# Usa uma imagem base Python que é compatível com o Playwright
+FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
-# 2. DEFINIÇÕES GERAIS E DIRETÓRIO DE TRABALHO
-ENV PYTHONUNBUFFERED 1
+# Define o diretório de trabalho dentro do container
 WORKDIR /app
 
-# 3. CÓPIA DO CÓDIGO E INSTALAÇÃO DE DEPENDÊNCIAS PYTHON
-# Instala as dependências do seu projeto (Selenium, undetected-chromedriver, etc.)
-COPY requirements.txt /app/
+# Copia o arquivo de dependências para o container
+COPY requirements.txt .
 
-# Instala as libs Python do seu arquivo
+# Instala as dependências Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Cópia do restante do código da aplicação
-COPY . /app/
+# Copia o restante do código para o container
+COPY . .
 
-# 4. PORTA E COMANDO DE INICIALIZAÇÃO
-EXPOSE 10000
-
-# COMANDO DE INICIALIZAÇÃO CORRIGIDO
-# O nome do arquivo foi corrigido para 'worker.py' (conforme seu repositório)
+# Comando para iniciar o bot
+# O Render usará este comando para rodar seu worker.py
 CMD ["python", "worker.py"]
