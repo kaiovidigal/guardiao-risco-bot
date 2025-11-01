@@ -1,4 +1,4 @@
 # requirements.txt
-pyrogram 
-playwright 
-tgdm
+pyrogram==2.0.106
+aiohttp==3.9.1
+tgdm==4.66.1
