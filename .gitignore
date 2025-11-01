@@ -1,0 +1,8 @@
+# •gitignore
+# Arquivos de ambiente e caches
+venv/ pycache
+1
+* . pyc
+# Arquivos de Banco de Dados (opcional, mas
+recomendado)
+double_jonbet_data. db
